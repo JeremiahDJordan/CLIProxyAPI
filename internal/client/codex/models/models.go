@@ -152,6 +152,7 @@ func buildCodexClientModelsWithToolCapabilities(models []map[string]any, provide
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
 		applyCodexClientModelMetadata(entry, id, model, optimizeMultiAgentV2, clientVersion)
+		applyCodexClientProviderCapabilities(entry, id, providersForModel)
 		applyCodexClientMaxTokens(entry, model)
 		applyCodexClientSearchToolSupport(entry, id, false, searchToolProvidersForModel, toolSearchCapabilityForModel)
 		applyCPAWebSearchCapability(entry, id, webSearchCapabilityForModel, clientVersion)
@@ -559,7 +560,12 @@ func applyCPAWebSearchCapability(entry map[string]any, id string, capabilityForM
 }
 
 func applyCodexClientProviderCapabilities(entry map[string]any, id string, providersForModel ProvidersForModelFunc) {
-	if providersForModel != nil && !isPureCodexProvider(id, providersForModel) {
+	if providersForModel == nil {
+		return
+	}
+	pureCodex := isPureCodexProvider(id, providersForModel)
+	entry["prefer_websockets"] = pureCodex
+	if !pureCodex {
 		entry["prefer_websockets"] = false
 		entry["service_tiers"] = []any{}
 		nullCodexClientRequiredOptions(entry)

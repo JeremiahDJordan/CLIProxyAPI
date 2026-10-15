@@ -151,12 +151,17 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 			}
 		}
 	}
-	if len(auth.Metadata) == 0 {
-		return false
+	// OAuth accounts created by either login flow omit the transport preference.
+	// Prefer the persistent transport for those accounts; compatible API-key
+	// endpoints remain opt-in because they may only implement HTTP Responses.
+	defaultEnabled := strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") &&
+		strings.TrimSpace(auth.Attributes["api_key"]) == ""
+	if key, _ := auth.Metadata["api_key"].(string); strings.TrimSpace(key) != "" {
+		defaultEnabled = false
 	}
 	raw, ok := auth.Metadata["websockets"]
 	if !ok || raw == nil {
-		return false
+		return defaultEnabled
 	}
 	switch v := raw.(type) {
 	case bool:
