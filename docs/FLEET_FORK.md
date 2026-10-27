@@ -29,7 +29,8 @@ Tests: `internal/client/codex/models/websockets_default_test.go`,
 standard plugin ABI) implement per-tool client keys, a native Claude Code / Codex
 client gate, provider quota tracking and the weekly-reset-first scheduler with
 cache-aware affinity. It lives in the main module so it can reuse upstream's
-`helps.DetectClaudeCodeRequest`, `helps.ParseCodexQuotaEventHeaders` and
+`helps.DetectClaudeCodeRequest`, `helps.ClaudePayloadHas1hTTL`,
+`helps.ParseCodexQuotaEventHeaders`, `cliproxysession.CallerScope` and
 `multiagentv2.IsCodexClientUserAgent`. See `cmd/fleet-plugin/README.md`.
 
 The only core change it needs: `applyRequestAfterAuthInterceptor`
@@ -46,8 +47,8 @@ non-native client never reaches a provider under its own identity. Claude uses
 upstream's default `auto` mode (only unconfirmed clients are cloaked). Codex gains
 `upstream.codex.cloak-mode` (`auto` default, `always`, `never`; the legacy
 `disable-codex-cloaking: true` still means `never`): `auto` keeps an official Codex
-client's own `User-Agent` and `Originator` (official User-Agent prefix plus an official
-originator) and applies the built-in identity to every other client, on both HTTP/SSE
+client's own `User-Agent` and `Originator` (`helps.IsOfficialCodexClient`, the same check
+the gate uses) and applies the built-in identity to every other client, on both HTTP/SSE
 and WebSocket paths, instead of upstream's unconditional overwrite. Tests:
 `internal/runtime/executor/codex_cloak_mode_fleet_test.go`.
 

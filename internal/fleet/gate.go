@@ -5,12 +5,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	multiagentv2 "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -22,18 +20,15 @@ const (
 	sourceResponses = "openai-response"
 )
 
-var extendedCacheTTL = regexp.MustCompile(`"ttl"\s*:\s*"1h"`)
-
 // Classification is computed from the original client request before credential
 // selection, where the untranslated body is available.
 type Classification struct {
-	SourceFormat     string
-	ClaudeConfirmed  bool
-	ClaudeEntrypoint string
-	CodexClient      bool
-	Session          string
-	ExtendedCache    bool
-	at               time.Time
+	SourceFormat    string
+	ClaudeConfirmed bool
+	CodexClient     bool
+	Session         string
+	ExtendedCache   bool
+	at              time.Time
 }
 
 // Classifier caches classifications by request ID between the before- and
@@ -47,7 +42,7 @@ type Classifier struct {
 func NewClassifier() *Classifier { return &Classifier{byReq: map[string]Classification{}} }
 
 // Classify inspects a request as it arrives from the client.
-func Classify(settings Settings, req pluginapi.RequestInterceptRequest) Classification {
+func Classify(req pluginapi.RequestInterceptRequest) Classification {
 	c := Classification{SourceFormat: strings.ToLower(strings.TrimSpace(req.SourceFormat))}
 	// The host's canonical derivation covers explicit session headers and Claude Code's
 	// metadata.user_id; the scheduler derives the same identity from its pick metadata.
@@ -55,30 +50,12 @@ func Classify(settings Settings, req pluginapi.RequestInterceptRequest) Classifi
 	if c.SourceFormat == sourceClaude {
 		path, _ := req.Metadata["request_path"].(string)
 		countTokens := strings.Contains(path, "count_tokens")
-		d := helps.DetectClaudeCodeRequest(req.Headers, req.Body, countTokens)
-		c.ClaudeEntrypoint = strings.ToLower(d.Entrypoint)
-		c.ClaudeConfirmed = d.Confirmed && settings.ClaudeEntrypoints[c.ClaudeEntrypoint]
-		c.ExtendedCache = extendedCacheTTL.Match(req.Body)
+		// Confirmed already requires a native Claude Code entrypoint.
+		c.ClaudeConfirmed = helps.DetectClaudeCodeRequest(req.Headers, req.Body, countTokens).Confirmed
+		c.ExtendedCache = helps.ClaudePayloadHas1hTTL(req.Body)
 	}
-	c.CodexClient = IsCodexClient(settings, req.Headers)
+	c.CodexClient = helps.IsOfficialCodexClient(req.Headers)
 	return c
-}
-
-// IsCodexClient requires both an official Codex User-Agent and an accepted Originator.
-func IsCodexClient(settings Settings, headers http.Header) bool {
-	if !multiagentv2.IsCodexClientUserAgent(headerGet(headers, "User-Agent")) {
-		return false
-	}
-	originator := strings.ToLower(strings.TrimSpace(headerGet(headers, "Originator")))
-	if originator == "" {
-		return false
-	}
-	for _, allowed := range settings.CodexOriginators {
-		if originator == allowed || strings.HasPrefix(originator, allowed+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 // Store remembers a classification for the after-selection check.
@@ -131,14 +108,17 @@ func KeyForScope(settings Settings, scope string) (Key, bool) {
 // Evaluate decides whether a request may reach the provider of its selected credential.
 func Evaluate(settings Settings, cl Classification, provider, callerScope string) Decision {
 	target := strings.ToLower(strings.TrimSpace(provider))
+	if target == "" && settings.GateEnabled {
+		return Decision{Code: "fleet_unresolved_provider", Reason: "the selected credential's provider could not be determined"}
+	}
 	key, known := KeyForScope(settings, callerScope)
 	if known && !key.Providers[target] {
 		return Decision{Code: "fleet_key_provider_denied", Reason: "client key " + key.Name + " is not allowed to use " + target + " models"}
 	}
-	if !settings.GateEnabled || !settings.GatedProviders[target] {
+	if !settings.GateEnabled || !subscriptionProviders[target] {
 		return Decision{Allow: true}
 	}
-	if !known && settings.DenyUnknownCallers {
+	if !known {
 		return Decision{Code: "fleet_unknown_caller", Reason: "subscription models require a fleet client key"}
 	}
 	switch target {

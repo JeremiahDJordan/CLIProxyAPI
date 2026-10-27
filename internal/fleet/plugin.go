@@ -37,20 +37,12 @@ type Plugin struct {
 	gateDenials map[string]int
 }
 
-// targetProvider resolves the provider a request reaches after selection: the
-// selected credential's provider reported by the host for this execution, otherwise
-// the provider implied by an unambiguous target format. The ambiguous Responses
-// format (used by responses/compact for any provider) resolves to "".
-func targetProvider(toFormat string, metadata map[string]any) string {
-	if v, ok := metadata["selected_auth_provider"].(string); ok && strings.TrimSpace(v) != "" {
-		return strings.ToLower(strings.TrimSpace(v))
-	}
-	switch f := strings.ToLower(strings.TrimSpace(toFormat)); f {
-	case sourceResponses:
-		return ""
-	default:
-		return f
-	}
+// targetProvider is the selected credential's provider, which the fork host reports
+// to after-selection interceptors for each execution. Target formats are not used:
+// openai-response (for example responses/compact) can reach either provider.
+func targetProvider(metadata map[string]any) string {
+	v, _ := metadata["selected_auth_provider"].(string)
+	return strings.ToLower(strings.TrimSpace(v))
 }
 
 // PickDecision records one scheduler outcome for the management view.
@@ -82,33 +74,21 @@ func (p *Plugin) Settings() Settings {
 	return p.settings
 }
 
-type envelope struct {
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *envelopeError  `json:"error,omitempty"`
-}
-
-type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
 type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
 type capabilities struct {
-	FrontendAuthProvider             bool `json:"frontend_auth_provider"`
-	FrontendAuthProviderExclusive    bool `json:"frontend_auth_provider_exclusive"`
-	Scheduler                        bool `json:"scheduler"`
-	SchedulerAcrossPriorities        bool `json:"scheduler_across_priorities,omitempty"`
-	RequestInterceptor               bool `json:"request_interceptor"`
-	RequestInterceptorOmitBodyBefore bool `json:"request_interceptor_omit_body_before,omitempty"`
-	RequestInterceptorOmitBodyAfter  bool `json:"request_interceptor_omit_body_after,omitempty"`
-	WebSocketResponseObserver        bool `json:"websocket_response_observer"`
-	UsagePlugin                      bool `json:"usage_plugin"`
-	ManagementAPI                    bool `json:"management_api"`
+	FrontendAuthProvider            bool `json:"frontend_auth_provider"`
+	FrontendAuthProviderExclusive   bool `json:"frontend_auth_provider_exclusive"`
+	Scheduler                       bool `json:"scheduler"`
+	SchedulerAcrossPriorities       bool `json:"scheduler_across_priorities,omitempty"`
+	RequestInterceptor              bool `json:"request_interceptor"`
+	RequestInterceptorOmitBodyAfter bool `json:"request_interceptor_omit_body_after,omitempty"`
+	WebSocketResponseObserver       bool `json:"websocket_response_observer"`
+	UsagePlugin                     bool `json:"usage_plugin"`
+	ManagementAPI                   bool `json:"management_api"`
 }
 
 type registration struct {
@@ -225,11 +205,10 @@ func (p *Plugin) interceptBefore(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	now := p.Now()
-	settings := p.Settings()
-	cl := Classify(settings, req)
+	cl := Classify(req)
 	p.Classifier.Store(req.RequestID, cl, now)
 	if cl.ExtendedCache {
-		p.Sessions.NoteCacheTTL(cl.Session, time.Hour, now)
+		p.Sessions.NoteExtendedCache(cl.Session, now)
 	}
 	return okEnvelope(pluginapi.RequestInterceptResponse{})
 }
@@ -240,20 +219,11 @@ func (p *Plugin) interceptAfter(raw []byte) ([]byte, error) {
 		// An unreadable request cannot be verified; deny gated traffic by failing closed.
 		return okEnvelope(Denial(Decision{Code: "fleet_unreadable_request", Reason: "request could not be inspected"}))
 	}
-	settings := p.Settings()
 	cl, ok := p.Classifier.Load(req.RequestID)
 	if !ok {
-		cl = Classify(settings, req)
+		cl = Classify(req)
 	}
-	provider := targetProvider(req.ToFormat, req.Metadata)
-	if provider == "" && settings.GateEnabled {
-		d := Decision{Code: "fleet_unresolved_provider", Reason: "the selected credential's provider could not be determined"}
-		p.decisionsMu.Lock()
-		p.gateDenials[d.Code]++
-		p.decisionsMu.Unlock()
-		return okEnvelope(Denial(d))
-	}
-	d := Evaluate(settings, cl, provider, req.CallerScope)
+	d := Evaluate(p.Settings(), cl, targetProvider(req.Metadata), req.CallerScope)
 	if d.Allow {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
@@ -279,7 +249,7 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 	now := p.Now()
 	provider := pickProvider(req)
 	decision := PickDecision{At: now, Provider: provider, Model: req.Model, Candidates: len(req.Candidates)}
-	if !settings.SchedulerEnabled || provider == "" || !settings.SchedulerProviders[provider] {
+	if !settings.SchedulerEnabled || !subscriptionProviders[provider] {
 		decision.Reason = "not-handled"
 		return pluginapi.SchedulerPickResponse{Handled: false}, decision
 	}
@@ -312,10 +282,10 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 		if reason != "affinity" {
 			reason = "affinity-rebind-excluded"
 		}
-	} else if session != "" && b.AuthID != "" {
+	} else if b.AuthID != "" {
 		reason = "affinity-expired:" + reason
 	}
-	p.Sessions.Bind(provider, session, chosen, ttl, now)
+	p.Sessions.Bind(provider, session, chosen, now)
 	decision.AuthID, decision.Reason = chosen, reason
 	return pluginapi.SchedulerPickResponse{AuthID: chosen, Handled: true}, decision
 }
@@ -455,10 +425,10 @@ func okEnvelope(v any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(envelope{OK: true, Result: raw})
+	return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
 }
 
 func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	raw, _ := pluginabi.NewErrorEnvelope(code, message)
 	return raw
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	"gopkg.in/yaml.v3"
 )
 
@@ -41,25 +42,12 @@ type KeyConfig struct {
 type GateConfig struct {
 	// Enabled defaults to true.
 	Enabled *bool `yaml:"enabled"`
-	// Providers are the gated target formats. Defaults to claude and codex.
-	Providers []string `yaml:"providers"`
-	// ClaudeEntrypoints are the Claude Code User-Agent entrypoints accepted when the
-	// upstream detector confirms the request. Defaults to the upstream native set.
-	ClaudeEntrypoints []string `yaml:"claude-entrypoints"`
-	// CodexOriginators are accepted Originator header values (case-insensitive,
-	// optionally followed by "/version").
-	CodexOriginators []string `yaml:"codex-originators"`
-	// DenyUnknownCallers rejects gated requests from callers that did not
-	// authenticate with a fleet key. Defaults to true.
-	DenyUnknownCallers *bool `yaml:"deny-unknown-callers"`
 }
 
 // SchedulerConfig controls the weekly-reset-first scheduler.
 type SchedulerConfig struct {
 	// Enabled defaults to true.
 	Enabled *bool `yaml:"enabled"`
-	// Providers handled by the scheduler. Defaults to claude and codex.
-	Providers []string `yaml:"providers"`
 	// ClaudeCacheTTL is the affinity idle limit when a Claude session did not
 	// request extended caching. Defaults to 5m.
 	ClaudeCacheTTL string `yaml:"claude-cache-ttl"`
@@ -76,12 +64,7 @@ type Settings struct {
 	Keys                   []Key
 	Exclusive              bool
 	GateEnabled            bool
-	GatedProviders         map[string]bool
-	ClaudeEntrypoints      map[string]bool
-	CodexOriginators       []string
-	DenyUnknownCallers     bool
 	SchedulerEnabled       bool
-	SchedulerProviders     map[string]bool
 	ClaudeCacheTTL         time.Duration
 	ClaudeExtendedCacheTTL time.Duration
 	CodexIdleTTL           time.Duration
@@ -99,11 +82,8 @@ type Key struct {
 // Principal returns the principal the plugin reports for this key.
 func (k Key) Principal() string { return PrincipalPrefix + k.Name }
 
-var (
-	defaultClaudeEntrypoints = []string{"cli", "sdk-cli", "sdk-ts", "claude-vscode"}
-	defaultCodexOriginators  = []string{"codex_cli_rs", "codex-tui", "codex desktop", "codex_exec"}
-	defaultProviders         = []string{"claude", "codex"}
-)
+// subscriptionProviders are the providers the gate protects and the scheduler ranks.
+var subscriptionProviders = map[string]bool{"claude": true, "codex": true}
 
 // ParseConfig decodes and normalizes the plugin YAML configuration.
 func ParseConfig(raw []byte) (Settings, error) {
@@ -114,16 +94,9 @@ func ParseConfig(raw []byte) (Settings, error) {
 		}
 	}
 	s := Settings{
-		Enabled:            cfg.Enabled,
-		GateEnabled:        boolDefault(cfg.Gate.Enabled, true),
-		GatedProviders:     lowerSet(cfg.Gate.Providers, defaultProviders),
-		ClaudeEntrypoints:  lowerSet(cfg.Gate.ClaudeEntrypoints, defaultClaudeEntrypoints),
-		DenyUnknownCallers: boolDefault(cfg.Gate.DenyUnknownCallers, true),
-		SchedulerEnabled:   boolDefault(cfg.Scheduler.Enabled, true),
-		SchedulerProviders: lowerSet(cfg.Scheduler.Providers, defaultProviders),
-	}
-	for _, o := range nonEmpty(cfg.Gate.CodexOriginators, defaultCodexOriginators) {
-		s.CodexOriginators = append(s.CodexOriginators, strings.ToLower(strings.TrimSpace(o)))
+		Enabled:          cfg.Enabled,
+		GateEnabled:      boolDefault(cfg.Gate.Enabled, true),
+		SchedulerEnabled: boolDefault(cfg.Scheduler.Enabled, true),
 	}
 	var err error
 	if s.ClaudeCacheTTL, err = durationDefault(cfg.Scheduler.ClaudeCacheTTL, 5*time.Minute); err != nil {
@@ -149,8 +122,8 @@ func ParseConfig(raw []byte) (Settings, error) {
 		if len(kc.Providers) == 0 {
 			return Settings{}, fmt.Errorf("fleet: key %q must list allowed providers", name)
 		}
-		k := Key{Name: name, Digest: [sha256.Size]byte(digest), Providers: lowerSet(kc.Providers, nil)}
-		k.CallerScope = CallerScope(k.Principal())
+		k := Key{Name: name, Digest: [sha256.Size]byte(digest), Providers: lowerSet(kc.Providers)}
+		k.CallerScope = cliproxysession.CallerScope(k.Principal())
 		s.Keys = append(s.Keys, k)
 	}
 	s.Exclusive = boolDefault(cfg.Exclusive, len(s.Keys) > 0)
@@ -161,17 +134,6 @@ func ParseConfig(raw []byte) (Settings, error) {
 		return Settings{}, fmt.Errorf("fleet: the client gate requires fleet keys with exclusive authentication")
 	}
 	return s, nil
-}
-
-// CallerScope mirrors sdk/cliproxy/session.CallerScope, which the host applies to the
-// authenticated principal before handing it to interceptors.
-func CallerScope(principal string) string {
-	principal = strings.TrimSpace(principal)
-	if principal == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("cli-proxy-api:caller-scope:v1\x00" + principal))
-	return hex.EncodeToString(sum[:])
 }
 
 func boolDefault(v *bool, def bool) bool {
@@ -193,16 +155,9 @@ func durationDefault(raw string, def time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
-func nonEmpty(values, def []string) []string {
-	if len(values) == 0 {
-		return def
-	}
-	return values
-}
-
-func lowerSet(values, def []string) map[string]bool {
+func lowerSet(values []string) map[string]bool {
 	out := map[string]bool{}
-	for _, v := range nonEmpty(values, def) {
+	for _, v := range values {
 		if v = strings.ToLower(strings.TrimSpace(v)); v != "" {
 			out[v] = true
 		}

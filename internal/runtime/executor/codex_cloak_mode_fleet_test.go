@@ -9,7 +9,8 @@ import (
 )
 
 // Fleet fork: Codex cloaking defaults to "auto", which keeps an official Codex
-// client's own identity and cloaks every other client.
+// client's own identity (helps.IsOfficialCodexClient, shared with the fleet gate) and
+// cloaks every other client.
 func TestCodexCloakModeFleet(t *testing.T) {
 	official := http.Header{}
 	official.Set("User-Agent", "codex_cli_rs/0.164.0 (Mac OS 27.2.0; arm64) Apple_Terminal/470")
@@ -19,6 +20,9 @@ func TestCodexCloakModeFleet(t *testing.T) {
 	copiedUA.Set("Originator", "pi")
 	other := http.Header{}
 	other.Set("User-Agent", "curl/8.7.1")
+	desktop := http.Header{}
+	desktop.Set("User-Agent", official.Get("User-Agent"))
+	desktop.Set("Originator", "Codex Desktop/27.1")
 
 	for _, tc := range []struct {
 		name, settings string
@@ -28,6 +32,7 @@ func TestCodexCloakModeFleet(t *testing.T) {
 	}{
 		{"default auto keeps official client", "codex: {}\n", official, official.Get("User-Agent"), "codex_cli_rs"},
 		{"default auto cloaks other client", "codex: {}\n", other, codexUserAgent, codexOriginator},
+		{"auto keeps a versioned originator the gate admits", "codex: {}\n", desktop, official.Get("User-Agent"), "Codex Desktop/27.1"},
 		{"auto cloaks copied user agent with wrong originator", "codex: {cloak-mode: auto}\n", copiedUA, codexUserAgent, codexOriginator},
 		{"always overwrites official client", "codex: {cloak-mode: always}\n", official, codexUserAgent, codexOriginator},
 		{"v8 upstream path is honored", "upstream: {codex: {cloak-mode: always}}\n", official, codexUserAgent, codexOriginator},

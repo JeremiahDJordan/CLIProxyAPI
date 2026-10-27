@@ -17,11 +17,12 @@
    (`helps.DetectClaudeCodeRequest`: `x-app: cli`, Claude Code User-Agent and betas,
    structured `metadata.user_id`, native entrypoint `cli`, `sdk-cli`, `sdk-ts` or
    `claude-vscode`). Requests targeting `codex` must be Responses/WebSocket requests
-   from an official Codex client (`multiagentv2.IsCodexClientUserAgent` **and** an
-   `Originator` of `codex_cli_rs`, `codex-tui`, `Codex Desktop` or `codex_exec`).
-   Translated requests (for example Chat Completions to a Claude model) and keys used
-   outside their providers get a JSON `403` naming the reason; callers without a fleet
-   key are denied gated providers by default.
+   from an official Codex client (`helps.IsOfficialCodexClient`:
+   `multiagentv2.IsCodexClientUserAgent` **and** an `Originator` of `codex_cli_rs`,
+   `codex-tui`, `Codex Desktop` or `codex_exec`, case-insensitive, optionally followed by
+   `/version`; Codex cloak-mode `auto` uses the same check). Translated requests (for
+   example Chat Completions to a Claude model), keys used outside their providers and
+   callers without a fleet key get a JSON `403` naming the reason.
 3. **Quota tracking** (`usage.handle`, `websocket.response_event`). Per credential it
    records Anthropic `Anthropic-Ratelimit-Unified-{5h,7d,7d_*}-{Status,Reset,Utilization}`
    windows (model-specific `7d_*` claims are attached to the model that returned them)
@@ -84,11 +85,9 @@ plugins:
           providers: [codex]
       # exclusive: true                # default true when keys are configured
       gate:
-        # providers: [claude, codex]
-        # claude-entrypoints: [cli, sdk-cli, sdk-ts, claude-vscode]
-        # codex-originators: [codex_cli_rs, codex-tui, codex desktop, codex_exec]
-        # deny-unknown-callers: true
+        # enabled: true                  # gates claude and codex; requires exclusive keys
       scheduler:
+        # enabled: true                  # ranks claude and codex accounts
         # claude-cache-ttl: 5m
         # claude-extended-cache-ttl: 1h
         # codex-idle-ttl: 1h
@@ -105,8 +104,9 @@ Generate a key and its digest without echoing it to logs, for example
 - The gate applies to Claude and Codex credentials regardless of whether they are OAuth
   or API keys. It uses the selected credential's provider, which the fork's host passes
   to the after-auth interceptor as `selected_auth_provider` (needed for
-  `responses/compact`, whose wire format is `openai-response` for every provider); if an
-  ambiguous format arrives without it, the gate fails closed (`fleet_unresolved_provider`).
+  `responses/compact`, whose wire format is `openai-response` for every provider). A
+  request without it fails closed (`fleet_unresolved_provider`), so the plugin requires
+  the fork's host.
 - The gate requires fleet keys with exclusive authentication: host-authenticated
   `access.api-keys` never reach the plugin and could otherwise use uninspected routes.
 - `scheduler.pick` runs before the after-selection gate, so a request that is later

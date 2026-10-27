@@ -14,7 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
-	multiagentv2 "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -550,48 +549,23 @@ func isCodexCloakingDisabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
 	return false
 }
 
-// codexCloakMode resolves the fleet cloak mode; unset or unknown values mean "auto".
-func codexCloakMode(cfg *config.Config) string {
-	if cfg == nil {
-		return "auto"
-	}
-	switch mode := strings.ToLower(strings.TrimSpace(cfg.Codex.CloakMode)); mode {
-	case "always", "never":
-		return mode
-	default:
-		return "auto"
-	}
-}
-
-// codexOfficialOriginators lists the Originator values sent by official Codex clients.
-var codexOfficialOriginators = map[string]bool{
-	"codex_cli_rs": true, "codex-tui": true, "Codex Desktop": true, "codex_exec": true,
-}
-
-// isOfficialCodexClient reports whether the downstream request already carries an
-// official Codex client identity in both User-Agent and Originator.
-func isOfficialCodexClient(clientHeaders http.Header) bool {
-	if clientHeaders == nil {
-		return false
-	}
-	return multiagentv2.IsCodexClientUserAgent(clientHeaders.Get("User-Agent")) &&
-		codexOfficialOriginators[strings.TrimSpace(clientHeaders.Get("Originator"))]
-}
-
-// applyCodexCloakingHeaders applies the official Codex identity. In the default "auto"
-// mode an official client keeps its own headers, so only other clients are cloaked.
+// applyCodexCloakingHeaders applies the official Codex identity according to
+// upstream.codex.cloak-mode: "never" leaves client headers, "always" overwrites them,
+// and the default "auto" keeps an official Codex client's own identity.
 func applyCodexCloakingHeaders(headers http.Header, clientHeaders http.Header, cfg *config.Config, auth *cliproxyauth.Auth) {
 	if headers == nil || cfg == nil || isCodexCloakingDisabled(cfg, auth) {
 		return
 	}
-	mode := codexCloakMode(cfg)
-	if mode == "never" {
+	switch strings.ToLower(strings.TrimSpace(cfg.Codex.CloakMode)) {
+	case "never":
 		return
-	}
-	if mode == "auto" && isOfficialCodexClient(clientHeaders) {
-		headers.Set("User-Agent", strings.TrimSpace(clientHeaders.Get("User-Agent")))
-		headers.Set("Originator", strings.TrimSpace(clientHeaders.Get("Originator")))
-		return
+	case "always":
+	default:
+		if helps.IsOfficialCodexClient(clientHeaders) {
+			headers.Set("User-Agent", strings.TrimSpace(clientHeaders.Get("User-Agent")))
+			headers.Set("Originator", strings.TrimSpace(clientHeaders.Get("Originator")))
+			return
+		}
 	}
 	headers.Set("User-Agent", codexUserAgent)
 	headers.Set("Originator", codexOriginator)

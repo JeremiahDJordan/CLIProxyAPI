@@ -12,83 +12,52 @@ import (
 
 // Binding keeps a session on the account that holds its prompt cache.
 type Binding struct {
-	AuthID   string        `json:"auth_id"`
-	LastUsed time.Time     `json:"last_used"`
-	TTL      time.Duration `json:"-"`
+	AuthID   string    `json:"auth_id"`
+	LastUsed time.Time `json:"last_used"`
 }
 
-// Sessions tracks session affinity and per-session cache lifetimes.
+// Sessions tracks session affinity and which Claude sessions requested the one-hour cache.
 type Sessions struct {
 	mu       sync.Mutex
-	bindings map[string]Binding       // provider|session -> binding
-	cacheTTL map[string]time.Duration // session -> requested Claude cache lifetime
-	seen     map[string]time.Time     // session -> last cacheTTL update, for pruning
+	bindings map[string]Binding   // provider|session -> binding
+	extended map[string]time.Time // session -> last request with cache_control ttl "1h"
 }
 
 // NewSessions returns empty session state.
 func NewSessions() *Sessions {
-	return &Sessions{bindings: map[string]Binding{}, cacheTTL: map[string]time.Duration{}, seen: map[string]time.Time{}}
+	return &Sessions{bindings: map[string]Binding{}, extended: map[string]time.Time{}}
 }
 
 func bindingKey(provider, session string) string { return strings.ToLower(provider) + "|" + session }
 
-// NoteCacheTTL records the Claude cache lifetime a session requested.
-func (s *Sessions) NoteCacheTTL(session string, ttl time.Duration, now time.Time) {
-	if session == "" || ttl <= 0 {
+// NoteExtendedCache records that a Claude session requested the one-hour cache.
+func (s *Sessions) NoteExtendedCache(session string, now time.Time) {
+	if session == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ttl > s.cacheTTL[session] {
-		s.cacheTTL[session] = ttl
-	}
-	s.seen[session] = now
+	s.extended[session] = now
 }
 
 // Bind records that session is using authID now.
-func (s *Sessions) Bind(provider, session, authID string, ttl time.Duration, now time.Time) {
+func (s *Sessions) Bind(provider, session, authID string, now time.Time) {
 	if session == "" || authID == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.bindings[bindingKey(provider, session)] = Binding{AuthID: authID, LastUsed: now, TTL: ttl}
+	s.bindings[bindingKey(provider, session)] = Binding{AuthID: authID, LastUsed: now}
 	s.pruneLocked(now)
 }
 
-// Touch refreshes an existing binding after a completed request on the same account.
-func (s *Sessions) Touch(provider, session, authID string, now time.Time) {
-	if session == "" || authID == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := bindingKey(provider, session)
-	if b, ok := s.bindings[key]; ok && b.AuthID == authID {
-		b.LastUsed = now
-		s.bindings[key] = b
-	}
-}
-
-// Lookup returns a live binding for the session: one whose idle time has not exceeded
-// the cache lifetime that applies to it.
+// Lookup returns the session's binding and whether it is live: idle for no longer
+// than ttl, the cache lifetime that applies to the session.
 func (s *Sessions) Lookup(provider, session string, ttl time.Duration, now time.Time) (Binding, bool) {
-	if session == "" {
-		return Binding{}, false
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.bindings[bindingKey(provider, session)]
-	if !ok {
-		return Binding{}, false
-	}
-	if ttl <= 0 {
-		ttl = b.TTL
-	}
-	if now.Sub(b.LastUsed) > ttl {
-		return b, false
-	}
-	return b, true
+	return b, ok && session != "" && now.Sub(b.LastUsed) <= ttl
 }
 
 // TTLFor returns the affinity idle limit for a session on provider.
@@ -97,9 +66,9 @@ func (s *Sessions) TTLFor(settings Settings, provider, session string) time.Dura
 		return settings.CodexIdleTTL
 	}
 	s.mu.Lock()
-	requested := s.cacheTTL[session]
+	_, extended := s.extended[session]
 	s.mu.Unlock()
-	if requested >= time.Hour {
+	if extended {
 		return settings.ClaudeExtendedCacheTTL
 	}
 	return settings.ClaudeCacheTTL
@@ -113,7 +82,7 @@ func (s *Sessions) Count() int {
 }
 
 func (s *Sessions) pruneLocked(now time.Time) {
-	if len(s.bindings) < 4096 && len(s.seen) < 4096 {
+	if len(s.bindings) < 4096 && len(s.extended) < 4096 {
 		return
 	}
 	for k, b := range s.bindings {
@@ -121,10 +90,9 @@ func (s *Sessions) pruneLocked(now time.Time) {
 			delete(s.bindings, k)
 		}
 	}
-	for k, t := range s.seen {
+	for k, t := range s.extended {
 		if now.Sub(t) > 24*time.Hour {
-			delete(s.seen, k)
-			delete(s.cacheTTL, k)
+			delete(s.extended, k)
 		}
 	}
 }
@@ -143,42 +111,30 @@ func Rank(book *QuotaBook, candidates []pluginapi.SchedulerAuthCandidate, model 
 		Ranked
 		priority int
 	}
-	var known, unknown []entry
+	var entries []entry
 	for _, c := range candidates {
 		acct, _ := book.Snapshot(c.ID)
-		v := ViewFor(acct, model, now)
-		if v.Excluded() {
-			continue
-		}
-		e := entry{Ranked: Ranked{AuthID: c.ID, View: v}, priority: c.Priority}
-		if v.Known {
-			known = append(known, e)
-		} else {
-			unknown = append(unknown, e)
+		if v := ViewFor(acct, model, now); !v.Excluded() {
+			entries = append(entries, entry{Ranked: Ranked{AuthID: c.ID, View: v}, priority: c.Priority})
 		}
 	}
-	sort.SliceStable(known, func(i, j int) bool {
-		a, b := known[i].View, known[j].View
-		if !a.WeeklyResetAt.Equal(b.WeeklyResetAt) {
-			return a.WeeklyResetAt.Before(b.WeeklyResetAt)
+	sort.Slice(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		switch {
+		case a.View.Known != b.View.Known:
+			return a.View.Known
+		case a.View.Known && !a.View.WeeklyResetAt.Equal(b.View.WeeklyResetAt):
+			return a.View.WeeklyResetAt.Before(b.View.WeeklyResetAt)
+		case a.View.Known && a.View.WeeklyLeft != b.View.WeeklyLeft:
+			return a.View.WeeklyLeft > b.View.WeeklyLeft
+		case !a.View.Known && a.priority != b.priority:
+			return a.priority > b.priority
 		}
-		if a.WeeklyLeft != b.WeeklyLeft {
-			return a.WeeklyLeft > b.WeeklyLeft
-		}
-		return known[i].AuthID < known[j].AuthID
+		return a.AuthID < b.AuthID
 	})
-	sort.SliceStable(unknown, func(i, j int) bool {
-		if unknown[i].priority != unknown[j].priority {
-			return unknown[i].priority > unknown[j].priority
-		}
-		return unknown[i].AuthID < unknown[j].AuthID
-	})
-	out := make([]Ranked, 0, len(known)+len(unknown))
-	for _, e := range known {
-		out = append(out, e.Ranked)
-	}
-	for _, e := range unknown {
-		out = append(out, e.Ranked)
+	out := make([]Ranked, len(entries))
+	for i, e := range entries {
+		out[i] = e.Ranked
 	}
 	return out
 }

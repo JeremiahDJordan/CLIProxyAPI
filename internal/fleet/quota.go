@@ -100,12 +100,6 @@ func (b *QuotaBook) Observe(provider, authID, model string, headers http.Header,
 		windows, modelSpecific = parseClaudeWindows(headers, now)
 	case "codex":
 		windows, modelSpecific, shared = parseCodexWindows(headers, now)
-	default:
-		if w, m := parseClaudeWindows(headers, now); len(w) > 0 {
-			windows, modelSpecific, provider = w, m, "claude"
-		} else if w, m, sh := parseCodexWindows(headers, now); len(w) > 0 {
-			windows, modelSpecific, shared, provider = w, m, sh, "codex"
-		}
 	}
 	if len(windows) == 0 {
 		return false
@@ -225,11 +219,12 @@ func ViewFor(acct Account, model string, now time.Time) View {
 	}
 	// Shared 5-hour windows block every model; a named (model-specific) Codex 5-hour
 	// limit such as "spark-primary" blocks only models whose weekly limit shares its name.
+	specificLimit, _ := limitPrefix(specific)
 	for name, w := range acct.Windows {
 		if w.Kind != kindFiveHour {
 			continue
 		}
-		if prefix, named := limitPrefix(name); named && prefix != mustLimitPrefix(specific) {
+		if prefix, named := limitPrefix(name); named && prefix != specificLimit {
 			continue
 		}
 		e := w.effective(now)
@@ -242,11 +237,8 @@ func ViewFor(acct Account, model string, now time.Time) View {
 	}
 	// A model-specific weekly window only blocks the model it was observed for;
 	// the general weekly window blocks every model.
-	for name, w := range acct.Windows {
-		if w.Kind != kindWeekly || !w.Exhausted(now) {
-			continue
-		}
-		if name == general || name == order {
+	for _, name := range []string{general, order} {
+		if w, ok := acct.Windows[name]; ok && w.Exhausted(now) {
 			v.WeeklyBlock = true
 		}
 	}
@@ -267,11 +259,6 @@ func limitPrefix(name string) (string, bool) {
 		return name[:i], true
 	}
 	return "", false
-}
-
-func mustLimitPrefix(name string) string {
-	p, _ := limitPrefix(name)
-	return p
 }
 
 func isGeneralWeekly(name string) bool {

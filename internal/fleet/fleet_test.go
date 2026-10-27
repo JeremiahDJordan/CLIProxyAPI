@@ -80,14 +80,11 @@ func scopeFor(s Settings, name string) string {
 
 func TestParseConfigDefaultsAndValidation(t *testing.T) {
 	s := testSettings(t, "")
-	if !s.Exclusive || !s.GateEnabled || !s.SchedulerEnabled || !s.DenyUnknownCallers {
+	if !s.Exclusive || !s.GateEnabled || !s.SchedulerEnabled {
 		t.Fatalf("defaults not applied: %+v", s)
 	}
 	if s.ClaudeCacheTTL != 5*time.Minute || s.ClaudeExtendedCacheTTL != time.Hour || s.CodexIdleTTL != time.Hour {
 		t.Fatalf("ttl defaults wrong: %v %v %v", s.ClaudeCacheTTL, s.ClaudeExtendedCacheTTL, s.CodexIdleTTL)
-	}
-	if !s.GatedProviders["claude"] || !s.GatedProviders["codex"] || !s.ClaudeEntrypoints["sdk-ts"] {
-		t.Fatalf("provider/entrypoint defaults wrong: %+v", s)
 	}
 	for _, bad := range []string{
 		"keys:\n  - name: a\n    sha256: nothex\n    providers: [claude]\n",
@@ -113,9 +110,9 @@ func TestParseConfigDefaultsAndValidation(t *testing.T) {
 }
 
 func TestCallerScopeMatchesHost(t *testing.T) {
-	for _, principal := range []string{"fleet:claude-code", "fleet:codex"} {
-		if CallerScope(principal) != cliproxysession.CallerScope(principal) {
-			t.Fatalf("caller scope for %s differs from host implementation", principal)
+	for _, k := range testSettings(t, "").Keys {
+		if k.CallerScope == "" || k.CallerScope != cliproxysession.CallerScope("fleet:"+k.Name) {
+			t.Fatalf("caller scope for %s differs from the host's", k.Name)
 		}
 	}
 }
@@ -178,10 +175,10 @@ func TestAuthenticateRouteAllowlist(t *testing.T) {
 
 func TestGateAcceptsNativeClaudeCodeAndCodex(t *testing.T) {
 	s := testSettings(t, "")
-	if d := Evaluate(s, Classify(s, claudeCodeRequest("")), "claude", scopeFor(s, "claude-code")); !d.Allow {
+	if d := Evaluate(s, Classify(claudeCodeRequest("")), "claude", scopeFor(s, "claude-code")); !d.Allow {
 		t.Fatalf("native Claude Code rejected: %+v", d)
 	}
-	if d := Evaluate(s, Classify(s, codexRequest()), "codex", scopeFor(s, "codex")); !d.Allow {
+	if d := Evaluate(s, Classify(codexRequest()), "codex", scopeFor(s, "codex")); !d.Allow {
 		t.Fatalf("official Codex rejected: %+v", d)
 	}
 }
@@ -192,58 +189,59 @@ func TestGateRejectsImpostorsAndTranslation(t *testing.T) {
 
 	copiedUA := claudeCodeRequest("")
 	copiedUA.Headers = http.Header{"User-Agent": {"claude-cli/2.1.280 (external, cli)"}}
-	if d := Evaluate(s, Classify(s, copiedUA), "claude", claudeScope); d.Allow || d.Code != "fleet_claude_client" {
+	if d := Evaluate(s, Classify(copiedUA), "claude", claudeScope); d.Allow || d.Code != "fleet_claude_client" {
 		t.Errorf("copied User-Agent allowed: %+v", d)
 	}
 
 	openAIForClaude := claudeCodeRequest("")
 	openAIForClaude.SourceFormat = "openai"
-	if d := Evaluate(s, Classify(s, openAIForClaude), "claude", claudeScope); d.Allow || d.Code != "fleet_claude_format" {
+	if d := Evaluate(s, Classify(openAIForClaude), "claude", claudeScope); d.Allow || d.Code != "fleet_claude_format" {
 		t.Errorf("translated OpenAI request allowed for Claude: %+v", d)
 	}
 
 	sdkPy := claudeCodeRequest("")
 	sdkPy.Headers.Set("User-Agent", "claude-cli/2.1.280 (external, sdk-py)")
-	if d := Evaluate(s, Classify(s, sdkPy), "claude", claudeScope); d.Allow {
+	if d := Evaluate(s, Classify(sdkPy), "claude", claudeScope); d.Allow {
 		t.Errorf("non-native entrypoint allowed: %+v", d)
 	}
 
 	uaOnly := codexRequest()
 	uaOnly.Headers.Del("Originator")
-	if d := Evaluate(s, Classify(s, uaOnly), "codex", codexScope); d.Allow || d.Code != "fleet_codex_client" {
+	if d := Evaluate(s, Classify(uaOnly), "codex", codexScope); d.Allow || d.Code != "fleet_codex_client" {
 		t.Errorf("Codex without Originator allowed: %+v", d)
 	}
 
 	other := codexRequest()
 	other.Headers.Set("User-Agent", "pi/1.0")
-	if d := Evaluate(s, Classify(s, other), "codex", codexScope); d.Allow {
+	if d := Evaluate(s, Classify(other), "codex", codexScope); d.Allow {
 		t.Errorf("non-Codex User-Agent allowed: %+v", d)
 	}
 
 	chat := codexRequest()
 	chat.SourceFormat = "openai"
-	if d := Evaluate(s, Classify(s, chat), "codex", codexScope); d.Allow || d.Code != "fleet_codex_format" {
+	if d := Evaluate(s, Classify(chat), "codex", codexScope); d.Allow || d.Code != "fleet_codex_format" {
 		t.Errorf("Chat Completions request allowed for Codex: %+v", d)
 	}
 }
 
 func TestGatePrincipalScoping(t *testing.T) {
 	s := testSettings(t, "")
-	if d := Evaluate(s, Classify(s, claudeCodeRequest("")), "claude", scopeFor(s, "codex")); d.Allow || d.Code != "fleet_key_provider_denied" {
+	if d := Evaluate(s, Classify(claudeCodeRequest("")), "claude", scopeFor(s, "codex")); d.Allow || d.Code != "fleet_key_provider_denied" {
 		t.Errorf("codex key reached Claude: %+v", d)
 	}
-	if d := Evaluate(s, Classify(s, codexRequest()), "codex", scopeFor(s, "claude-code")); d.Allow || d.Code != "fleet_key_provider_denied" {
+	if d := Evaluate(s, Classify(codexRequest()), "codex", scopeFor(s, "claude-code")); d.Allow || d.Code != "fleet_key_provider_denied" {
 		t.Errorf("claude key reached Codex: %+v", d)
 	}
-	if d := Evaluate(s, Classify(s, codexRequest()), "gemini", scopeFor(s, "codex")); d.Allow {
+	if d := Evaluate(s, Classify(codexRequest()), "gemini", scopeFor(s, "codex")); d.Allow {
 		t.Errorf("codex key reached an unlisted provider: %+v", d)
 	}
-	if d := Evaluate(s, Classify(s, codexRequest()), "codex", ""); d.Allow || d.Code != "fleet_unknown_caller" {
+	if d := Evaluate(s, Classify(codexRequest()), "codex", ""); d.Allow || d.Code != "fleet_unknown_caller" {
 		t.Errorf("unknown caller reached Codex: %+v", d)
 	}
-	open := testSettings(t, "gate:\n  deny-unknown-callers: false\n")
-	if d := Evaluate(open, Classify(open, codexRequest()), "codex", ""); !d.Allow {
-		t.Errorf("unknown caller should pass when allowed: %+v", d)
+	// Removed settings that could only weaken the gate are ignored.
+	legacy := testSettings(t, "gate:\n  deny-unknown-callers: false\n  providers: [claude]\n")
+	if d := Evaluate(legacy, Classify(codexRequest()), "codex", ""); d.Allow || d.Code != "fleet_unknown_caller" {
+		t.Errorf("legacy settings must not open the gate: %+v", d)
 	}
 	if d := Evaluate(s, Classification{}, "gemini", ""); !d.Allow {
 		t.Errorf("ungated provider without a fleet key should pass: %+v", d)
@@ -556,6 +554,7 @@ func TestHandleEndToEnd(t *testing.T) {
 	after.RequestID = "unseen"
 	after.SourceFormat = "openai"
 	after.ToFormat = "codex"
+	after.Metadata = map[string]any{"selected_auth_provider": "codex"}
 	after.CallerScope = cliproxysession.CallerScope("fleet:codex")
 	raw, _ = json.Marshal(after)
 	_ = json.Unmarshal(p.Handle(pluginabi.MethodRequestInterceptAfter, raw), &env)
@@ -572,8 +571,8 @@ func TestHandleEndToEnd(t *testing.T) {
 	if mr.StatusCode != http.StatusOK || strings.Contains(string(mr.Body), digest("codex-secret")) || !strings.Contains(string(mr.Body), `"fleet_codex_format"`) {
 		t.Fatalf("status response wrong: %d %s", mr.StatusCode, mr.Body)
 	}
-	if strings.Contains(string(p.Handle("nope", nil)), `"ok":true`) {
-		t.Fatal("unknown method must error")
+	if got := string(p.Handle("nope", nil)); got != `{"ok":false,"error":{"code":"unknown_method","message":"unknown method: nope"}}` {
+		t.Fatalf("unknown method envelope = %s", got)
 	}
 }
 
