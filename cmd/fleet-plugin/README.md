@@ -51,7 +51,9 @@ go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o fleet.so ./cmd/fleet-
 rm -f fleet.h
 ```
 
-The library file name sets the plugin ID: install it as `<plugins.dir>/fleet.so`.
+The library file name sets the plugin ID: install it as `<plugins.dir>/fleet.so`. Keep the
+directory and file root-owned and read-only to the proxy account; the host loads a
+content-addressed copy from `$TMPDIR/cliproxy-pluginhost/`.
 
 ## Configuration
 
@@ -63,7 +65,7 @@ upstream:
     disable-codex-cloaking: true      # never force Codex identity headers
 plugins:
   enabled: true
-  dir: "/var/lib/cliproxyapi/plugins"
+  dir: "/opt/cliproxyapi/current/plugins"   # root-owned; never writable by the service user
   configs:
     fleet:
       enabled: true
