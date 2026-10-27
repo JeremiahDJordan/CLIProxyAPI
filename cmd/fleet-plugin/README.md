@@ -60,9 +60,9 @@ content-addressed copy from `$TMPDIR/cliproxy-pluginhost/`.
 ```yaml
 upstream:
   claude:
-    disable-claude-cloak-mode: true   # never disguise other clients as Claude Code
+    disable-claude-cloak-mode: false  # auto (default): native Claude Code passes through; others are cloaked
   codex:
-    disable-codex-cloaking: true      # never force Codex identity headers
+    cloak-mode: auto                  # fleet default: official Codex clients keep their headers; others are cloaked
 plugins:
   enabled: true
   dir: "/opt/cliproxyapi/current/plugins"   # root-owned; never writable by the service user

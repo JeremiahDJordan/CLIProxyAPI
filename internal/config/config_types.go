@@ -257,6 +257,11 @@ type CodexConfig struct {
 	UpstreamRequestCompressionMinBytes int `yaml:"upstream-request-compression-min-bytes,omitempty" json:"upstream-request-compression-min-bytes,omitempty"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
+	// CloakMode selects when the official Codex identity headers are applied (fleet fork):
+	// "auto" (default) keeps an official Codex client's own User-Agent and Originator and
+	// cloaks every other client; "always" overwrites every request (upstream behavior);
+	// "never" disables cloaking. DisableCodexCloaking=true still means "never".
+	CloakMode string `yaml:"cloak-mode,omitempty" json:"cloak-mode,omitempty"`
 	// StreamBootstrapBuffering holds back the frames that arrive before generation starts, none of
 	// which the client has seen anything from - the handshake (response.created, response.in_progress,
 	// the websocket metadata frames), keepalive heartbeats, and the *.added announcements of an item

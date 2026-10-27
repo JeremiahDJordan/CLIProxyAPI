@@ -32,9 +32,17 @@ cache-aware affinity. It lives in the main module so it can reuse upstream's
 `multiagentv2.IsCodexClientUserAgent`. See `cmd/fleet-plugin/README.md`.
 
 Plugins require the host built with `CGO_ENABLED=1` (`plugins/` is upstream's ignored
-runtime directory, hence `cmd/fleet-plugin`). Deployment config sets
-`upstream.claude.disable-claude-cloak-mode: true` and
-`upstream.codex.disable-codex-cloaking: true`.
+runtime directory, hence `cmd/fleet-plugin`).
+
+Cloaking stays on as a backstop in case the client gate is ever disabled, so a
+non-native client never reaches a provider under its own identity. Claude uses
+upstream's default `auto` mode (only unconfirmed clients are cloaked). Codex gains
+`upstream.codex.cloak-mode` (`auto` default, `always`, `never`; the legacy
+`disable-codex-cloaking: true` still means `never`): `auto` keeps an official Codex
+client's own `User-Agent` and `Originator` (official User-Agent prefix plus an official
+originator) and applies the built-in identity to every other client, on both HTTP/SSE
+and WebSocket paths, instead of upstream's unconditional overwrite. Tests:
+`internal/runtime/executor/codex_cloak_mode_fleet_test.go`.
 
 Run `go test ./internal/fleet/ ./internal/client/codex/models ./internal/runtime/executor`
 then `go test ./...`. Tests use synthetic credentials and local upstreams only.
