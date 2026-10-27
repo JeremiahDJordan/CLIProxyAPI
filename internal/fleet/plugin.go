@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -34,6 +35,22 @@ type Plugin struct {
 	decisionsMu sync.Mutex
 	decisions   []PickDecision
 	gateDenials map[string]int
+}
+
+// targetProvider resolves the provider a request reaches after selection: the
+// selected credential's provider reported by the host for this execution, otherwise
+// the provider implied by an unambiguous target format. The ambiguous Responses
+// format (used by responses/compact for any provider) resolves to "".
+func targetProvider(toFormat string, metadata map[string]any) string {
+	if v, ok := metadata["selected_auth_provider"].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.ToLower(strings.TrimSpace(v))
+	}
+	switch f := strings.ToLower(strings.TrimSpace(toFormat)); f {
+	case sourceResponses:
+		return ""
+	default:
+		return f
+	}
 }
 
 // PickDecision records one scheduler outcome for the management view.
@@ -85,6 +102,7 @@ type capabilities struct {
 	FrontendAuthProvider             bool `json:"frontend_auth_provider"`
 	FrontendAuthProviderExclusive    bool `json:"frontend_auth_provider_exclusive"`
 	Scheduler                        bool `json:"scheduler"`
+	SchedulerAcrossPriorities        bool `json:"scheduler_across_priorities,omitempty"`
 	RequestInterceptor               bool `json:"request_interceptor"`
 	RequestInterceptorOmitBodyBefore bool `json:"request_interceptor_omit_body_before,omitempty"`
 	RequestInterceptorOmitBodyAfter  bool `json:"request_interceptor_omit_body_after,omitempty"`
@@ -189,7 +207,9 @@ func (p *Plugin) configure(raw []byte) ([]byte, error) {
 			FrontendAuthProvider:          hasKeys,
 			FrontendAuthProviderExclusive: hasKeys && settings.Exclusive,
 			Scheduler:                     settings.SchedulerEnabled,
-			RequestInterceptor:            settings.GateEnabled || hasKeys || settings.SchedulerEnabled,
+			// The weekly-reset rule ignores credential priority tiers, so rank every eligible account.
+			SchedulerAcrossPriorities: settings.SchedulerEnabled,
+			RequestInterceptor:        settings.GateEnabled || hasKeys || settings.SchedulerEnabled,
 			// The after-selection check needs only headers, formats and caller scope.
 			RequestInterceptorOmitBodyAfter: true,
 			WebSocketResponseObserver:       true,
@@ -225,7 +245,15 @@ func (p *Plugin) interceptAfter(raw []byte) ([]byte, error) {
 	if !ok {
 		cl = Classify(settings, req)
 	}
-	d := Evaluate(settings, cl, req.ToFormat, req.CallerScope)
+	provider := targetProvider(req.ToFormat, req.Metadata)
+	if provider == "" && settings.GateEnabled {
+		d := Decision{Code: "fleet_unresolved_provider", Reason: "the selected credential's provider could not be determined"}
+		p.decisionsMu.Lock()
+		p.gateDenials[d.Code]++
+		p.decisionsMu.Unlock()
+		return okEnvelope(Denial(d))
+	}
+	d := Evaluate(settings, cl, provider, req.CallerScope)
 	if d.Allow {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
@@ -255,9 +283,11 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 		decision.Reason = "not-handled"
 		return pluginapi.SchedulerPickResponse{Handled: false}, decision
 	}
-	session := SessionFromHeaders(req.Options.Headers)
-	if session == "" {
-		session = sessionFromMetadata(req.Options.Metadata)
+	// Prefer the host's canonical identity (derived from headers and body, as in the
+	// before-selection hook); re-deriving from headers alone can be weaker.
+	session, _ := req.Options.Metadata["canonical_session_id"].(string)
+	if session = strings.TrimSpace(session); session == "" {
+		session = cliproxyauth.CanonicalSessionID(req.Options.Headers, nil, req.Options.Metadata)
 	}
 	if session != "" {
 		decision.SessionHash = shortHash(session)
@@ -314,7 +344,7 @@ func (p *Plugin) usage(raw []byte) ([]byte, error) {
 		return okEnvelope(struct{}{})
 	}
 	now := p.Now()
-	p.Book.Observe(rec.Provider, rec.AuthID, firstNonEmpty(rec.Model, rec.Alias), rec.ResponseHeaders, now)
+	p.Book.Observe(rec.Provider, rec.AuthID, rec.Model, rec.ResponseHeaders, now, rec.Alias)
 	return okEnvelope(struct{}{})
 }
 
@@ -328,7 +358,7 @@ func (p *Plugin) websocketEvent(raw []byte) ([]byte, error) {
 		if provider == "" {
 			provider = "codex"
 		}
-		p.Book.Observe(provider, ev.AuthID, firstNonEmpty(ev.Model, ev.RequestedModel), headers, p.Now())
+		p.Book.Observe(provider, ev.AuthID, ev.Model, headers, p.Now(), ev.RequestedModel)
 	}
 	return okEnvelope(struct{}{})
 }
@@ -418,15 +448,6 @@ func (p *Plugin) record(d PickDecision) {
 func shortHash(v string) string {
 	sum := sha256.Sum256([]byte(v))
 	return hex.EncodeToString(sum[:6])
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 func okEnvelope(v any) ([]byte, error) {

@@ -154,6 +154,12 @@ func ParseConfig(raw []byte) (Settings, error) {
 		s.Keys = append(s.Keys, k)
 	}
 	s.Exclusive = boolDefault(cfg.Exclusive, len(s.Keys) > 0)
+	// Non-plugin credentials (access.api-keys) are authenticated by the host without this
+	// plugin, so they could reach routes the gate never inspects. The gate therefore
+	// requires fleet keys to be the only authentication.
+	if s.GateEnabled && (len(s.Keys) == 0 || !s.Exclusive) {
+		return Settings{}, fmt.Errorf("fleet: the client gate requires fleet keys with exclusive authentication")
+	}
 	return s, nil
 }
 

@@ -26,7 +26,9 @@ var (
 	claudeWindowHeader = regexp.MustCompile(`(?i)^anthropic-ratelimit-unified-([a-z0-9_]+)-(status|reset|utilization)$`)
 	// X-Codex-[<limit>-]<primary|secondary>-<field>, as produced by the Codex backend
 	// and by upstream helps.ParseCodexQuotaEventHeaders for WebSocket rate-limit events.
-	codexWindowHeader = regexp.MustCompile(`(?i)^x-codex-(?:([a-z0-9][a-z0-9-]*?)-)?(primary|secondary)-(used-percent|window-minutes|reset-after-seconds|reset-at)$`)
+	// Limit identifiers use upstream's normalized alphabet (letters, digits, '.', '_', '-'),
+	// e.g. X-Codex-Additional-GPT-5.3-Codex-Spark-Secondary-Used-Percent.
+	codexWindowHeader = regexp.MustCompile(`(?i)^x-codex-(?:([a-z0-9][a-z0-9._-]*?)-)?(primary|secondary)-(used-percent|window-minutes|reset-after-seconds|reset-at)$`)
 )
 
 // Window is the latest observation of one quota window.
@@ -82,25 +84,27 @@ type QuotaBook struct {
 // NewQuotaBook returns an empty quota book.
 func NewQuotaBook() *QuotaBook { return &QuotaBook{accounts: map[string]*Account{}} }
 
-// Observe records rate-limit headers returned for authID while serving model.
+// Observe records rate-limit headers returned for authID while serving model; any
+// aliases (the requested route model) share the model-specific association. A Codex
+// response metered by the shared limit clears earlier associations for those names.
 // It reports whether any quota window was recognized.
-func (b *QuotaBook) Observe(provider, authID, model string, headers http.Header, now time.Time) bool {
+func (b *QuotaBook) Observe(provider, authID, model string, headers http.Header, now time.Time, aliases ...string) bool {
 	authID = strings.TrimSpace(authID)
 	if authID == "" || len(headers) == 0 {
 		return false
 	}
 	var windows []Window
-	modelSpecific := ""
+	modelSpecific, shared := "", false
 	switch strings.ToLower(provider) {
 	case "claude":
 		windows, modelSpecific = parseClaudeWindows(headers, now)
 	case "codex":
-		windows, modelSpecific = parseCodexWindows(headers, now)
+		windows, modelSpecific, shared = parseCodexWindows(headers, now)
 	default:
 		if w, m := parseClaudeWindows(headers, now); len(w) > 0 {
 			windows, modelSpecific, provider = w, m, "claude"
-		} else if w, m := parseCodexWindows(headers, now); len(w) > 0 {
-			windows, modelSpecific, provider = w, m, "codex"
+		} else if w, m, sh := parseCodexWindows(headers, now); len(w) > 0 {
+			windows, modelSpecific, shared, provider = w, m, sh, "codex"
 		}
 	}
 	if len(windows) == 0 {
@@ -120,8 +124,16 @@ func (b *QuotaBook) Observe(provider, authID, model string, headers http.Header,
 		}
 		acct.Windows[w.Name] = w
 	}
-	if modelSpecific != "" && model != "" {
-		acct.ModelWeekly[modelKey(model)] = modelSpecific
+	if modelSpecific != "" || shared {
+		for _, name := range append([]string{model}, aliases...) {
+			if key := modelKey(name); key == "" {
+				continue
+			} else if modelSpecific != "" {
+				acct.ModelWeekly[key] = modelSpecific
+			} else {
+				delete(acct.ModelWeekly, key)
+			}
+		}
 	}
 	acct.UpdatedAt = now
 	return true
@@ -318,7 +330,15 @@ func parseClaudeWindows(headers http.Header, now time.Time) ([]Window, string) {
 	return out, specific
 }
 
-func parseCodexWindows(headers http.Header, now time.Time) ([]Window, string) {
+// codexSharedLimits are X-Codex-Active-Limit names Codex uses for the plan-wide limit
+// (the unnamed primary/secondary windows); named limits look like "codex_bengalfox" or
+// "GPT-5.3-Codex-Spark".
+var codexSharedLimits = map[string]bool{"codex": true, "premium": true}
+
+// parseCodexWindows also reports shared when X-Codex-Active-Limit names the plan-wide
+// limit. Other unmatched names (such as a named limit whose weekly window is missing
+// from a partial update) are not treated as shared.
+func parseCodexWindows(headers http.Header, now time.Time) (out []Window, specific string, shared bool) {
 	type raw struct {
 		used, minutes, after float64
 		at                   time.Time
@@ -364,8 +384,6 @@ func parseCodexWindows(headers http.Header, now time.Time) ([]Window, string) {
 			}
 		}
 	}
-	specific := ""
-	var out []Window
 	for name, r := range byName {
 		if !r.hasUsed || !r.hasMinutes || r.minutes <= 0 {
 			continue
@@ -384,12 +402,28 @@ func parseCodexWindows(headers http.Header, now time.Time) ([]Window, string) {
 		} else if r.hasAfter {
 			w.ResetAt = now.Add(time.Duration(r.after * float64(time.Second)))
 		}
-		if w.Kind == kindWeekly && strings.Contains(name, "-") {
-			specific = name
-		}
 		out = append(out, w)
 	}
-	return out, specific
+	// Responses carry every limit's windows; only the limit that metered this request
+	// (X-Codex-Active-Limit) is model-specific for it. Without a match the model uses
+	// the shared weekly window.
+	if active := strings.ToLower(strings.TrimSpace(headerGet(headers, "X-Codex-Active-Limit"))); active != "" {
+		for _, w := range out {
+			if prefix, named := limitPrefix(w.Name); named && w.Kind == kindWeekly && activeLimitMatches(active, prefix) {
+				specific = w.Name
+				break
+			}
+		}
+		shared = specific == "" && codexSharedLimits[active]
+	}
+	return out, specific, shared
+}
+
+// activeLimitMatches relates X-Codex-Active-Limit ("codex_bengalfox",
+// "GPT-5.3-Codex-Spark") to a window's limit prefix ("bengalfox",
+// "additional-gpt-5.3-codex-spark").
+func activeLimitMatches(active, prefix string) bool {
+	return prefix == active || prefix == "additional-"+active || strings.HasSuffix(active, "_"+prefix)
 }
 
 // parseResetTime accepts Unix seconds, Unix milliseconds or RFC 3339.

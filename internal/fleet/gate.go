@@ -12,6 +12,7 @@ import (
 
 	multiagentv2 "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -48,10 +49,9 @@ func NewClassifier() *Classifier { return &Classifier{byReq: map[string]Classifi
 // Classify inspects a request as it arrives from the client.
 func Classify(settings Settings, req pluginapi.RequestInterceptRequest) Classification {
 	c := Classification{SourceFormat: strings.ToLower(strings.TrimSpace(req.SourceFormat))}
-	c.Session = SessionFromHeaders(req.Headers)
-	if c.Session == "" {
-		c.Session = sessionFromMetadata(req.Metadata)
-	}
+	// The host's canonical derivation covers explicit session headers and Claude Code's
+	// metadata.user_id; the scheduler derives the same identity from its pick metadata.
+	c.Session = cliproxyauth.CanonicalSessionID(req.Headers, req.Body, req.Metadata)
 	if c.SourceFormat == sourceClaude {
 		path, _ := req.Metadata["request_path"].(string)
 		countTokens := strings.Contains(path, "count_tokens")
@@ -128,9 +128,9 @@ func KeyForScope(settings Settings, scope string) (Key, bool) {
 	return Key{}, false
 }
 
-// Evaluate decides whether a request may reach its selected provider format.
-func Evaluate(settings Settings, cl Classification, toFormat, callerScope string) Decision {
-	target := strings.ToLower(strings.TrimSpace(toFormat))
+// Evaluate decides whether a request may reach the provider of its selected credential.
+func Evaluate(settings Settings, cl Classification, provider, callerScope string) Decision {
+	target := strings.ToLower(strings.TrimSpace(provider))
 	key, known := KeyForScope(settings, callerScope)
 	if known && !key.Providers[target] {
 		return Decision{Code: "fleet_key_provider_denied", Reason: "client key " + key.Name + " is not allowed to use " + target + " models"}
@@ -184,6 +184,12 @@ func Authenticate(settings Settings, req pluginapi.FrontendAuthRequest) pluginap
 	digest := sha256.Sum256([]byte(presented))
 	for _, k := range settings.Keys {
 		if subtle.ConstantTimeCompare(digest[:], k.Digest[:]) == 1 {
+			if !RouteAllowed(k, req.Method, req.Path) {
+				return pluginapi.FrontendAuthResponse{
+					DenyStatusCode: http.StatusForbidden,
+					DenyMessage:    "fleet_route_denied: client key " + k.Name + " may not use " + req.Method + " " + req.Path,
+				}
+			}
 			return pluginapi.FrontendAuthResponse{
 				Authenticated: true,
 				Principal:     k.Principal(),
@@ -192,6 +198,32 @@ func Authenticate(settings Settings, req pluginapi.FrontendAuthRequest) pluginap
 		}
 	}
 	return pluginapi.FrontendAuthResponse{Authenticated: false}
+}
+
+// RouteAllowed limits fleet keys to the routes the client gate inspects. Other
+// provider-reaching routes (search, live/realtime, images, video, audio, Gemini)
+// select credentials without request interceptors, so they are denied outright.
+func RouteAllowed(k Key, method, path string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	if method == http.MethodGet && (path == "/v1/models" || strings.HasPrefix(path, "/v1/models/")) {
+		return true
+	}
+	if k.Providers["claude"] && method == http.MethodPost &&
+		(path == "/v1/messages" || path == "/v1/messages/count_tokens") {
+		return true
+	}
+	if k.Providers["codex"] {
+		for _, prefix := range []string{"/v1", "/backend-api/codex"} {
+			switch {
+			case path == prefix+"/responses" && (method == http.MethodPost || method == http.MethodGet):
+				return true
+			case path == prefix+"/responses/compact" && method == http.MethodPost:
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func presentedKey(req pluginapi.FrontendAuthRequest) string {

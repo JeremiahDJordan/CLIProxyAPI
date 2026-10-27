@@ -183,30 +183,6 @@ func Rank(book *QuotaBook, candidates []pluginapi.SchedulerAuthCandidate, model 
 	return out
 }
 
-// sessionHeaders are explicit client session identities, in upstream's priority order.
-var sessionHeaders = []string{"X-Claude-Code-Session-Id", "Session-Id", "Session_id", "X-Session-Id", "X-Session-Affinity", "X-Client-Request-Id"}
-
-// SessionFromHeaders extracts the explicit session identity sent by Claude Code
-// (X-Claude-Code-Session-Id) or Codex (Session-Id) and compatible clients.
-func SessionFromHeaders(headers http.Header) string {
-	for _, name := range sessionHeaders {
-		if v := strings.TrimSpace(headerGet(headers, name)); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// sessionFromMetadata falls back to the host's reconciled session identities.
-func sessionFromMetadata(meta map[string]any) string {
-	for _, key := range []string{"canonical_session_id", "execution_session_id", "derived_session_id"} {
-		if v, ok := meta[key].(string); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
-
 func headerGet(headers http.Header, name string) string {
 	if v := headers.Get(name); v != "" {
 		return v

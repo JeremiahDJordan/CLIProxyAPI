@@ -5,7 +5,12 @@
 1. **Per-tool client keys** (`frontend_auth`). Keys are configured as SHA-256 digests only.
    Each key names the provider formats it may reach (`claude`, `codex`). With keys
    configured the plugin is the **exclusive** request authenticator, so
-   `access.api-keys` no longer admits requests.
+   `access.api-keys` no longer admits requests. A fleet key reaches only the routes the
+   gate inspects: `GET /v1/models[/...]`; for Claude keys `POST /v1/messages[/count_tokens]`;
+   for Codex keys `/v1/responses` (POST and WebSocket GET) and `POST /v1/responses/compact`,
+   also under `/backend-api/codex`. Other credentialed routes (alpha search, live and
+   realtime, images, video, audio, Chat Completions, Gemini) select credentials without
+   request interceptors, so they are refused with `403 fleet_route_denied`.
 2. **Native-client gate** (`request.intercept_before` + `request.intercept_after`).
    After credential selection, requests whose target format is `claude` must be
    native Anthropic Messages requests confirmed as Claude Code by upstream's detector
@@ -97,8 +102,13 @@ Generate a key and its digest without echoing it to logs, for example
 - Client identity is self-reported. The gate stops other tools and accidental
   configuration; a client that reproduces every Claude Code or Codex signal can pass.
   The tailnet-only listener and the per-tool keys are the access boundary.
-- The gate applies to the target formats `claude` and `codex` regardless of whether the
-  selected credential is OAuth or an API key.
+- The gate applies to Claude and Codex credentials regardless of whether they are OAuth
+  or API keys. It uses the selected credential's provider, which the fork's host passes
+  to the after-auth interceptor as `selected_auth_provider` (needed for
+  `responses/compact`, whose wire format is `openai-response` for every provider); if an
+  ambiguous format arrives without it, the gate fails closed (`fleet_unresolved_provider`).
+- The gate requires fleet keys with exclusive authentication: host-authenticated
+  `access.api-keys` never reach the plugin and could otherwise use uninspected routes.
 - `scheduler.pick` runs before the after-selection gate, so a request that is later
   denied still refreshes its session binding.
 - State is in memory; a restart forgets quota windows until the next responses.

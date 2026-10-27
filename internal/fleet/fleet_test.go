@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -97,9 +99,16 @@ func TestParseConfigDefaultsAndValidation(t *testing.T) {
 			t.Errorf("expected error for %q", bad)
 		}
 	}
-	none, _ := ParseConfig(nil)
-	if none.Exclusive {
-		t.Fatal("exclusive must default false without keys")
+	// The gate needs exclusive fleet keys; otherwise host-authenticated keys could reach
+	// routes the gate never inspects.
+	for _, insecure := range []string{"", "exclusive: false\nkeys:\n  - name: a\n    sha256: " + digest("x") + "\n    providers: [claude]\n"} {
+		if _, err := ParseConfig([]byte(insecure)); err == nil {
+			t.Errorf("gate without exclusive fleet keys must be rejected: %q", insecure)
+		}
+	}
+	none, err := ParseConfig([]byte("gate:\n  enabled: false\n"))
+	if err != nil || none.Exclusive {
+		t.Fatalf("scheduler-only config without keys should parse non-exclusive: %+v %v", none, err)
 	}
 }
 
@@ -114,18 +123,55 @@ func TestCallerScopeMatchesHost(t *testing.T) {
 func TestAuthenticateKeys(t *testing.T) {
 	s := testSettings(t, "")
 	cases := []struct {
-		headers http.Header
-		want    string
+		headers      http.Header
+		method, path string
+		want         string
 	}{
-		{http.Header{"Authorization": {"Bearer claude-secret"}}, "fleet:claude-code"},
-		{http.Header{"X-Api-Key": {"codex-secret"}}, "fleet:codex"},
-		{http.Header{"Authorization": {"Bearer wrong"}}, ""},
-		{http.Header{}, ""},
+		{http.Header{"Authorization": {"Bearer claude-secret"}}, "POST", "/v1/messages", "fleet:claude-code"},
+		{http.Header{"X-Api-Key": {"codex-secret"}}, "POST", "/v1/responses", "fleet:codex"},
+		{http.Header{"Authorization": {"Bearer wrong"}}, "POST", "/v1/messages", ""},
+		{http.Header{}, "POST", "/v1/messages", ""},
 	}
 	for _, c := range cases {
-		resp := Authenticate(s, pluginapi.FrontendAuthRequest{Headers: c.headers})
-		if resp.Authenticated != (c.want != "") || resp.Principal != c.want {
+		resp := Authenticate(s, pluginapi.FrontendAuthRequest{Method: c.method, Path: c.path, Headers: c.headers})
+		if resp.Authenticated != (c.want != "") || resp.Principal != c.want || resp.DenyStatusCode != 0 {
 			t.Errorf("headers %v: got %+v, want principal %q", c.headers, resp, c.want)
+		}
+	}
+}
+
+// Fleet keys reach only routes the client gate inspects; credentialed routes that skip
+// request interceptors (search, live/realtime, media, Gemini) are refused.
+func TestAuthenticateRouteAllowlist(t *testing.T) {
+	s := testSettings(t, "")
+	claude := http.Header{"Authorization": {"Bearer claude-secret"}}
+	codex := http.Header{"Authorization": {"Bearer codex-secret"}}
+	for _, c := range []struct {
+		headers      http.Header
+		method, path string
+		allowed      bool
+	}{
+		{claude, "GET", "/v1/models", true},
+		{claude, "POST", "/v1/messages/count_tokens", true},
+		{codex, "GET", "/v1/responses", true},
+		{codex, "POST", "/backend-api/codex/responses/compact", true},
+		{codex, "POST", "/v1/responses/compact/", true},
+		{claude, "POST", "/v1/alpha/search", false},
+		{codex, "POST", "/backend-api/codex/alpha/search", false},
+		{codex, "POST", "/v1/realtime/client_secrets", false},
+		{codex, "GET", "/v1/realtime", false},
+		{codex, "POST", "/v1/images/generations", false},
+		{codex, "POST", "/v1/chat/completions", false},
+		{codex, "POST", "/v1/messages", false},
+		{claude, "POST", "/v1/responses", false},
+		{claude, "POST", "/v1beta/models/gemini:generateContent", false},
+	} {
+		resp := Authenticate(s, pluginapi.FrontendAuthRequest{Method: c.method, Path: c.path, Headers: c.headers})
+		if c.allowed && !resp.Authenticated {
+			t.Errorf("%s %s should be allowed: %+v", c.method, c.path, resp)
+		}
+		if !c.allowed && (resp.Authenticated || resp.DenyStatusCode != http.StatusForbidden) {
+			t.Errorf("%s %s should be denied with 403: %+v", c.method, c.path, resp)
 		}
 	}
 }
@@ -270,6 +316,7 @@ func TestParseCodexWindows(t *testing.T) {
 	h.Set("X-Codex-Code-Review-Primary-Used-Percent", "100")
 	h.Set("X-Codex-Code-Review-Primary-Window-Minutes", "300")
 	h.Set("X-Codex-Code-Review-Primary-Reset-After-Seconds", "60")
+	h.Set("X-Codex-Active-Limit", "codex_bengalfox")
 	b := NewQuotaBook()
 	b.Observe("codex", "c", "gpt-6-1-codex-spark", h, t0)
 	a, _ := b.Snapshot("c")
@@ -475,7 +522,7 @@ func TestHandleEndToEnd(t *testing.T) {
 	var reg registration
 	_ = json.Unmarshal(env.Result, &reg)
 	c := reg.Capabilities
-	if !c.FrontendAuthProvider || !c.FrontendAuthProviderExclusive || !c.Scheduler || !c.RequestInterceptor || !c.UsagePlugin || !c.WebSocketResponseObserver || !c.RequestInterceptorOmitBodyAfter {
+	if !c.FrontendAuthProvider || !c.FrontendAuthProviderExclusive || !c.Scheduler || !c.RequestInterceptor || !c.UsagePlugin || !c.WebSocketResponseObserver || !c.RequestInterceptorOmitBodyAfter || !c.SchedulerAcrossPriorities {
 		t.Fatalf("capabilities wrong: %+v", c)
 	}
 
@@ -540,5 +587,218 @@ func TestPickMixedRouteUsesCandidateProvider(t *testing.T) {
 	req.Candidates[1].Provider = "codex"
 	if resp, _ := p.Pick(req); resp.Handled {
 		t.Fatal("mixed multi-provider route must defer to the host")
+	}
+}
+
+// Only the limit named by X-Codex-Active-Limit becomes model-specific; a response for
+// a normal model carrying another limit's exhausted window does not exclude it.
+func TestCodexActiveLimitSelectsModelWindow(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Codex-Secondary-Used-Percent", "20")
+	h.Set("X-Codex-Secondary-Window-Minutes", "10080")
+	h.Set("X-Codex-Secondary-Reset-At", strconv.FormatInt(t0.Add(72*time.Hour).Unix(), 10))
+	for _, limit := range []string{"Bengalfox", "Other"} {
+		h.Set("X-Codex-"+limit+"-Secondary-Used-Percent", "100")
+		h.Set("X-Codex-"+limit+"-Secondary-Window-Minutes", "10080")
+		h.Set("X-Codex-"+limit+"-Secondary-Reset-At", strconv.FormatInt(t0.Add(24*time.Hour).Unix(), 10))
+	}
+	for _, active := range []string{"codex", ""} {
+		h.Set("X-Codex-Active-Limit", active)
+		b := NewQuotaBook()
+		b.Observe("codex", "c", "gpt-6-1", h, t0)
+		a, _ := b.Snapshot("c")
+		if len(a.ModelWeekly) != 0 {
+			t.Fatalf("active %q: unrelated named limit mapped: %+v", active, a.ModelWeekly)
+		}
+		if v := ViewFor(a, "gpt-6-1", t0); v.Excluded() || v.WeeklyWindow != "secondary" {
+			t.Fatalf("active %q: normal model should use the shared window: %+v", active, v)
+		}
+	}
+}
+
+// WebSocket additional limits use upstream's identifier alphabet (dots, mixed case).
+func TestCodexWebSocketAdditionalLimitParsed(t *testing.T) {
+	headers := helps.ParseCodexQuotaEventHeaders([]byte(`{"type":"codex.rate_limits","meteredLimitName":"GPT-5.3-Codex-Spark",
+		"rateLimit":{"primary":{"usedPercent":10,"windowMinutes":10080,"resetAfterSeconds":300000}},
+		"additionalRateLimits":[{"limitName":"GPT-5.3-Codex-Spark","rateLimit":{
+			"primary":{"usedPercent":20,"windowMinutes":300,"resetAfterSeconds":600},
+			"secondary":{"usedPercent":100,"windowMinutes":10080,"resetAfterSeconds":120000}}}]}`))
+	if len(headers) == 0 {
+		t.Fatal("upstream parser produced no headers")
+	}
+	b := NewQuotaBook()
+	if !b.Observe("codex", "c", "gpt-5.3-codex-spark", headers, t0) {
+		t.Fatalf("no windows recognized from %v", headers)
+	}
+	a, _ := b.Snapshot("c")
+	if a.ModelWeekly["gpt-5.3-codex-spark"] != "additional-gpt-5.3-codex-spark-secondary" {
+		t.Fatalf("spark weekly not mapped: %+v windows=%v", a.ModelWeekly, a.Windows)
+	}
+	if v := ViewFor(a, "gpt-5.3-codex-spark", t0); !v.WeeklyBlock {
+		t.Fatalf("exhausted spark weekly should exclude spark: %+v", v)
+	}
+}
+
+// Model-specific windows observed under the resolved model also apply to the alias
+// the scheduler sees.
+func TestObserveMapsAliasToModelWindow(t *testing.T) {
+	b := NewQuotaBook()
+	b.Observe("claude", "a", "claude-opus-5-5", claudeHeaders(0.1, 0.2, t0.Add(time.Hour), t0.Add(72*time.Hour), map[string]string{
+		"Anthropic-Ratelimit-Unified-7d_oi-Utilization": "1.0",
+		"Anthropic-Ratelimit-Unified-7d_oi-Reset":       strconv.FormatInt(t0.Add(48*time.Hour).Unix(), 10),
+	}), t0, "opus")
+	a, _ := b.Snapshot("a")
+	if v := ViewFor(a, "opus", t0); !v.WeeklyBlock || v.WeeklyWindow != "7d_oi" {
+		t.Fatalf("alias should use the model window: %+v", v)
+	}
+}
+
+// The gate uses the provider the host reports for the selected credential: native Codex
+// compaction (ToFormat openai-response) passes, an ambiguous format without it fails
+// closed, and a Codex-only key cannot reach a Claude credential even if earlier usage
+// records for the same auth ID came from a Codex account.
+func TestGateUsesHostReportedProvider(t *testing.T) {
+	p, _ := newTestPlugin(t, "")
+	run := func(toFormat string, meta map[string]any) pluginapi.RequestInterceptResponse {
+		req := codexRequest()
+		req.ToFormat = toFormat
+		req.CallerScope = scopeFor(p.Settings(), "codex")
+		req.Metadata = meta
+		raw, _ := json.Marshal(req)
+		var env struct {
+			Result pluginapi.RequestInterceptResponse `json:"result"`
+		}
+		_ = json.Unmarshal(p.Handle(pluginabi.MethodRequestInterceptAfter, raw), &env)
+		return env.Result
+	}
+	if resp := run("openai-response", map[string]any{"selected_auth_id": "a"}); !resp.Terminate ||
+		!strings.Contains(string(resp.ResponseBody), "fleet_unresolved_provider") {
+		t.Fatalf("ambiguous format without provider should fail closed: %+v", resp)
+	}
+	if resp := run("openai-response", map[string]any{"selected_auth_provider": "codex"}); resp.Terminate {
+		t.Fatalf("official Codex compaction rejected: %s", resp.ResponseBody)
+	}
+	// A stale Codex observation for the same auth ID must not open the gate.
+	rec, _ := json.Marshal(pluginapi.UsageRecord{Provider: "codex", AuthID: "account.json", Model: "gpt-6-1"})
+	p.Handle(pluginabi.MethodUsageHandle, rec)
+	if resp := run("claude", map[string]any{"selected_auth_id": "account.json", "selected_auth_provider": "claude"}); !resp.Terminate ||
+		!strings.Contains(string(resp.ResponseBody), "fleet_key_provider_denied") {
+		t.Fatalf("codex key reached a Claude credential: %+v", resp)
+	}
+	if resp := run("claude", map[string]any{"selected_auth_id": "account.json"}); !resp.Terminate {
+		t.Fatalf("unambiguous claude target without provider metadata must still be gated: %+v", resp)
+	}
+}
+
+// Claude Code sessions identified only by metadata.user_id keep their one-hour cache
+// lifetime because both hooks use the host's canonical session identity.
+func TestMetadataSessionKeepsExtendedCache(t *testing.T) {
+	p, now := newTestPlugin(t, "")
+	p.Book.Observe("claude", "later", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(72*time.Hour), nil), t0)
+	encoded, _ := json.Marshal(claudeUserID)
+	req := claudeCodeRequest(`{"model":"m","metadata":{"user_id":` + string(encoded) + `},"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`)
+	req.Headers.Del("X-Claude-Code-Session-Id")
+	raw, _ := json.Marshal(req)
+	p.Handle(pluginabi.MethodRequestInterceptBefore, raw)
+	session := cliproxyauth.CanonicalSessionID(req.Headers, req.Body, nil)
+	if session == "" {
+		t.Fatal("fixture has no metadata session")
+	}
+	pick := func(ids ...string) (pluginapi.SchedulerPickResponse, PickDecision) {
+		return p.Pick(pluginapi.SchedulerPickRequest{Provider: "claude", Model: "m", Candidates: candidates(ids...),
+			Options: pluginapi.SchedulerOptions{Metadata: map[string]any{"canonical_session_id": session}}})
+	}
+	pick("later")
+	p.Book.Observe("claude", "soon", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(24*time.Hour), nil), t0)
+	*now = t0.Add(40 * time.Minute)
+	if resp, d := pick("later", "soon"); resp.AuthID != "later" || d.Reason != "affinity" {
+		t.Fatalf("1h metadata session moved at 40m: %+v %+v", resp, d)
+	}
+}
+
+// Subagent sessions (session header plus body metadata.agent_id) keep their one-hour
+// cache: the scheduler uses the host's canonical identity instead of re-deriving a
+// weaker header-only one.
+func TestSubagentSessionUsesHostCanonicalIdentity(t *testing.T) {
+	p, now := newTestPlugin(t, "")
+	p.Book.Observe("claude", "later", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(72*time.Hour), nil), t0)
+	encoded, _ := json.Marshal(claudeUserID)
+	req := claudeCodeRequest(`{"model":"m","metadata":{"user_id":` + string(encoded) + `,"agent_id":"worker-1"},"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`)
+	raw, _ := json.Marshal(req)
+	p.Handle(pluginabi.MethodRequestInterceptBefore, raw)
+	canonical := cliproxyauth.CanonicalSessionID(req.Headers, req.Body, nil)
+	if canonical == cliproxyauth.CanonicalSessionID(req.Headers, nil, nil) {
+		t.Fatalf("fixture must make the body-derived identity differ from the header-only one: %q", canonical)
+	}
+	pick := func(ids ...string) (pluginapi.SchedulerPickResponse, PickDecision) {
+		return p.Pick(pluginapi.SchedulerPickRequest{Provider: "claude", Model: "m", Candidates: candidates(ids...),
+			Options: pluginapi.SchedulerOptions{Headers: req.Headers, Metadata: map[string]any{"canonical_session_id": canonical}}})
+	}
+	pick("later")
+	p.Book.Observe("claude", "soon", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(24*time.Hour), nil), t0)
+	*now = t0.Add(40 * time.Minute)
+	if resp, d := pick("later", "soon"); resp.AuthID != "later" || d.Reason != "affinity" {
+		t.Fatalf("1h subagent session moved at 40m: %+v %+v", resp, d)
+	}
+}
+
+// A route alias retargeted from a model-specific Codex limit to one metered by the shared
+// limit stops using the old model window; a response without X-Codex-Active-Limit keeps it.
+func TestCodexSharedLimitClearsStaleAlias(t *testing.T) {
+	headers := func(active string) http.Header {
+		h := http.Header{}
+		h.Set("X-Codex-Secondary-Used-Percent", "20")
+		h.Set("X-Codex-Secondary-Window-Minutes", "10080")
+		h.Set("X-Codex-Secondary-Reset-At", strconv.FormatInt(t0.Add(72*time.Hour).Unix(), 10))
+		h.Set("X-Codex-Spark-Secondary-Used-Percent", "100")
+		h.Set("X-Codex-Spark-Secondary-Window-Minutes", "10080")
+		h.Set("X-Codex-Spark-Secondary-Reset-At", strconv.FormatInt(t0.Add(24*time.Hour).Unix(), 10))
+		if active != "" {
+			h.Set("X-Codex-Active-Limit", active)
+		}
+		return h
+	}
+	b := NewQuotaBook()
+	b.Observe("codex", "c", "gpt-spark", headers("codex_spark"), t0, "fast")
+	a, _ := b.Snapshot("c")
+	if v := ViewFor(a, "fast", t0); v.WeeklyWindow != "spark-secondary" || !v.WeeklyBlock {
+		t.Fatalf("alias should start on the Spark window: %+v", v)
+	}
+	b.Observe("codex", "c", "gpt-6-1", headers(""), t0, "fast")
+	a, _ = b.Snapshot("c")
+	if v := ViewFor(a, "fast", t0); v.WeeklyWindow != "spark-secondary" {
+		t.Fatalf("a response without an active limit must not clear the alias: %+v", v)
+	}
+	for _, shared := range []string{"codex", "premium"} {
+		b.Observe("codex", "c", "gpt-spark", headers("codex_spark"), t0, "fast")
+		b.Observe("codex", "c", "gpt-6-1", headers(shared), t0, "fast")
+		a, _ = b.Snapshot("c")
+		if v := ViewFor(a, "fast", t0); v.WeeklyWindow != "secondary" || v.Excluded() {
+			t.Fatalf("%s: retargeted alias should use the shared window: %+v", shared, v)
+		}
+		if _, ok := a.ModelWeekly["gpt-spark"]; !ok {
+			t.Fatalf("%s: the Spark model keeps its own association: %+v", shared, a.ModelWeekly)
+		}
+	}
+}
+
+// A WebSocket update that still names Spark but omits its weekly window keeps the Spark
+// association, so the exhausted weekly window keeps excluding the account.
+func TestCodexPartialNamedUpdateKeepsWeeklyBlock(t *testing.T) {
+	b := NewQuotaBook()
+	full := helps.ParseCodexQuotaEventHeaders([]byte(`{"type":"codex.rate_limits","metered_limit_name":"GPT-5.3-Codex-Spark",
+		"rate_limits":{"primary":{"used_percent":20,"window_minutes":10080,"reset_after_seconds":300000}},
+		"additional_rate_limits":{"GPT-5.3-Codex-Spark":{"primary":{"used_percent":10,"window_minutes":300,"reset_after_seconds":600},
+			"secondary":{"used_percent":100,"window_minutes":10080,"reset_after_seconds":120000}}}}`))
+	partial := helps.ParseCodexQuotaEventHeaders([]byte(`{"type":"codex.rate_limits","metered_limit_name":"GPT-5.3-Codex-Spark",
+		"rate_limits":{"primary":{"used_percent":20,"window_minutes":10080,"reset_after_seconds":299999}},
+		"additional_rate_limits":{"GPT-5.3-Codex-Spark":{"primary":{"used_percent":10,"window_minutes":300,"reset_after_seconds":599},"secondary":null}}}`))
+	b.Observe("codex", "c", "gpt-spark", full, t0, "fast")
+	b.Observe("codex", "c", "gpt-spark", partial, t0.Add(time.Second), "fast")
+	a, _ := b.Snapshot("c")
+	for _, model := range []string{"gpt-spark", "fast"} {
+		if v := ViewFor(a, model, t0.Add(time.Second)); !v.WeeklyBlock {
+			t.Fatalf("%s lost its exhausted Spark weekly window on a partial update: %+v %+v", model, v, a.ModelWeekly)
+		}
 	}
 }
