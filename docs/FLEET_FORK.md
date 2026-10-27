@@ -1,8 +1,16 @@
-# Fleet WebSocket changes
+# Fleet fork changes
 
-Based on upstream v8.0.29. Theo's video describes the behavior, but no public
-source fork was found under t3dotgg, TheoBr, pingdotgg or t3-oss on 2026-10-14.
-These changes are an independent implementation, not a copy of his private code.
+Branch `fleet`, based on upstream **v8.0.44** (`1f917e77`). Earlier work on v8.0.29 is
+preserved on `fleet-websockets`. Theo's video describes the behavior, but no public
+source fork was found under t3dotgg, TheoBr, pingdotgg or t3-oss on 2026-10-14. These
+changes are an independent implementation, not a copy of his private code.
+
+## 1. Codex WebSocket default (core patch, carried forward)
+
+Upstream v8.0.44 still returns `false` from `codexWebsocketsEnabled` when a credential
+has no `websockets` setting, and the catalog only forces `prefer_websockets: false` on
+non-Codex routes. The fork commit is therefore still needed and was cherry-picked
+unchanged:
 
 - Codex OAuth credentials without a transport preference use upstream WebSockets
   for downstream WebSocket requests. Explicit `websockets: false` is respected.
@@ -10,10 +18,23 @@ These changes are an independent implementation, not a copy of his private code.
 - The Codex model catalog advertises `prefer_websockets: true` for known,
   exclusively Codex routes, including synthesized aliases. Mixed or non-Codex
   routes remain conservative.
-- Existing upstream connection reuse, continuation replay, HTTP fallback and
-  disconnect handling are retained. Enable routing.session-affinity separately
-  to keep a conversation on its account; no client configurations are changed.
 
-Run `go test ./internal/client/codex/models ./internal/runtime/executor
-./sdk/api/handlers/openai` (on one line), then `go test ./...` and build the server.
-Tests use synthetic credentials and local upstreams, not subscription accounts.
+Tests: `internal/client/codex/models/websockets_default_test.go`,
+`internal/runtime/executor/codex_websockets_default_test.go`.
+
+## 2. Fleet policy plugin (no host-core changes)
+
+`internal/fleet` (logic, unit-tested) and `cmd/fleet-plugin` (cgo shim exporting the
+standard plugin ABI) implement per-tool client keys, a native Claude Code / Codex
+client gate, provider quota tracking and the weekly-reset-first scheduler with
+cache-aware affinity. It lives in the main module so it can reuse upstream's
+`helps.DetectClaudeCodeRequest`, `helps.ParseCodexQuotaEventHeaders` and
+`multiagentv2.IsCodexClientUserAgent`. See `cmd/fleet-plugin/README.md`.
+
+Plugins require the host built with `CGO_ENABLED=1` (`plugins/` is upstream's ignored
+runtime directory, hence `cmd/fleet-plugin`). Deployment config sets
+`upstream.claude.disable-claude-cloak-mode: true` and
+`upstream.codex.disable-codex-cloaking: true`.
+
+Run `go test ./internal/fleet/ ./internal/client/codex/models ./internal/runtime/executor`
+then `go test ./...`. Tests use synthetic credentials and local upstreams only.

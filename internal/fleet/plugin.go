@@ -1,0 +1,443 @@
+package fleet
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+// PluginName is the plugin's metadata name; the shared library must be named
+// fleet.so so its ID matches plugins.configs.fleet.
+const PluginName = "fleet"
+
+// Version is the plugin version reported at registration.
+const Version = "1.0.0"
+
+// Plugin holds all runtime state shared across hook calls.
+type Plugin struct {
+	mu         sync.RWMutex
+	settings   Settings
+	Book       *QuotaBook
+	Sessions   *Sessions
+	Classifier *Classifier
+	Now        func() time.Time
+
+	decisionsMu sync.Mutex
+	decisions   []PickDecision
+	gateDenials map[string]int
+}
+
+// PickDecision records one scheduler outcome for the management view.
+type PickDecision struct {
+	At          time.Time `json:"at"`
+	Provider    string    `json:"provider"`
+	Model       string    `json:"model"`
+	SessionHash string    `json:"session_hash,omitempty"`
+	AuthID      string    `json:"auth_id,omitempty"`
+	Reason      string    `json:"reason"`
+	Candidates  int       `json:"candidates"`
+}
+
+// New returns a plugin with empty state.
+func New() *Plugin {
+	return &Plugin{
+		Book:        NewQuotaBook(),
+		Sessions:    NewSessions(),
+		Classifier:  NewClassifier(),
+		Now:         time.Now,
+		gateDenials: map[string]int{},
+	}
+}
+
+// Settings returns the active settings.
+func (p *Plugin) Settings() Settings {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.settings
+}
+
+type envelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *envelopeError  `json:"error,omitempty"`
+}
+
+type envelopeError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type lifecycleRequest struct {
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version"`
+}
+
+type capabilities struct {
+	FrontendAuthProvider             bool `json:"frontend_auth_provider"`
+	FrontendAuthProviderExclusive    bool `json:"frontend_auth_provider_exclusive"`
+	Scheduler                        bool `json:"scheduler"`
+	RequestInterceptor               bool `json:"request_interceptor"`
+	RequestInterceptorOmitBodyBefore bool `json:"request_interceptor_omit_body_before,omitempty"`
+	RequestInterceptorOmitBodyAfter  bool `json:"request_interceptor_omit_body_after,omitempty"`
+	WebSocketResponseObserver        bool `json:"websocket_response_observer"`
+	UsagePlugin                      bool `json:"usage_plugin"`
+	ManagementAPI                    bool `json:"management_api"`
+}
+
+type registration struct {
+	SchemaVersion uint32             `json:"schema_version"`
+	Metadata      pluginapi.Metadata `json:"metadata"`
+	Capabilities  capabilities       `json:"capabilities"`
+}
+
+type identifierResponse struct {
+	Identifier string `json:"identifier"`
+}
+
+type managementRegistration struct {
+	Routes []pluginapi.ManagementRoute `json:"routes,omitempty"`
+}
+
+// Handle dispatches one ABI call and returns the response envelope.
+func (p *Plugin) Handle(method string, request []byte) []byte {
+	result, err := p.dispatch(method, request)
+	if err != nil {
+		return errorEnvelope("plugin_error", err.Error())
+	}
+	return result
+}
+
+func (p *Plugin) dispatch(method string, request []byte) ([]byte, error) {
+	switch method {
+	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		return p.configure(request)
+	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+		return okEnvelope(struct{}{})
+	case pluginabi.MethodFrontendAuthIdentifier:
+		return okEnvelope(identifierResponse{Identifier: PluginName})
+	case pluginabi.MethodFrontendAuthAuthenticate:
+		var req pluginapi.FrontendAuthRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return okEnvelope(pluginapi.FrontendAuthResponse{Authenticated: false})
+		}
+		return okEnvelope(Authenticate(p.Settings(), req))
+	case pluginabi.MethodRequestInterceptBefore:
+		return p.interceptBefore(request)
+	case pluginabi.MethodRequestInterceptAfter:
+		return p.interceptAfter(request)
+	case pluginabi.MethodSchedulerPick:
+		return p.pick(request)
+	case pluginabi.MethodUsageHandle:
+		return p.usage(request)
+	case pluginabi.MethodWebSocketResponseEvent:
+		return p.websocketEvent(request)
+	case pluginabi.MethodManagementRegister:
+		return okEnvelope(managementRegistration{Routes: []pluginapi.ManagementRoute{{
+			Method:      http.MethodGet,
+			Path:        "/fleet/status",
+			Description: "Per-account quota windows, scheduling order and gate counters (no secrets).",
+		}}})
+	case pluginabi.MethodManagementHandle:
+		return p.management(request)
+	default:
+		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+	}
+}
+
+func (p *Plugin) configure(raw []byte) ([]byte, error) {
+	var req lifecycleRequest
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	settings, err := ParseConfig(req.ConfigYAML)
+	if err != nil {
+		return nil, err
+	}
+	if req.SchemaVersion != 0 && req.SchemaVersion < pluginabi.SchemaVersionWebSocketResponseObserver {
+		return nil, fmt.Errorf("fleet: host schema version %d is too old", req.SchemaVersion)
+	}
+	p.mu.Lock()
+	p.settings = settings
+	p.mu.Unlock()
+	hasKeys := len(settings.Keys) > 0
+	return okEnvelope(registration{
+		SchemaVersion: pluginabi.SchemaVersion,
+		Metadata: pluginapi.Metadata{
+			Name:             PluginName,
+			Version:          Version,
+			Author:           "Jeremiah Jordan",
+			GitHubRepository: "https://github.com/JeremiahDJordan/CLIProxyAPI",
+			ConfigFields: []pluginapi.ConfigField{
+				{Name: "keys", Type: pluginapi.ConfigFieldTypeArray, Description: "Client keys: name, sha256 digest and allowed providers (claude, codex)."},
+				{Name: "exclusive", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Make fleet keys the only request authentication (default true when keys exist)."},
+				{Name: "gate", Type: pluginapi.ConfigFieldTypeObject, Description: "Native-client gate for subscription providers."},
+				{Name: "scheduler", Type: pluginapi.ConfigFieldTypeObject, Description: "Weekly-reset-first scheduler and affinity cache lifetimes."},
+			},
+		},
+		Capabilities: capabilities{
+			FrontendAuthProvider:          hasKeys,
+			FrontendAuthProviderExclusive: hasKeys && settings.Exclusive,
+			Scheduler:                     settings.SchedulerEnabled,
+			RequestInterceptor:            settings.GateEnabled || hasKeys || settings.SchedulerEnabled,
+			// The after-selection check needs only headers, formats and caller scope.
+			RequestInterceptorOmitBodyAfter: true,
+			WebSocketResponseObserver:       true,
+			UsagePlugin:                     true,
+			ManagementAPI:                   true,
+		},
+	})
+}
+
+func (p *Plugin) interceptBefore(raw []byte) ([]byte, error) {
+	var req pluginapi.RequestInterceptRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	now := p.Now()
+	settings := p.Settings()
+	cl := Classify(settings, req)
+	p.Classifier.Store(req.RequestID, cl, now)
+	if cl.ExtendedCache {
+		p.Sessions.NoteCacheTTL(cl.Session, time.Hour, now)
+	}
+	return okEnvelope(pluginapi.RequestInterceptResponse{})
+}
+
+func (p *Plugin) interceptAfter(raw []byte) ([]byte, error) {
+	var req pluginapi.RequestInterceptRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		// An unreadable request cannot be verified; deny gated traffic by failing closed.
+		return okEnvelope(Denial(Decision{Code: "fleet_unreadable_request", Reason: "request could not be inspected"}))
+	}
+	settings := p.Settings()
+	cl, ok := p.Classifier.Load(req.RequestID)
+	if !ok {
+		cl = Classify(settings, req)
+	}
+	d := Evaluate(settings, cl, req.ToFormat, req.CallerScope)
+	if d.Allow {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	p.decisionsMu.Lock()
+	p.gateDenials[d.Code]++
+	p.decisionsMu.Unlock()
+	return okEnvelope(Denial(d))
+}
+
+func (p *Plugin) pick(raw []byte) ([]byte, error) {
+	var req pluginapi.SchedulerPickRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	resp, decision := p.Pick(req)
+	p.record(decision)
+	return okEnvelope(resp)
+}
+
+// Pick applies the weekly-reset-first rule with cache-aware session affinity.
+func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, PickDecision) {
+	settings := p.Settings()
+	now := p.Now()
+	provider := pickProvider(req)
+	decision := PickDecision{At: now, Provider: provider, Model: req.Model, Candidates: len(req.Candidates)}
+	if !settings.SchedulerEnabled || provider == "" || !settings.SchedulerProviders[provider] {
+		decision.Reason = "not-handled"
+		return pluginapi.SchedulerPickResponse{Handled: false}, decision
+	}
+	session := SessionFromHeaders(req.Options.Headers)
+	if session == "" {
+		session = sessionFromMetadata(req.Options.Metadata)
+	}
+	if session != "" {
+		decision.SessionHash = shortHash(session)
+	}
+	ranked := Rank(p.Book, req.Candidates, req.Model, now)
+	if len(ranked) == 0 {
+		decision.Reason = "all-excluded-fallback"
+		return pluginapi.SchedulerPickResponse{Handled: false}, decision
+	}
+	ttl := p.Sessions.TTLFor(settings, provider, session)
+	chosen, reason := ranked[0].AuthID, "weekly-soonest"
+	if !ranked[0].View.Known {
+		reason = "no-quota-data"
+	}
+	if b, live := p.Sessions.Lookup(provider, session, ttl, now); live {
+		for _, r := range ranked {
+			if r.AuthID == b.AuthID {
+				chosen, reason = b.AuthID, "affinity"
+				break
+			}
+		}
+		if reason != "affinity" {
+			reason = "affinity-rebind-excluded"
+		}
+	} else if session != "" && b.AuthID != "" {
+		reason = "affinity-expired:" + reason
+	}
+	p.Sessions.Bind(provider, session, chosen, ttl, now)
+	decision.AuthID, decision.Reason = chosen, reason
+	return pluginapi.SchedulerPickResponse{AuthID: chosen, Handled: true}, decision
+}
+
+// pickProvider resolves the provider for a pick. Mixed routes (a model served by
+// several providers) arrive with an empty Provider; the scheduler then handles the
+// pick only when every candidate belongs to the same provider.
+func pickProvider(req pluginapi.SchedulerPickRequest) string {
+	if p := strings.ToLower(strings.TrimSpace(req.Provider)); p != "" {
+		return p
+	}
+	provider := ""
+	for _, c := range req.Candidates {
+		cp := strings.ToLower(strings.TrimSpace(c.Provider))
+		if cp == "" || (provider != "" && cp != provider) {
+			return ""
+		}
+		provider = cp
+	}
+	return provider
+}
+
+func (p *Plugin) usage(raw []byte) ([]byte, error) {
+	var rec pluginapi.UsageRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return okEnvelope(struct{}{})
+	}
+	now := p.Now()
+	p.Book.Observe(rec.Provider, rec.AuthID, firstNonEmpty(rec.Model, rec.Alias), rec.ResponseHeaders, now)
+	return okEnvelope(struct{}{})
+}
+
+func (p *Plugin) websocketEvent(raw []byte) ([]byte, error) {
+	var ev pluginapi.WebSocketResponseEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return okEnvelope(struct{}{})
+	}
+	if headers := helps.ParseCodexQuotaEventHeaders(ev.Payload); len(headers) > 0 {
+		provider := ev.Provider
+		if provider == "" {
+			provider = "codex"
+		}
+		p.Book.Observe(provider, ev.AuthID, firstNonEmpty(ev.Model, ev.RequestedModel), headers, p.Now())
+	}
+	return okEnvelope(struct{}{})
+}
+
+// Status is the management view.
+type Status struct {
+	GeneratedAt time.Time       `json:"generated_at"`
+	Version     string          `json:"version"`
+	Settings    StatusSettings  `json:"settings"`
+	Accounts    []AccountStatus `json:"accounts"`
+	Bindings    int             `json:"session_bindings"`
+	GateDenials map[string]int  `json:"gate_denials"`
+	Recent      []PickDecision  `json:"recent_picks"`
+}
+
+// StatusSettings summarizes configuration without key digests.
+type StatusSettings struct {
+	KeyNames          []string `json:"key_names"`
+	Exclusive         bool     `json:"exclusive"`
+	Gate              bool     `json:"gate"`
+	Scheduler         bool     `json:"scheduler"`
+	ClaudeCacheTTL    string   `json:"claude_cache_ttl"`
+	ClaudeExtendedTTL string   `json:"claude_extended_cache_ttl"`
+	CodexIdleTTL      string   `json:"codex_idle_ttl"`
+}
+
+// AccountStatus is one account's windows and per-model views.
+type AccountStatus struct {
+	Account
+	Views map[string]View `json:"views"`
+}
+
+// BuildStatus assembles the management view.
+func (p *Plugin) BuildStatus() Status {
+	settings := p.Settings()
+	now := p.Now()
+	st := Status{GeneratedAt: now, Version: Version, Bindings: p.Sessions.Count(), GateDenials: map[string]int{}}
+	for _, k := range settings.Keys {
+		st.Settings.KeyNames = append(st.Settings.KeyNames, k.Name)
+	}
+	st.Settings.Exclusive, st.Settings.Gate, st.Settings.Scheduler = settings.Exclusive, settings.GateEnabled, settings.SchedulerEnabled
+	st.Settings.ClaudeCacheTTL = settings.ClaudeCacheTTL.String()
+	st.Settings.ClaudeExtendedTTL = settings.ClaudeExtendedCacheTTL.String()
+	st.Settings.CodexIdleTTL = settings.CodexIdleTTL.String()
+	for _, acct := range p.Book.All() {
+		as := AccountStatus{Account: acct, Views: map[string]View{"*": ViewFor(acct, "", now)}}
+		for model := range acct.ModelWeekly {
+			as.Views[model] = ViewFor(acct, model, now)
+		}
+		st.Accounts = append(st.Accounts, as)
+	}
+	p.decisionsMu.Lock()
+	for k, v := range p.gateDenials {
+		st.GateDenials[k] = v
+	}
+	st.Recent = append(st.Recent, p.decisions...)
+	p.decisionsMu.Unlock()
+	return st
+}
+
+func (p *Plugin) management(raw []byte) ([]byte, error) {
+	var req pluginapi.ManagementRequest
+	_ = json.Unmarshal(raw, &req)
+	if req.Method != "" && req.Method != http.MethodGet {
+		return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusMethodNotAllowed})
+	}
+	body, err := json.MarshalIndent(p.BuildStatus(), "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers:    http.Header{"Content-Type": []string{"application/json"}},
+		Body:       body,
+	})
+}
+
+func (p *Plugin) record(d PickDecision) {
+	p.decisionsMu.Lock()
+	defer p.decisionsMu.Unlock()
+	p.decisions = append(p.decisions, d)
+	if len(p.decisions) > 50 {
+		p.decisions = p.decisions[len(p.decisions)-50:]
+	}
+}
+
+func shortHash(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(sum[:6])
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func okEnvelope(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(envelope{OK: true, Result: raw})
+}
+
+func errorEnvelope(code, message string) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return raw
+}
