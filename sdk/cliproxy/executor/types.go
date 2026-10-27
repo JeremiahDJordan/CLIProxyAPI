@@ -38,6 +38,10 @@ const (
 	SelectionIDMetadataKey = "selection_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
+	// SelectedAuthProviderMetadataKey carries the selected credential's provider to the
+	// after-auth request interceptor (fleet fork), so policy can act on the actual
+	// provider rather than the wire format.
+	SelectedAuthProviderMetadataKey = "selected_auth_provider"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// SelectedAuthIndexMetadataKey stores the stable index of the auth selected by the scheduler.

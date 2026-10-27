@@ -339,6 +339,14 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		return req, opts, nil
 	}
 	toFormat := requestToFormat(provider, executor, req, opts)
+	interceptMetadata := opts.Metadata
+	if selectedProvider := strings.TrimSpace(provider); selectedProvider != "" {
+		interceptMetadata = maps.Clone(opts.Metadata)
+		if interceptMetadata == nil {
+			interceptMetadata = make(map[string]any, 1)
+		}
+		interceptMetadata[cliproxyexecutor.SelectedAuthProviderMetadataKey] = selectedProvider
+	}
 	resp := opts.RequestAfterAuthInterceptor(ctx, cliproxyexecutor.RequestAfterAuthInterceptRequest{
 		SourceFormat:   opts.SourceFormat,
 		ToFormat:       toFormat,
@@ -347,7 +355,7 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		Stream:         opts.Stream,
 		Headers:        cloneRequestHeaders(opts.Headers),
 		Body:           req.Payload,
-		Metadata:       opts.Metadata,
+		Metadata:       interceptMetadata,
 	})
 	opts.Headers = mergeRequestHeaders(opts.Headers, resp.Headers, resp.ClearHeaders)
 	if len(resp.Body) > 0 {
