@@ -27,7 +27,13 @@
    Z6) run the official Codex app-server under the `T3 Code` originator, which OpenAI
    recognizes, so their requests pass the gate and reach Codex unchanged. Translated requests (for
    example Chat Completions to a Claude model), keys used outside their providers and
-   callers without a fleet key get a JSON `403` naming the reason.
+   callers without a fleet key get a JSON `403` naming the reason. Client-identity denials
+   also name the checks that failed and the request ID from the proxy's access log. Every
+   denial, including `fleet_route_denied`, writes one `[fleet] gate denied` line to the
+   proxy's log with the code, failed checks, key name, provider, model, format, whether the
+   request was classified before or after credential selection, and the client headers the
+   gate read (User-Agent, Originator, entrypoint) with each check's result. Keys, digests
+   and request content are never logged.
 3. **Quota tracking** (`usage.handle`, `websocket.response_event`). Per credential it
    records Anthropic `Anthropic-Ratelimit-Unified-{5h,7d,7d_*}-{Status,Reset,Utilization}`
    windows (model-specific `7d_*` claims are attached to the model that returned them)
@@ -49,7 +55,8 @@
    bound account or an idle session is re-placed by the rule. If every candidate is
    excluded the pick is left to the host.
 5. **Status** at `GET /v0/management/fleet/status` (management key required): windows,
-   per-model views, recent picks with hashed session IDs and gate counters. No digests.
+   per-model views, recent picks with hashed session IDs, gate counters and the last 50
+   denials (`recent_denials`, the same fields as the log line). No digests.
 
 ## Build
 

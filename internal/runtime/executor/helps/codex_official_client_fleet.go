@@ -16,7 +16,17 @@ var codexOfficialOriginators = []string{"codex_cli_rs", "codex-tui", "codex desk
 // identity in both User-Agent and Originator. The fleet gate admits only these clients
 // and Codex cloak-mode auto keeps their identity; both must agree.
 func IsOfficialCodexClient(headers http.Header) bool {
-	if headers == nil || !multiagentv2.IsCodexClientUserAgent(headers.Get("User-Agent")) {
+	return headers != nil && CodexClientUserAgent(headers) && OfficialCodexOriginator(headers)
+}
+
+// CodexClientUserAgent reports whether the User-Agent is a Codex client's.
+func CodexClientUserAgent(headers http.Header) bool {
+	return headers != nil && multiagentv2.IsCodexClientUserAgent(headers.Get("User-Agent"))
+}
+
+// OfficialCodexOriginator reports whether the Originator is an official Codex client's.
+func OfficialCodexOriginator(headers http.Header) bool {
+	if headers == nil {
 		return false
 	}
 	originator := strings.ToLower(strings.TrimSpace(headers.Get("Originator")))

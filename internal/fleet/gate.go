@@ -28,7 +28,62 @@ type Classification struct {
 	CodexClient     bool
 	Session         string
 	ExtendedCache   bool
-	at              time.Time
+	// Checks records the client identity checks, so a denial can say which failed.
+	Checks ClientChecks
+	at     time.Time
+}
+
+// ClientChecks are the client identity checks behind a classification. They hold
+// header values the gate reads, never keys or request content.
+type ClientChecks struct {
+	UserAgent  string `json:"user_agent,omitempty"`
+	Originator string `json:"originator,omitempty"`
+	Entrypoint string `json:"entrypoint,omitempty"`
+	// BodyInspected is false when the request arrived without a body, so
+	// metadata.user_id could not be read.
+	BodyInspected      bool `json:"body_inspected"`
+	NativeEntrypoint   bool `json:"native_entrypoint"`
+	XAppCLI            bool `json:"x_app_cli"`
+	ClaudeUserAgent    bool `json:"claude_cli_user_agent"`
+	ClaudeCodeBeta     bool `json:"claude_code_beta"`
+	MetadataUserID     bool `json:"metadata_user_id"`
+	CodexUserAgent     bool `json:"codex_user_agent"`
+	OfficialOriginator bool `json:"official_originator"`
+}
+
+// failedClaude lists the checks that kept a Claude request from being confirmed.
+// The gate accepts a native entrypoint with x-app, a plausible User-Agent and
+// metadata.user_id, so one of these four has failed whenever it denies.
+func (c ClientChecks) failedClaude() []string {
+	var failed []string
+	if !c.NativeEntrypoint {
+		failed = append(failed, "native Claude Code entrypoint (got "+emptyAs(c.Entrypoint, "none")+")")
+	}
+	if !c.XAppCLI {
+		failed = append(failed, "x-app: cli")
+	}
+	if !c.ClaudeUserAgent {
+		failed = append(failed, "claude-cli User-Agent at or above the supported version")
+	}
+	if !c.MetadataUserID {
+		if c.BodyInspected {
+			failed = append(failed, "metadata.user_id")
+		} else {
+			failed = append(failed, "metadata.user_id (no request body to inspect)")
+		}
+	}
+	return failed
+}
+
+func (c ClientChecks) failedCodex() []string {
+	var failed []string
+	if !c.CodexUserAgent {
+		failed = append(failed, "Codex User-Agent")
+	}
+	if !c.OfficialOriginator {
+		failed = append(failed, "official Originator (got "+emptyAs(c.Originator, "none")+")")
+	}
+	return failed
 }
 
 // Classifier caches classifications by request ID between the before- and
@@ -47,6 +102,13 @@ func Classify(req pluginapi.RequestInterceptRequest) Classification {
 	// The host's canonical derivation covers explicit session headers and Claude Code's
 	// metadata.user_id; the scheduler derives the same identity from its pick metadata.
 	c.Session = cliproxyauth.CanonicalSessionID(req.Headers, req.Body, req.Metadata)
+	c.Checks = ClientChecks{
+		UserAgent:          headerForLog(req.Headers, "User-Agent"),
+		Originator:         headerForLog(req.Headers, "Originator"),
+		BodyInspected:      len(req.Body) > 0,
+		CodexUserAgent:     helps.CodexClientUserAgent(req.Headers),
+		OfficialOriginator: helps.OfficialCodexOriginator(req.Headers),
+	}
 	if c.SourceFormat == sourceClaude {
 		path, _ := req.Metadata["request_path"].(string)
 		countTokens := strings.Contains(path, "count_tokens")
@@ -55,10 +117,28 @@ func Classify(req pluginapi.RequestInterceptRequest) Classification {
 		// beta but keep every other signal, so those are accepted as well.
 		d := helps.DetectClaudeCodeRequest(req.Headers, req.Body, countTokens)
 		c.ClaudeConfirmed = d.Confirmed || (d.NativeClient && d.XAppCLI && d.UserAgent && d.MetadataUserID)
+		c.Checks.Entrypoint = d.Entrypoint
+		c.Checks.NativeEntrypoint, c.Checks.XAppCLI, c.Checks.ClaudeUserAgent = d.NativeClient, d.XAppCLI, d.UserAgent
+		c.Checks.ClaudeCodeBeta, c.Checks.MetadataUserID = d.BetasPresent, d.MetadataUserID
 		c.ExtendedCache = helps.ClaudePayloadHas1hTTL(req.Body)
 	}
-	c.CodexClient = helps.IsOfficialCodexClient(req.Headers)
+	c.CodexClient = c.Checks.CodexUserAgent && c.Checks.OfficialOriginator
 	return c
+}
+
+// headerForLog returns a header value fit for a log line: control characters
+// removed and at most 200 bytes.
+func headerForLog(h http.Header, name string) string {
+	v := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, h.Get(name))
+	if len(v) > 200 {
+		v = v[:200]
+	}
+	return v
 }
 
 // Store remembers a classification for the after-selection check.
@@ -92,6 +172,8 @@ type Decision struct {
 	Allow  bool
 	Code   string
 	Reason string
+	// Failed names the client checks that failed, for client-identity denials.
+	Failed []string
 }
 
 // KeyForScope returns the fleet key whose principal produced the caller scope.
@@ -130,14 +212,18 @@ func Evaluate(settings Settings, cl Classification, provider, callerScope string
 			return Decision{Code: "fleet_claude_format", Reason: "Claude subscription models accept only native Anthropic Messages requests from Claude Code (got " + emptyAs(cl.SourceFormat, "unknown") + ")"}
 		}
 		if !cl.ClaudeConfirmed {
-			return Decision{Code: "fleet_claude_client", Reason: "Claude subscription models accept only requests confirmed as native Claude Code"}
+			failed := cl.Checks.failedClaude()
+			return Decision{Code: "fleet_claude_client", Failed: failed,
+				Reason: "Claude subscription models accept only requests confirmed as native Claude Code" + failedSuffix(failed)}
 		}
 	case "codex":
 		if cl.SourceFormat != sourceResponses {
 			return Decision{Code: "fleet_codex_format", Reason: "Codex subscription models accept only Responses API or WebSocket requests from Codex (got " + emptyAs(cl.SourceFormat, "unknown") + ")"}
 		}
 		if !cl.CodexClient {
-			return Decision{Code: "fleet_codex_client", Reason: "Codex subscription models accept only official Codex clients (User-Agent and Originator)"}
+			failed := cl.Checks.failedCodex()
+			return Decision{Code: "fleet_codex_client", Failed: failed,
+				Reason: "Codex subscription models accept only official Codex clients (User-Agent and Originator)" + failedSuffix(failed)}
 		}
 	}
 	return Decision{Allow: true}
@@ -160,9 +246,15 @@ func Denial(d Decision) pluginapi.RequestInterceptResponse {
 
 // Authenticate checks a presented client key against the configured digests.
 func Authenticate(settings Settings, req pluginapi.FrontendAuthRequest) pluginapi.FrontendAuthResponse {
+	resp, _ := authenticate(settings, req)
+	return resp
+}
+
+// authenticate also returns the matched key, if any.
+func authenticate(settings Settings, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, Key) {
 	presented := presentedKey(req)
 	if presented == "" || len(settings.Keys) == 0 {
-		return pluginapi.FrontendAuthResponse{Authenticated: false}
+		return pluginapi.FrontendAuthResponse{Authenticated: false}, Key{}
 	}
 	digest := sha256.Sum256([]byte(presented))
 	for _, k := range settings.Keys {
@@ -171,16 +263,16 @@ func Authenticate(settings Settings, req pluginapi.FrontendAuthRequest) pluginap
 				return pluginapi.FrontendAuthResponse{
 					DenyStatusCode: http.StatusForbidden,
 					DenyMessage:    "fleet_route_denied: client key " + k.Name + " may not use " + req.Method + " " + req.Path,
-				}
+				}, k
 			}
 			return pluginapi.FrontendAuthResponse{
 				Authenticated: true,
 				Principal:     k.Principal(),
 				Metadata:      map[string]string{"fleet_key": k.Name},
-			}
+			}, k
 		}
 	}
-	return pluginapi.FrontendAuthResponse{Authenticated: false}
+	return pluginapi.FrontendAuthResponse{Authenticated: false}, Key{}
 }
 
 // RouteAllowed limits fleet keys to the routes the client gate inspects. Other
@@ -224,6 +316,13 @@ func presentedKey(req pluginapi.FrontendAuthRequest) string {
 		return v
 	}
 	return ""
+}
+
+func failedSuffix(failed []string) string {
+	if len(failed) == 0 {
+		return ""
+	}
+	return "; failed: " + strings.Join(failed, ", ")
 }
 
 func emptyAs(v, def string) string {

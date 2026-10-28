@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,57 @@ type Plugin struct {
 	decisionsMu sync.Mutex
 	decisions   []PickDecision
 	gateDenials map[string]int
+	denials     []GateDenial
+
+	// Log writes one line to the proxy's log; tests replace it.
+	Log func(line string)
+}
+
+// GateDenial records why one request was refused, for the log and the
+// management view. It holds no keys or request content.
+type GateDenial struct {
+	At       time.Time `json:"at"`
+	Code     string    `json:"code"`
+	TraceID  string    `json:"trace_id,omitempty"`
+	Key      string    `json:"key,omitempty"`
+	Provider string    `json:"provider,omitempty"`
+	Model    string    `json:"model,omitempty"`
+	Format   string    `json:"format,omitempty"`
+	Route    string    `json:"route,omitempty"`
+	Failed   []string  `json:"failed,omitempty"`
+	// Classified is "before selection" when the gate used the classification
+	// made from the client's original request, or "after selection" when it had
+	// to classify the request again without the body.
+	Classified string        `json:"classified,omitempty"`
+	Checks     *ClientChecks `json:"checks,omitempty"`
+}
+
+// line renders the denial in the proxy's log format, keyed by the access log's request ID.
+func (d GateDenial) line() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] [%s] [warn ] [fleet] gate denied %s", d.At.Format("2006-01-02 15:04:05"), emptyAs(d.TraceID, "--------"), d.Code)
+	if len(d.Failed) > 0 {
+		fmt.Fprintf(&b, "; failed: %s", strings.Join(d.Failed, ", "))
+	}
+	field := func(name, value string) {
+		if value != "" {
+			fmt.Fprintf(&b, " %s=%q", name, value)
+		}
+	}
+	field("key", d.Key)
+	field("provider", d.Provider)
+	field("model", d.Model)
+	field("format", d.Format)
+	field("route", d.Route)
+	field("classified", d.Classified)
+	if c := d.Checks; c != nil {
+		field("entrypoint", c.Entrypoint)
+		field("user_agent", c.UserAgent)
+		field("originator", c.Originator)
+		fmt.Fprintf(&b, " body_inspected=%t x_app_cli=%t claude_user_agent=%t claude_code_beta=%t metadata_user_id=%t codex_user_agent=%t official_originator=%t",
+			c.BodyInspected, c.XAppCLI, c.ClaudeUserAgent, c.ClaudeCodeBeta, c.MetadataUserID, c.CodexUserAgent, c.OfficialOriginator)
+	}
+	return b.String()
 }
 
 // targetProvider is the selected credential's provider, which the fork host reports
@@ -68,6 +120,7 @@ func New() *Plugin {
 		Classifier:  NewClassifier(),
 		Now:         time.Now,
 		gateDenials: map[string]int{},
+		Log:         func(line string) { fmt.Fprintln(os.Stderr, line) },
 	}
 }
 
@@ -131,7 +184,11 @@ func (p *Plugin) dispatch(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return okEnvelope(pluginapi.FrontendAuthResponse{Authenticated: false})
 		}
-		return okEnvelope(Authenticate(p.Settings(), req))
+		resp, key := authenticate(p.Settings(), req)
+		if resp.DenyStatusCode != 0 {
+			p.deny(GateDenial{At: p.Now(), Code: "fleet_route_denied", Key: key.Name, Route: req.Method + " " + req.Path})
+		}
+		return okEnvelope(resp)
 	case pluginabi.MethodRequestInterceptBefore:
 		return p.interceptBefore(request)
 	case pluginabi.MethodRequestInterceptAfter:
@@ -221,20 +278,46 @@ func (p *Plugin) interceptAfter(raw []byte) ([]byte, error) {
 	var req pluginapi.RequestInterceptRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		// An unreadable request cannot be verified; deny gated traffic by failing closed.
-		return okEnvelope(Denial(Decision{Code: "fleet_unreadable_request", Reason: "request could not be inspected"}))
+		d := Decision{Code: "fleet_unreadable_request", Reason: "request could not be inspected"}
+		p.deny(GateDenial{At: p.Now(), Code: d.Code})
+		return okEnvelope(Denial(d))
 	}
 	cl, ok := p.Classifier.Load(req.RequestID)
+	classified := "before selection"
 	if !ok {
 		cl = Classify(req)
+		classified = "after selection"
 	}
-	d := Evaluate(p.Settings(), cl, targetProvider(req.Metadata), req.CallerScope)
+	settings := p.Settings()
+	provider := targetProvider(req.Metadata)
+	d := Evaluate(settings, cl, provider, req.CallerScope)
 	if d.Allow {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
+	key, _ := KeyForScope(settings, req.CallerScope)
+	checks := cl.Checks
+	p.deny(GateDenial{
+		At: p.Now(), Code: d.Code, TraceID: req.TraceID, Key: key.Name, Provider: provider,
+		Model: req.Model, Format: cl.SourceFormat, Failed: d.Failed, Classified: classified, Checks: &checks,
+	})
+	if req.TraceID != "" {
+		d.Reason += " (request " + req.TraceID + ")"
+	}
+	return okEnvelope(Denial(d))
+}
+
+// deny counts, keeps and logs one denial.
+func (p *Plugin) deny(d GateDenial) {
 	p.decisionsMu.Lock()
 	p.gateDenials[d.Code]++
+	p.denials = append(p.denials, d)
+	if len(p.denials) > 50 {
+		p.denials = p.denials[len(p.denials)-50:]
+	}
 	p.decisionsMu.Unlock()
-	return okEnvelope(Denial(d))
+	if p.Log != nil {
+		p.Log(d.line())
+	}
 }
 
 func (p *Plugin) pick(raw []byte) ([]byte, error) {
@@ -353,7 +436,9 @@ type Status struct {
 	Accounts    []AccountStatus `json:"accounts"`
 	Bindings    int             `json:"session_bindings"`
 	GateDenials map[string]int  `json:"gate_denials"`
-	Recent      []PickDecision  `json:"recent_picks"`
+	// RecentDenials are the last 50 denials with the checks that failed.
+	RecentDenials []GateDenial   `json:"recent_denials"`
+	Recent        []PickDecision `json:"recent_picks"`
 }
 
 // StatusSettings summarizes configuration without key digests.
@@ -396,6 +481,7 @@ func (p *Plugin) BuildStatus() Status {
 	for k, v := range p.gateDenials {
 		st.GateDenials[k] = v
 	}
+	st.RecentDenials = append(st.RecentDenials, p.denials...)
 	st.Recent = append(st.Recent, p.decisions...)
 	p.decisionsMu.Unlock()
 	return st

@@ -899,3 +899,126 @@ func TestCodexPartialNamedUpdateKeepsWeeklyBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestGateDenialNamesFailedChecks(t *testing.T) {
+	s := testSettings(t, "")
+	claudeScope, codexScope := scopeFor(s, "claude-code"), scopeFor(s, "codex")
+	for _, c := range []struct {
+		name string
+		req  pluginapi.RequestInterceptRequest
+		want []string
+	}{
+		{"no x-app", func() pluginapi.RequestInterceptRequest {
+			r := claudeCodeRequest("")
+			r.Headers.Del("X-App")
+			return r
+		}(), []string{"x-app: cli"}},
+		{"sdk-py", func() pluginapi.RequestInterceptRequest {
+			r := claudeCodeRequest("")
+			r.Headers.Set("User-Agent", "claude-cli/2.1.280 (external, sdk-py)")
+			return r
+		}(), []string{"native Claude Code entrypoint (got sdk-py)"}},
+		{"old version", func() pluginapi.RequestInterceptRequest {
+			r := claudeCodeRequest("")
+			r.Headers.Set("User-Agent", "claude-cli/2.0.1 (external, cli)")
+			return r
+		}(), []string{"claude-cli User-Agent at or above the supported version"}},
+		{"no user id", claudeCodeRequest(`{"model":"claude-opus-5-5"}`), []string{"metadata.user_id"}},
+		{"no body", func() pluginapi.RequestInterceptRequest {
+			r := claudeCodeRequest("")
+			r.Body = nil
+			return r
+		}(), []string{"metadata.user_id (no request body to inspect)"}},
+	} {
+		d := Evaluate(s, Classify(c.req), "claude", claudeScope)
+		if d.Allow || d.Code != "fleet_claude_client" || strings.Join(d.Failed, "|") != strings.Join(c.want, "|") {
+			t.Errorf("%s: failed = %q, want %q (%+v)", c.name, d.Failed, c.want, d)
+		}
+		if !strings.Contains(d.Reason, "; failed: "+strings.Join(c.want, ", ")) {
+			t.Errorf("%s: reason does not name the failed checks: %q", c.name, d.Reason)
+		}
+	}
+
+	noOriginator := codexRequest()
+	noOriginator.Headers.Del("Originator")
+	if d := Evaluate(s, Classify(noOriginator), "codex", codexScope); strings.Join(d.Failed, "|") != "official Originator (got none)" {
+		t.Errorf("Codex without Originator: failed = %q", d.Failed)
+	}
+	curl := codexRequest()
+	curl.Headers.Set("User-Agent", "curl/8.7.1")
+	curl.Headers.Set("Originator", "pi")
+	if d := Evaluate(s, Classify(curl), "codex", codexScope); strings.Join(d.Failed, "|") != "Codex User-Agent|official Originator (got pi)" {
+		t.Errorf("curl as Codex: failed = %q", d.Failed)
+	}
+}
+
+func TestDenialsAreLoggedAndListed(t *testing.T) {
+	p, _ := newTestPlugin(t, "")
+	var lines []string
+	p.Log = func(line string) { lines = append(lines, line) }
+	call := func(method string, v any) pluginapi.RequestInterceptResponse {
+		t.Helper()
+		raw, _ := json.Marshal(v)
+		var env struct {
+			OK     bool            `json:"ok"`
+			Result json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(p.Handle(method, raw), &env); err != nil || !env.OK {
+			t.Fatalf("%s failed: %s", method, env.Result)
+		}
+		var resp pluginapi.RequestInterceptResponse
+		_ = json.Unmarshal(env.Result, &resp)
+		return resp
+	}
+
+	// Classified before selection from the client's request, denied after it.
+	req := claudeCodeRequest("")
+	req.Headers.Del("X-App")
+	req.TraceID = "2fdec61e"
+	call(pluginabi.MethodRequestInterceptBefore, req)
+	req.Body = nil
+	req.Metadata = map[string]any{"selected_auth_provider": "claude"}
+	req.CallerScope = scopeFor(p.settings, "claude-code")
+	resp := call(pluginabi.MethodRequestInterceptAfter, req)
+	if !resp.Terminate || !strings.Contains(string(resp.ResponseBody), "failed: x-app: cli (request 2fdec61e)") {
+		t.Fatalf("denial body = %s", resp.ResponseBody)
+	}
+
+	// A request the gate never saw before selection is classified without its body.
+	unseen := claudeCodeRequest("")
+	unseen.RequestID, unseen.Body = "unseen", nil
+	unseen.Metadata = map[string]any{"selected_auth_provider": "claude"}
+	unseen.CallerScope = scopeFor(p.settings, "claude-code")
+	call(pluginabi.MethodRequestInterceptAfter, unseen)
+
+	raw, _ := json.Marshal(pluginapi.FrontendAuthRequest{Method: "POST", Path: "/v1/alpha/search", Headers: http.Header{"Authorization": {"Bearer claude-secret"}}})
+	p.Handle(pluginabi.MethodFrontendAuthAuthenticate, raw)
+
+	if len(lines) != 3 {
+		t.Fatalf("want 3 log lines, got %d: %q", len(lines), lines)
+	}
+	for _, want := range []string{"[2fdec61e] [warn ] [fleet] gate denied fleet_claude_client; failed: x-app: cli", `key="claude-code"`, `classified="before selection"`, `entrypoint="cli"`, `user_agent="claude-cli/2.1.280 (external, cli)"`, "body_inspected=true", "x_app_cli=false"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("log line lacks %q: %s", want, lines[0])
+		}
+	}
+	if !strings.Contains(lines[1], `metadata.user_id (no request body to inspect)`) || !strings.Contains(lines[1], `classified="after selection"`) {
+		t.Errorf("unseen request line: %s", lines[1])
+	}
+	if !strings.Contains(lines[2], `gate denied fleet_route_denied key="claude-code" route="POST /v1/alpha/search"`) {
+		t.Errorf("route denial line: %s", lines[2])
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "claude-secret") || strings.Contains(line, digest("claude-secret")) {
+			t.Fatalf("log line leaks the key: %s", line)
+		}
+	}
+
+	st := p.BuildStatus()
+	if len(st.RecentDenials) != 3 || st.GateDenials["fleet_claude_client"] != 2 || st.GateDenials["fleet_route_denied"] != 1 {
+		t.Fatalf("status denials = %+v %+v", st.GateDenials, st.RecentDenials)
+	}
+	if d := st.RecentDenials[0]; d.TraceID != "2fdec61e" || d.Checks == nil || d.Checks.XAppCLI || !d.Checks.MetadataUserID {
+		t.Fatalf("first recent denial = %+v", d)
+	}
+}
