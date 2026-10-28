@@ -9,6 +9,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -65,12 +66,13 @@ func (s *Server) getFleetActivity(c *gin.Context) {
 // until ctx ends; Stop closes whatever remains. In order:
 //   - the base listener closes, so new connections stay in the kernel queue
 //     (under socket activation, for the next process);
-//   - connections already accepted are still routed and handed to the HTTP
-//     server, which takes all queued ones before its listener closes;
-//   - http.Server.Shutdown waits for every HTTP connection to finish its response,
-//     including the final writes after the handler returns (HTTP/2 gets GOAWAY);
+//   - connections already accepted are still routed and taken by the HTTP server;
+//   - with keep-alives off, every HTTP/1 connection finishes its response, including
+//     the writes net/http makes after the handler returns, and closes. This does not
+//     use http.Server.Shutdown, which drops a request read after it has started;
 //   - idle Responses WebSockets close at once with 1012 (service restart) and busy
-//     ones after their current turn; clients reconnect on their next request.
+//     ones after their current turn; clients reconnect on their next request;
+//   - Shutdown then sends HTTP/2 connections GOAWAY and waits for their streams.
 func (s *Server) DrainFleet(ctx context.Context) {
 	if s == nil || s.drain == nil {
 		return
@@ -90,7 +92,7 @@ func (s *Server) DrainFleet(ctx context.Context) {
 	before := s.drain.Snapshot()
 	s.drain.StartDrain()
 	if s.server != nil {
-		// Close idle keep-alive connections now and the rest after their response.
+		// Idle keep-alive connections close now and the rest after their response.
 		s.server.SetKeepAlivesEnabled(false)
 	}
 	_ = muxBase.Close()
@@ -102,15 +104,23 @@ func (s *Server) DrainFleet(ctx context.Context) {
 	}
 	if errWait == nil && muxHTTP != nil {
 		step = "handing queued connections to the HTTP server"
-		errWait = waitFleetCondition(ctx, func() bool { return len(muxHTTP.connCh) == 0 })
+		// Routing is over, so the queued total is final. A connection taken off the
+		// queue is not tracked yet: wait until net/http has seen every one of them.
+		errWait = waitFleetCondition(ctx, func() bool {
+			return s.fleetConns.adopted() >= muxHTTP.queued.Load()
+		})
 	}
-	if errWait == nil && s.server != nil {
+	if errWait == nil {
 		step = "finishing HTTP responses"
-		errWait = s.server.Shutdown(ctx)
+		errWait = waitFleetCondition(ctx, func() bool { return s.fleetConns.busy(time.Now()) == 0 })
 	}
 	if errWait == nil {
 		step = "finishing websocket turns"
 		errWait = s.drain.Wait(ctx)
+	}
+	if errWait == nil && s.server != nil {
+		step = "finishing HTTP/2 streams"
+		errWait = s.server.Shutdown(ctx)
 	}
 	if errWait != nil {
 		left := s.drain.Snapshot()
@@ -120,6 +130,71 @@ func (s *Server) DrainFleet(ctx context.Context) {
 	}
 	log.Infof("fleet drain: finished in %s (%d requests, %d websocket turns, %d websockets were open)",
 		time.Since(started).Round(time.Millisecond), before.Requests, before.WebSocketTurns, before.WebSockets)
+}
+
+// fleetNewConnIdle matches net/http: a new connection that has sent no request
+// for this long counts as idle and is closed.
+const fleetNewConnIdle = 5 * time.Second
+
+// fleetConnTracker follows HTTP connection states (http.Server.ConnState) so a
+// drain can wait for responses to finish.
+type fleetConnTracker struct {
+	mu    sync.Mutex
+	conns map[net.Conn]fleetConnState
+	news  int64 // connections net/http has reported as new
+}
+
+func (t *fleetConnTracker) adopted() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.news
+}
+
+type fleetConnState struct {
+	state http.ConnState
+	since time.Time
+}
+
+func (t *fleetConnTracker) track(conn net.Conn, state http.ConnState) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if state == http.StateNew {
+		t.news++
+	}
+	switch state {
+	case http.StateHijacked, http.StateClosed:
+		delete(t.conns, conn)
+	default:
+		if t.conns == nil {
+			t.conns = make(map[net.Conn]fleetConnState)
+		}
+		t.conns[conn] = fleetConnState{state: state, since: time.Now()}
+	}
+}
+
+// busy counts HTTP/1 connections that may still carry a response and closes new
+// ones that have stayed silent. HTTP/2 connections are left to Shutdown.
+func (t *fleetConnTracker) busy(now time.Time) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	busy := 0
+	for conn, st := range t.conns {
+		if tlsConn, ok := conn.(*tls.Conn); ok && tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+			continue
+		}
+		switch st.state {
+		case http.StateActive:
+			busy++
+		case http.StateNew:
+			if now.Sub(st.since) >= fleetNewConnIdle {
+				_ = conn.Close()
+				delete(t.conns, conn)
+				continue
+			}
+			busy++
+		}
+	}
+	return busy
 }
 
 func waitFleetGroup(ctx context.Context, group *sync.WaitGroup) error {

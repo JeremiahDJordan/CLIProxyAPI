@@ -3,6 +3,7 @@ package api
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,6 +15,8 @@ type muxListener struct {
 	mu       sync.Mutex
 	inFlight sync.WaitGroup
 	once     sync.Once
+	// queued counts connections put on the queue (fleet: drain_fleet.go).
+	queued atomic.Int64
 }
 
 func newMuxListener(addr net.Addr, buffer int) *muxListener {
@@ -44,6 +47,7 @@ func (l *muxListener) Put(conn net.Conn) error {
 	case <-l.closeCh:
 		return net.ErrClosed
 	case l.connCh <- conn:
+		l.queued.Add(1)
 		return nil
 	}
 }
@@ -71,6 +75,7 @@ func (l *muxListener) putWithTimeout(conn net.Conn, timeout time.Duration) error
 	case <-l.closeCh:
 		return net.ErrClosed
 	case l.connCh <- conn:
+		l.queued.Add(1)
 		return nil
 	case <-timer.C:
 		return net.ErrClosed
@@ -94,13 +99,10 @@ func (l *muxListener) Accept() (net.Conn, error) {
 		if !ok || conn == nil {
 			return nil, net.ErrClosed
 		}
-		select {
-		case <-l.closeCh:
-			_ = conn.Close()
-			return nil, net.ErrClosed
-		default:
-			return conn, nil
-		}
+		// fleet: hand over a connection already taken even if Close raced it;
+		// http.Server tracks it before Serve returns, so a draining Shutdown
+		// serves it instead of the client seeing a reset (drain_fleet.go).
+		return conn, nil
 	}
 }
 

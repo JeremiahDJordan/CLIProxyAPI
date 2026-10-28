@@ -51,6 +51,7 @@ type Server struct {
 	fleetDraining    atomic.Bool
 	fleetAcceptLoops sync.WaitGroup
 	fleetRouting     sync.WaitGroup
+	fleetConns       fleetConnTracker
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
@@ -278,6 +279,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler:           wrapUnconsumedRequestBodyHandler(engine),
 		ReadHeaderTimeout: muxSniffDeadline,
+		ConnState:         s.fleetConns.track, // fleet: drain_fleet.go
 	}
 
 	return s

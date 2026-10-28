@@ -103,10 +103,13 @@ streaming and every open Codex WebSocket. `internal/fleetdrain`, `internal/api/d
   in such a moment.
 - On SIGTERM, before anything else stops (`DrainFleet`, 75 s, then upstream's 30 s shutdown,
   within systemd's `TimeoutStopSec=120`): the base listener closes; connections already
-  accepted are still sniffed, routed and taken by the HTTP server; `http.Server.Shutdown`
-  then waits for every HTTP connection to finish its response, including the writes net/http
-  makes after the handler returns (HTTP/2 gets GOAWAY); idle Responses WebSockets close
-  with 1012 (service restart) and busy ones after their current turn, and frames read after
+  accepted are still sniffed, routed and adopted by the HTTP server (the mux listener now
+  hands over a connection it has taken even if it was closed meanwhile); with keep-alives
+  off, every HTTP/1 connection (tracked through `http.Server.ConnState`) finishes its
+  response, including the writes net/http makes after the handler returns, and closes.
+  `http.Server.Shutdown` is not used for this because net/http drops a request read after
+  Shutdown starts; it runs last, for HTTP/2 GOAWAY. Idle Responses WebSockets close with
+  1012 (service restart) and busy ones after their current turn, and frames read after
   that are dropped (the client sees the close and resends). Codex checks its cached socket
   before each turn and reconnects when it is closed.
 - Limits: with `codex.response-steering` on (off at homelab; the archive also refuses it),
@@ -120,7 +123,8 @@ streaming and every open Codex WebSocket. `internal/fleetdrain`, `internal/api/d
   refused. The socket's address wins over the configured one (logged when they differ).
 
 Core hooks: in `internal/api/server.go` the drain fields, their install line, the listener
-call, accept-loop accounting and the drain branch in `Start`; routing accounting in
-`protocol_multiplexer.go`; one route in `server_management.go`; one line in
+call, the `ConnState` hook, accept-loop accounting and the drain branch in `Start`; routing
+accounting in `protocol_multiplexer.go`; the queued count and the hand-over in
+`mux_listener.go`; one route in `server_management.go`; one line in
 `sdk/cliproxy/service_lifecycle.go` (drain before `Shutdown`); in the Responses WebSocket
 handler and reader, the socket count, admission and the drain close.

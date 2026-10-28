@@ -418,22 +418,58 @@ func TestDrainFleetWaitsForTheFinalResponseWrite(t *testing.T) {
 	}
 }
 
+type acceptSignalListener struct {
+	net.Listener
+	accepted chan<- struct{}
+}
+
+func (l *acceptSignalListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted <- struct{}{}
+	}
+	return conn, err
+}
+
 func TestDrainFleetServesConnectionsAcceptedBeforeIt(t *testing.T) {
+	accepted := make(chan struct{}, 1)
+	fleetListenerForTest = func(l net.Listener) net.Listener {
+		return &acceptSignalListener{Listener: l, accepted: accepted}
+	}
+	t.Cleanup(func() { fleetListenerForTest = nil })
 	s, addr, _ := startTestServer(t)
+	fleetListenerForTest = nil
 	// Accepted but still being sniffed: no byte has arrived when the drain starts.
 	conn, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server never accepted the connection")
+	}
 	drained := make(chan struct{})
 	go func() {
 		s.DrainFleet(context.Background())
 		close(drained)
 	}()
 	waitForActivity(t, s.drain, func(a fleetdrain.Activity) bool { return a.Draining })
-	if _, err := conn.Write([]byte("GET /fleet-test/quick HTTP/1.1\r\nHost: fleet-test\r\nConnection: close\r\n\r\n")); err != nil {
+	// The first byte gets the connection routed and adopted by net/http; the rest
+	// arrives once the drain has had time to reach its last step. net/http drops a
+	// request it reads after http.Server.Shutdown starts, so the drain must wait.
+	request := []byte("GET /fleet-test/quick HTTP/1.1\r\nHost: fleet-test\r\nConnection: close\r\n\r\n")
+	if _, err := conn.Write(request[:1]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-drained:
+		t.Fatal("drain finished while an accepted connection had not sent its request")
+	default:
+	}
+	if _, err := conn.Write(request[1:]); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
