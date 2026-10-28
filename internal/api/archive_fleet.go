@@ -244,18 +244,24 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 		data := archiveIngressEndData{archiveResponseSummary: summary, Headers: headers}
 		// The writer fills in capture_drops when it writes the event.
 		ev := &archive.Event{Type: archive.TypeIngressEnd, Time: end, Capture: archive.CaptureFull, Data: data, SizeHint: data.sizeHint(), ReportDrops: true}
-		emitEnd := func() {
-			defer recoverArchiveTap("observer.finish")
-			o.in.Emit(ev)
-		}
 		if o.tee == nil {
-			emitEnd()
+			o.in.Emit(ev)
 			return
 		}
 		// ingress_end follows client_body so its capture_drops counts a
 		// body drop. When a read is still in progress both wait for that
-		// read (on its goroutine, never on this one); ts stays the request end.
-		o.tee.endThen("request_end", emitEnd)
+		// read (on its goroutine, never on this one), or for Stop; ts stays
+		// the request end. The held event's bytes are reserved first; a
+		// failed reservation drops it (counted) and the deferred end still
+		// ends the body.
+		reserved, ok := o.in.ReserveEvent(ev)
+		if !ok {
+			return
+		}
+		o.tee.endThen("request_end", func() {
+			defer recoverArchiveTap("observer.finish")
+			o.in.EmitReserved(ev, reserved)
+		})
 		return
 	}
 	data := archiveMetadataOnlyData{
@@ -502,8 +508,10 @@ func (s *Server) installArchiveBodyTee(req *http.Request, in *archive.Ingress) *
 		encoding:      req.Header.Get("Content-Encoding"),
 		contentLength: req.ContentLength,
 		limit:         s.maxRequestBodyBytes(),
-		capturing:     rec.CaptureBodies(),
 	}
+	// Tracked until client_body is emitted, so Stop can finalize it. Once
+	// Stop has begun the tee is not tracked and captures nothing.
+	tee.capturing = rec.TrackCapture(tee) && rec.CaptureBodies()
 	if !tee.capturing {
 		tee.dropReason = rec.BodyDropReason()
 	}
@@ -514,13 +522,17 @@ func (s *Server) installArchiveBodyTee(req *http.Request, in *archive.Ingress) *
 // archiveBodyMinBuffer is the first buffer for a body of unknown length.
 const archiveBodyMinBuffer = 4 << 10
 
+// archiveEndedShutdown is client_body's ended when Stop finalized the tee.
+const archiveEndedShutdown = "shutdown"
+
 // archiveBodyTee copies the wire bytes the handler consumes. Its queue
 // reservation always covers its buffer's capacity. It emits client_body
 // once, at EOF or Close, or at the end of the request, but never while
-// another read is in progress: the last read to return then emits it. Later
-// reads pass through. net/http request bodies are not safe for concurrent
-// reads, so the order of bytes from concurrent reads is not meaningful; the
-// tee only makes sure none of them is lost and the reservation is returned.
+// another read is in progress: the last read to return then emits it, unless
+// Stop finalizes the tee first. Later reads pass through. net/http request
+// bodies are not safe for concurrent reads, so the order of bytes from
+// concurrent reads is not meaningful; the tee only makes sure none of them is
+// lost and the reservation is returned.
 type archiveBodyTee struct {
 	inner         io.ReadCloser
 	in            *archive.Ingress
@@ -659,6 +671,19 @@ func (t *archiveBodyTee) endThen(ended string, afterEnd func()) {
 	t.emitLocked(ended)
 }
 
+// FinalizeAtStop is called by Stop, before the writer's final drain. It does
+// not wait for a read in progress: client_body records the body as dropped
+// (reason stopped, ended shutdown; wire_bytes counts what was read so far),
+// the deferred ingress_end follows, and every reservation is returned. A read returning
+// later finds the tee done and emits nothing.
+func (t *archiveBodyTee) FinalizeAtStop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	defer t.runAfterEndLocked()
+	defer t.recoverLocked("body.stop")
+	t.emitLocked(archiveEndedShutdown)
+}
+
 // runAfterEndLocked runs afterEnd once, after client_body was emitted (or
 // lost to a tap panic, which recoverLocked has counted by then).
 func (t *archiveBodyTee) runAfterEndLocked() {
@@ -742,6 +767,7 @@ func (t *archiveBodyTee) emitLocked(ended string) {
 		return
 	}
 	t.done = true
+	t.rec.UntrackCapture(t)
 	archiveFault("body.emit")
 	data := archiveClientBodyData{
 		WireBytes:       t.consumed,
@@ -757,7 +783,7 @@ func (t *archiveBodyTee) emitLocked(ended string) {
 		data.DeliveredBytes = t.limit
 		data.Truncated = true
 	}
-	if t.consumed == 0 && !t.sawEOF && t.readErr == "" {
+	if t.consumed == 0 && !t.sawEOF && t.readErr == "" && ended != archiveEndedShutdown {
 		// Never read by the handler, so not read by the recorder either.
 		t.releaseLocked()
 		t.handedOff = true

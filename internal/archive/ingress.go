@@ -87,6 +87,28 @@ func (in *Ingress) EmitReserved(ev *Event, reserved int64) bool {
 	return true
 }
 
+// ReserveEvent claims ev's queue bytes now, for an event held until later
+// (an ingress_end waiting for its client_body); EmitReserved then charges
+// them to it. A failure drops the event and counts it against the request,
+// as emit does. It fails once Stop has begun.
+func (in *Ingress) ReserveEvent(ev *Event) (int64, bool) {
+	if in == nil || in.rec == nil || ev == nil {
+		return 0, false
+	}
+	r := in.rec
+	n := ev.reservation()
+	if r.CaptureEvents() && r.q.reserve(n) {
+		return n, true
+	}
+	reason := DropQueueFull
+	if !r.CaptureEvents() {
+		reason = r.BodyDropReason()
+	}
+	r.ledger.add(reason, DropCount{Events: 1})
+	in.drops.Add(1)
+	return 0, false
+}
+
 // NoteDrop counts a body or event of this request that was not captured.
 func (in *Ingress) NoteDrop() {
 	if in != nil {

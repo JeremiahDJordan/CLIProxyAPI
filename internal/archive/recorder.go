@@ -116,6 +116,11 @@ type Recorder struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	done     chan struct{}
+
+	// captures holds the pending captures Stop finalizes; nil once it has.
+	capturesMu     sync.Mutex
+	captures       map[PendingCapture]struct{}
+	capturesClosed bool
 }
 
 type refusal struct {
@@ -154,6 +159,7 @@ func start(p StartParams) (*Recorder, error) {
 		ledger:      newDropLedger(opts.StateDir),
 		stopCh:      make(chan struct{}),
 		done:        make(chan struct{}),
+		captures:    map[PendingCapture]struct{}{},
 	}
 	rec.spaceMode.Store(spaceModeFor(fsInfo.free, opts))
 
@@ -311,7 +317,10 @@ func (r *Recorder) emit(ev *Event, reserved int64) bool {
 		r.ledger.add(reason, d)
 		return false
 	}
-	if !r.CaptureEvents() || (ev.Body != nil && !r.CaptureBodies()) {
+	// Stopping refuses new captures and reservations, not events: Stop
+	// finalizes the pending captures after it begins, and the writer's
+	// close of the queue is the cut-off.
+	if !r.writerOK.Load() || r.spaceMode.Load() == spaceStopped || (ev.Body != nil && !r.CaptureBodies()) {
 		return drop(r.BodyDropReason())
 	}
 	if extra := ev.reservation() - reserved; extra > 0 {
@@ -324,6 +333,53 @@ func (r *Recorder) emit(ev *Event, reserved int64) bool {
 		return drop(DropStopped)
 	}
 	return true
+}
+
+// PendingCapture is a capture that can hold queue bytes or a deferred event
+// until a read returns (the client body tee). Stop finalizes every one still
+// tracked, without waiting for that read, before the writer's final drain.
+type PendingCapture interface {
+	// FinalizeAtStop emits what the capture holds and releases its
+	// reservations. It must not wait, and must be idempotent.
+	FinalizeAtStop()
+}
+
+// TrackCapture registers p until UntrackCapture. It fails once Stop has
+// begun; reservations fail by then too, so an untracked capture holds none.
+func (r *Recorder) TrackCapture(p PendingCapture) bool {
+	if r == nil || p == nil {
+		return false
+	}
+	r.capturesMu.Lock()
+	defer r.capturesMu.Unlock()
+	if r.capturesClosed {
+		return false
+	}
+	r.captures[p] = struct{}{}
+	return true
+}
+
+// UntrackCapture removes p once it holds nothing more.
+func (r *Recorder) UntrackCapture(p PendingCapture) {
+	if r == nil || p == nil {
+		return
+	}
+	r.capturesMu.Lock()
+	delete(r.captures, p)
+	r.capturesMu.Unlock()
+}
+
+// finalizeCaptures closes the registry and finalizes what it held. Captures
+// lock themselves, so it runs without holding capturesMu.
+func (r *Recorder) finalizeCaptures() {
+	r.capturesMu.Lock()
+	pending := r.captures
+	r.captures = nil
+	r.capturesClosed = true
+	r.capturesMu.Unlock()
+	for p := range pending {
+		p.FinalizeAtStop()
+	}
 }
 
 // Emit queues a recorder-level event (one without an ingress).
@@ -354,7 +410,11 @@ func (r *Recorder) stop(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	r.stopOnce.Do(func() {
+		// Refuse new captures and reservations, then end the pending ones
+		// without waiting for their reads, so their events are queued before
+		// the writer's final drain and no reservation outlives it.
 		r.stopping.Store(true)
+		r.finalizeCaptures()
 		close(r.stopCh)
 	})
 	select {

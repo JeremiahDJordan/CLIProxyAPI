@@ -1298,3 +1298,77 @@ func TestDropsAfterStopAreNotCounted(t *testing.T) {
 		t.Fatalf("persisted drops = %+v", st.Drops)
 	}
 }
+
+// A held event's reservation fails like any other: dropped and counted.
+func TestReserveEventCountsAFailedReservation(t *testing.T) {
+	env := setup(t, "", func(o *TestOverrides) { o.QueueBytes = 4096 })
+	rec := mustStart(t, env)
+	in := rec.BeginIngress(RouteInference, time.Now())
+	if _, ok := in.ReserveEvent(&Event{Type: TypeIngressEnd, SizeHint: 8192}); ok {
+		t.Fatal("an 8 KiB event was reserved on a 4 KiB queue")
+	}
+	if got := rec.ledger.totals()[DropQueueFull]; got.Events != 1 || in.Drops() != 1 {
+		t.Fatalf("queue_full drops = %+v, request drops = %d", got, in.Drops())
+	}
+	ev := &Event{Type: TypeIngressEnd, SizeHint: 100}
+	reserved, ok := in.ReserveEvent(ev)
+	if !ok || rec.q.used.Load() != reserved {
+		t.Fatalf("reserved %d, %v; queue holds %d", reserved, ok, rec.q.used.Load())
+	}
+	if !in.EmitReserved(ev, reserved) {
+		t.Fatal("the reserved event was refused")
+	}
+	flush(t)
+	if used := rec.q.used.Load(); used != 0 {
+		t.Fatalf("queue still holds %d bytes", used)
+	}
+}
+
+// stopCapture holds a reserved event until Stop finalizes it.
+type stopCapture struct {
+	in        *Ingress
+	ev        *Event
+	reserved  int64
+	finalized atomic.Int32
+}
+
+func (c *stopCapture) FinalizeAtStop() {
+	if c.finalized.Add(1) == 1 {
+		c.in.EmitReserved(c.ev, c.reserved)
+	}
+}
+
+// Stop finalizes tracked captures before the writer's final drain, so their
+// events are written and their reservations returned; once Stop has begun,
+// nothing more can be tracked.
+func TestStopFinalizesTrackedCaptures(t *testing.T) {
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+	in := rec.BeginIngress(RouteInference, time.Now())
+	held := &stopCapture{in: in, ev: &Event{Type: TypeIngressEnd, ReportDrops: true, Data: map[string]any{"held": true}}}
+	var ok bool
+	if held.reserved, ok = in.ReserveEvent(held.ev); !ok {
+		t.Fatal("cannot reserve the held event")
+	}
+	completed := &stopCapture{in: in, ev: &Event{Type: TypeIngressEnd, Data: map[string]any{"completed": true}}}
+	if !rec.TrackCapture(held) || !rec.TrackCapture(completed) {
+		t.Fatal("cannot track the captures")
+	}
+	rec.UntrackCapture(completed)
+	stop(t)
+	if held.finalized.Load() != 1 || completed.finalized.Load() != 0 {
+		t.Fatalf("finalized held %d times, the untracked capture %d times", held.finalized.Load(), completed.finalized.Load())
+	}
+	if rec.TrackCapture(&stopCapture{in: in}) {
+		t.Fatal("a capture was tracked after Stop")
+	}
+	events := readEvents(t, env.spool)
+	ends := ofType(events, TypeIngressEnd)
+	shutdowns := ofType(events, TypeShutdown)
+	if len(ends) != 1 || ends[0]["held"] != true || len(shutdowns) != 1 {
+		t.Fatalf("ingress_end = %v, shutdown = %v", ends, shutdowns)
+	}
+	if ends[0]["seq"].(float64) > shutdowns[0]["seq"].(float64) || shutdowns[0]["queue_bytes"] != float64(0) {
+		t.Fatalf("the held event follows shutdown, or shutdown reports %v queue bytes", shutdowns[0]["queue_bytes"])
+	}
+}

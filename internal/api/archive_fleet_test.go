@@ -1317,3 +1317,154 @@ func BenchmarkArchiveObserver(b *testing.B) {
 	b.Run("off", func(b *testing.B) { run(b, false) })
 	b.Run("on", func(b *testing.B) { run(b, true) })
 }
+
+// archiveStalledReader delivers "first bytes", then keeps its next read
+// pending until release is closed.
+type archiveStalledReader struct {
+	calls            int
+	entered, release chan struct{}
+}
+
+func (r *archiveStalledReader) Read(p []byte) (int, error) {
+	r.calls++
+	if r.calls == 1 {
+		return copy(p, "first bytes"), nil
+	}
+	close(r.entered)
+	<-r.release
+	return 0, io.EOF
+}
+
+func (r *archiveStalledReader) Close() error { return nil }
+
+// serveStalledBody serves a request whose handler reads the first bytes and
+// returns while a second read is still pending, with a response header of
+// headerSize bytes. It returns the tee, the reader and a channel closed when
+// that read returns.
+func serveStalledBody(t *testing.T, server *Server, path string, headerSize int) (*archiveBodyTee, *archiveStalledReader, chan struct{}) {
+	t.Helper()
+	classifyForTest(t, http.MethodPost, path)
+	reader := &archiveStalledReader{entered: make(chan struct{}), release: make(chan struct{})}
+	readDone := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-reader.release:
+		default:
+			close(reader.release)
+		}
+		<-readDone
+	})
+	var tee *archiveBodyTee
+	server.engine.POST(path, func(c *gin.Context) {
+		tee = archiveTee(t, c)
+		_, _ = c.Request.Body.Read(make([]byte, 32))
+		go func() { defer close(readDone); _, _ = tee.Read(make([]byte, 32)) }()
+		<-reader.entered
+		c.Header("X-Archive-Test", strings.Repeat("h", headerSize))
+		c.Status(http.StatusAccepted)
+	})
+	req := httptest.NewRequest(http.MethodPost, path, reader)
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d", rec.Code)
+	}
+	return tee, reader, readDone
+}
+
+// An ingress_end held for a read in progress has its bytes reserved; one
+// that does not fit the queue is dropped and counted, not held unreserved.
+func TestArchiveHeldIngressEndIsReserved(t *testing.T) {
+	const queueBytes = 16 << 10
+	t.Run("fits", func(t *testing.T) {
+		server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.QueueBytes = queueBytes }, nil)
+		tee, reader, readDone := serveStalledBody(t, server, "/archive-test/held-end", 2<<10)
+		spoolEvents(t, spool) // the queue now holds only the tee's buffer and the held end
+		tee.mu.Lock()
+		held, bodyReserved := tee.afterEnd != nil, tee.reserved
+		tee.mu.Unlock()
+		if !held {
+			t.Fatal("ingress_end is not held for the read in progress")
+		}
+		if rec := archive.Current(); rec.ReserveBody(queueBytes - bodyReserved) {
+			rec.ReleaseBody(queueBytes - bodyReserved)
+			t.Fatal("the held ingress_end reserves no queue bytes")
+		}
+		close(reader.release)
+		<-readDone
+		events := spoolEvents(t, spool)
+		ends := eventsFor(events, archive.TypeIngressEnd, "/archive-test/held-end")
+		bodies := eventsFor(events, archive.TypeClientBody, "/archive-test/held-end")
+		if len(ends) != 1 || len(bodies) != 1 || ends[0]["seq"].(float64) < bodies[0]["seq"].(float64) {
+			t.Fatalf("ingress_end = %v, client_body = %v", ends, bodies)
+		}
+		if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+			t.Fatalf("%v queue bytes still reserved", queued)
+		}
+	})
+	t.Run("too large", func(t *testing.T) {
+		server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.QueueBytes = queueBytes }, nil)
+		tee, reader, readDone := serveStalledBody(t, server, "/archive-test/held-end", 128<<10)
+		tee.mu.Lock()
+		held := tee.afterEnd != nil
+		tee.mu.Unlock()
+		if held || tee.in.Drops() != 1 {
+			t.Fatalf("held %v, request drops %d; a 128 KiB ingress_end was held on a 16 KiB queue", held, tee.in.Drops())
+		}
+		close(reader.release)
+		<-readDone
+		events := spoolEvents(t, spool)
+		if ends := eventsFor(events, archive.TypeIngressEnd, "/archive-test/held-end"); len(ends) != 0 {
+			t.Fatalf("ingress_end = %v", ends)
+		}
+		if bodies := eventsFor(events, archive.TypeClientBody, "/archive-test/held-end"); len(bodies) != 1 || bodies[0]["capture"] != archive.CaptureFull {
+			t.Fatalf("client_body = %v", bodies)
+		}
+		waitUntil(t, "a queue_full gap", func() bool {
+			for _, ev := range spoolEvents(t, spool) {
+				if drops, ok := ev["drops"].(map[string]any); ok && ev["type"] == archive.TypeGap && drops[archive.DropQueueFull] != nil {
+					return true
+				}
+			}
+			return false
+		})
+		if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+			t.Fatalf("%v queue bytes still reserved", queued)
+		}
+	})
+}
+
+// Stop ends a body whose read never returns: client_body (dropped, with
+// what was read so far) and the held ingress_end are written before the
+// shutdown event, nothing stays reserved, and the read returning later is a
+// no-op.
+func TestArchiveStopFinalizesAPendingBody(t *testing.T) {
+	server, spool := newArchiveServer(t, nil)
+	tee, reader, readDone := serveStalledBody(t, server, "/archive-test/stop-pending", 64)
+	events := spoolEvents(t, spool)
+	if got := len(eventsFor(events, archive.TypeClientBody, "/archive-test/stop-pending")) + len(eventsFor(events, archive.TypeIngressEnd, "/archive-test/stop-pending")); got != 0 {
+		t.Fatalf("%d events written before the read returned", got)
+	}
+	if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+		t.Fatalf("shutdown reports %v queue bytes; the pending body stranded its reservation", queued)
+	}
+	events = spoolEvents(t, spool)
+	bodies := eventsFor(events, archive.TypeClientBody, "/archive-test/stop-pending")
+	ends := eventsFor(events, archive.TypeIngressEnd, "/archive-test/stop-pending")
+	if len(bodies) != 1 || bodies[0]["capture"] != archive.CaptureDroppedBody || bodies[0]["drop_reason"] != archive.DropStopped ||
+		bodies[0]["ended"] != archiveEndedShutdown || bodies[0]["eof"] != false || bodies[0]["wire_bytes"] != float64(11) {
+		t.Fatalf("client_body = %v", bodies)
+	}
+	if len(ends) != 1 || ends[0]["capture_drops"] != float64(1) || ends[0]["status"] != float64(http.StatusAccepted) || ends[0]["seq"].(float64) < bodies[0]["seq"].(float64) {
+		t.Fatalf("ingress_end = %v", ends)
+	}
+	drops := tee.in.Drops()
+	close(reader.release)
+	<-readDone
+	tee.mu.Lock()
+	defer tee.mu.Unlock()
+	if tee.reserved != 0 || tee.afterEnd != nil || tee.in.Drops() != drops {
+		t.Fatalf("after the read returned: reserved %d, end held %v, drops %d -> %d", tee.reserved, tee.afterEnd != nil, drops, tee.in.Drops())
+	}
+}
