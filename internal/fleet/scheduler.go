@@ -101,11 +101,16 @@ func (s *Sessions) pruneLocked(now time.Time) {
 type Ranked struct {
 	AuthID string `json:"auth_id"`
 	View   View   `json:"view"`
+	// Probe marks an account without quota data that has not been tried within
+	// probeRetry; one request through it reveals its windows.
+	Probe bool `json:"probe,omitempty"`
 }
 
-// Rank orders candidates: excluded accounts are dropped; accounts with a known weekly
-// reset come first by soonest weekly reset, then by more weekly quota remaining;
-// accounts without quota data follow in host priority order, then by ID.
+// Rank orders candidates: excluded accounts are dropped; accounts without quota data
+// that are due a probe come first (one request learns their windows), then accounts
+// with a known weekly reset by soonest weekly reset and more weekly quota remaining,
+// then recently probed accounts that still have no data. Accounts without data are
+// ordered by host priority, then by ID.
 func Rank(book *QuotaBook, candidates []pluginapi.SchedulerAuthCandidate, model string, now time.Time) []Ranked {
 	type entry struct {
 		Ranked
@@ -115,12 +120,15 @@ func Rank(book *QuotaBook, candidates []pluginapi.SchedulerAuthCandidate, model 
 	for _, c := range candidates {
 		acct, _ := book.Snapshot(c.ID)
 		if v := ViewFor(acct, model, now); !v.Excluded() {
-			entries = append(entries, entry{Ranked: Ranked{AuthID: c.ID, View: v}, priority: c.Priority})
+			probe := !v.Known && book.probeDue(c.ID, now)
+			entries = append(entries, entry{Ranked: Ranked{AuthID: c.ID, View: v, Probe: probe}, priority: c.Priority})
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		a, b := entries[i], entries[j]
 		switch {
+		case a.Probe != b.Probe:
+			return a.Probe
 		case a.View.Known != b.View.Known:
 			return a.View.Known
 		case a.View.Known && !a.View.WeeklyResetAt.Equal(b.View.WeeklyResetAt):

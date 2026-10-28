@@ -79,10 +79,31 @@ type Account struct {
 type QuotaBook struct {
 	mu       sync.Mutex
 	accounts map[string]*Account
+	probed   map[string]time.Time // auth ID -> when it was last chosen to learn its quota
 }
 
 // NewQuotaBook returns an empty quota book.
-func NewQuotaBook() *QuotaBook { return &QuotaBook{accounts: map[string]*Account{}} }
+func NewQuotaBook() *QuotaBook {
+	return &QuotaBook{accounts: map[string]*Account{}, probed: map[string]time.Time{}}
+}
+
+// probeRetry is how long an account chosen to learn its quota waits before it is
+// tried first again, when its response did not report quota (an error or no headers).
+const probeRetry = time.Hour
+
+// NoteProbe records that authID was chosen so its response reveals its quota.
+func (b *QuotaBook) NoteProbe(authID string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.probed[authID] = now
+}
+
+func (b *QuotaBook) probeDue(authID string, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	at, ok := b.probed[authID]
+	return !ok || now.Sub(at) >= probeRetry
+}
 
 // Observe records rate-limit headers returned for authID while serving model; any
 // aliases (the requested route model) share the model-specific association. A Codex

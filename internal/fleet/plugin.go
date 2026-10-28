@@ -32,6 +32,10 @@ type Plugin struct {
 	Classifier *Classifier
 	Now        func() time.Time
 
+	// pickMu makes ranking, probe recording and session binding one step, so
+	// concurrent picks cannot both probe the same unknown account.
+	pickMu sync.Mutex
+
 	decisionsMu sync.Mutex
 	decisions   []PickDecision
 	gateDenials map[string]int
@@ -262,6 +266,8 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 	if session != "" {
 		decision.SessionHash = shortHash(session)
 	}
+	p.pickMu.Lock()
+	defer p.pickMu.Unlock()
 	ranked := Rank(p.Book, req.Candidates, req.Model, now)
 	if len(ranked) == 0 {
 		decision.Reason = "all-excluded-fallback"
@@ -269,7 +275,10 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 	}
 	ttl := p.Sessions.TTLFor(settings, provider, session)
 	chosen, reason := ranked[0].AuthID, "weekly-soonest"
-	if !ranked[0].View.Known {
+	switch {
+	case ranked[0].Probe:
+		reason = "probe-unknown"
+	case !ranked[0].View.Known:
 		reason = "no-quota-data"
 	}
 	if b, live := p.Sessions.Lookup(provider, session, ttl, now); live {
@@ -284,6 +293,9 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 		}
 	} else if b.AuthID != "" {
 		reason = "affinity-expired:" + reason
+	}
+	if chosen == ranked[0].AuthID && ranked[0].Probe {
+		p.Book.NoteProbe(chosen, now)
 	}
 	p.Sessions.Bind(provider, session, chosen, now)
 	decision.AuthID, decision.Reason = chosen, reason

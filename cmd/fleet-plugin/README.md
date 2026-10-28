@@ -35,7 +35,10 @@
    skip accounts whose 5-hour or weekly window is exhausted, then pick the soonest
    weekly reset (Claude: the model's own `7d_*` window when observed, otherwise `7d`;
    Codex: the model's named limit, otherwise the shared weekly window). Ties prefer more
-   weekly quota left; accounts without data come after known ones. A session keeps its
+   weekly quota left. An account without quota data (new, or not used since a restart)
+   first gets one request (`probe-unknown`) so its response reveals its windows; if that
+   still reports nothing (an error or no rate-limit headers), it ranks after known
+   accounts and is probed again at most hourly. A session keeps its
    account while its prompt cache is warm: Claude 5 minutes, or 1 hour when the session's
    requests used `cache_control` `ttl: "1h"`; Codex 1 hour (configurable). An exhausted
    bound account or an idle session is re-placed by the rule. If every candidate is

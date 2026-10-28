@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -405,15 +406,75 @@ func TestRankWeeklySoonestWithExclusions(t *testing.T) {
 	}
 }
 
-func TestRankUnknownAfterKnownAndTieBreak(t *testing.T) {
+// Accounts without quota data get one probe first so their windows can be compared;
+// once probed they rank after known accounts until probeRetry passes.
+func TestRankProbesUnknownThenKnownAndTieBreak(t *testing.T) {
 	b := NewQuotaBook()
 	reset := t0.Add(48 * time.Hour)
 	b.Observe("claude", "more-left", "m", claudeHeaders(0.1, 0.2, t0.Add(time.Hour), reset, nil), t0)
 	b.Observe("claude", "less-left", "m", claudeHeaders(0.1, 0.7, t0.Add(time.Hour), reset, nil), t0)
 	c := candidates("new-b", "less-left", "new-a", "more-left")
 	c[0].Priority = 5 // higher host priority sorts first among unknown accounts
-	if got := rankIDs(Rank(b, c, "m", t0)); got != "more-left,less-left,new-b,new-a" {
-		t.Fatalf("order = %s", got)
+	if got := rankIDs(Rank(b, c, "m", t0)); got != "new-b,new-a,more-left,less-left" {
+		t.Fatalf("unprobed order = %s", got)
+	}
+	b.NoteProbe("new-b", t0)
+	b.NoteProbe("new-a", t0)
+	if got := rankIDs(Rank(b, c, "m", t0.Add(time.Minute))); got != "more-left,less-left,new-b,new-a" {
+		t.Fatalf("probed order = %s", got)
+	}
+	if got := rankIDs(Rank(b, c, "m", t0.Add(probeRetry))); got != "new-b,new-a,more-left,less-left" {
+		t.Fatalf("order after probe retry = %s", got)
+	}
+}
+
+// Concurrent new sessions probe an unknown account only once.
+func TestPickConcurrentProbesOnce(t *testing.T) {
+	p, _ := newTestPlugin(t, "")
+	p.Book.Observe("claude", "known", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(72*time.Hour), nil), t0)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	probes := 0
+	start := make(chan struct{})
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			resp, _ := p.Pick(pluginapi.SchedulerPickRequest{Provider: "claude", Model: "m", Candidates: candidates("known", "fresh"),
+				Options: pluginapi.SchedulerOptions{Metadata: map[string]any{"canonical_session_id": "s" + strconv.Itoa(i)}}})
+			if resp.AuthID == "fresh" {
+				mu.Lock()
+				probes++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if probes != 1 {
+		t.Fatalf("unknown account probed %d times, want 1", probes)
+	}
+}
+
+// A new session probes an unknown account once; the next new session goes to the
+// known account, and a session with a warm cache stays on its account.
+func TestPickProbesUnknownOnceAndKeepsAffinity(t *testing.T) {
+	p, now := newTestPlugin(t, "")
+	p.Book.Observe("claude", "known", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(72*time.Hour), nil), t0)
+	pick := func(session string) (pluginapi.SchedulerPickResponse, PickDecision) {
+		return p.Pick(pluginapi.SchedulerPickRequest{Provider: "claude", Model: "m", Candidates: candidates("known", "fresh"),
+			Options: pluginapi.SchedulerOptions{Metadata: map[string]any{"canonical_session_id": session}}})
+	}
+	if resp, d := pick("warm"); resp.AuthID != "fresh" || d.Reason != "probe-unknown" {
+		t.Fatalf("first pick should probe the unknown account: %+v %+v", resp, d)
+	}
+	*now = t0.Add(time.Minute)
+	if resp, d := pick("other"); resp.AuthID != "known" || d.Reason != "weekly-soonest" {
+		t.Fatalf("probed account should not be probed again: %+v %+v", resp, d)
+	}
+	if resp, d := pick("warm"); resp.AuthID != "fresh" || d.Reason != "affinity" {
+		t.Fatalf("warm session should keep its account: %+v %+v", resp, d)
 	}
 }
 
@@ -537,8 +598,13 @@ func TestHandleEndToEnd(t *testing.T) {
 	_ = json.Unmarshal(p.Handle(pluginabi.MethodSchedulerPick, raw), &env)
 	var picked pluginapi.SchedulerPickResponse
 	_ = json.Unmarshal(env.Result, &picked)
+	if picked.AuthID != "fresh" {
+		t.Fatalf("first pick through ABI should probe the unknown account: %+v", picked)
+	}
+	_ = json.Unmarshal(p.Handle(pluginabi.MethodSchedulerPick, raw), &env)
+	_ = json.Unmarshal(env.Result, &picked)
 	if picked.AuthID != "acct" {
-		t.Fatalf("pick through ABI = %+v", picked)
+		t.Fatalf("second pick through ABI = %+v", picked)
 	}
 
 	// A WebSocket rate-limit event is parsed with upstream's helper.
