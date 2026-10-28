@@ -605,6 +605,7 @@ func (r *UsageReporter) publishAttemptRecord(ctx context.Context, record usage.R
 }
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
+	archiveReporterUsage(ctx, record) // fleet: request archive (archive_fleet.go)
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
 	if r != nil {
 		ctx = usage.WithCapturedIdentity(ctx, r.apiKey, r.accessProvider, r.isNativeKey)

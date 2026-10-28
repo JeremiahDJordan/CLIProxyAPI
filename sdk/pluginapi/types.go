@@ -565,6 +565,9 @@ type SchedulerPickResponse struct {
 	RejectReason string
 	// RejectCode is an optional machine-readable error code for the rejection (defaults to "auth_unavailable").
 	RejectCode string
+	// Reason optionally explains the decision, also when Handled is false
+	// (fleet fork: recorded as the attempt's pick_reason by the request archive).
+	Reason string
 }
 
 // UnmarshalJSON supports both Go struct field names and snake_case field names.
@@ -582,6 +585,8 @@ func (r *SchedulerPickResponse) UnmarshalJSON(data []byte) error {
 		AltRejectReason *string `json:"reject_reason"`
 		RejectCode      *string `json:"RejectCode"`
 		AltRejectCode   *string `json:"reject_code"`
+		Reason          *string `json:"Reason"`
+		AltReason       *string `json:"reason"`
 	}
 	var raw rawResponse
 	if errUnmarshal := json.Unmarshal(data, &raw); errUnmarshal != nil {
@@ -616,6 +621,11 @@ func (r *SchedulerPickResponse) UnmarshalJSON(data []byte) error {
 		r.RejectCode = *raw.RejectCode
 	} else if raw.AltRejectCode != nil {
 		r.RejectCode = *raw.AltRejectCode
+	}
+	if raw.Reason != nil {
+		r.Reason = *raw.Reason
+	} else if raw.AltReason != nil {
+		r.Reason = *raw.AltReason
 	}
 	return nil
 }

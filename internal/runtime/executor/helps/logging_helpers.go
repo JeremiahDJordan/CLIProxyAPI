@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/archive"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -63,6 +64,11 @@ func requestLogCaptureEnabled(cfg *config.Config) bool {
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	archive.TapUpstreamRequest(ctx, archiveUpstreamRequest(info)) // fleet: request archive (archive_fleet.go)
+	recordAPIRequest(ctx, cfg, info)
+}
+
+func recordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
 	if cfg == nil || cfg.CommercialMode {
 		return
 	}
@@ -189,6 +195,11 @@ func newAPIRequestLogBuilder(index int, info UpstreamRequestLog, timestamp time.
 
 // RecordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
+	archive.TapUpstreamResponse(ctx, status, headers) // fleet: request archive
+	recordAPIResponseMetadata(ctx, cfg, status, headers)
+}
+
+func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
 	logging.SetResponseHeaders(ctx, headers)
 	if !requestLogCaptureEnabled(cfg) {
 		return
@@ -218,6 +229,7 @@ func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 
 // RecordAPIResponseError adds an error entry for the latest attempt when no HTTP response is available.
 func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) {
+	archive.TapUpstreamError(ctx, err) // fleet: request archive
 	if !requestLogCaptureEnabled(cfg) || err == nil {
 		return
 	}
@@ -243,6 +255,11 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 
 // AppendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
 func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
+	archive.TapUpstreamChunk(ctx, chunk) // fleet: request archive, the chunk as read
+	appendAPIResponseChunk(ctx, cfg, chunk)
+}
+
+func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
 	if !requestLogCaptureEnabled(cfg) {
 		return
 	}
@@ -287,6 +304,7 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 
 // RecordAPIWebsocketRequest stores an upstream websocket request event in Gin context.
 func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	archive.TapUpstreamWSRequest(ctx, archiveUpstreamRequest(info)) // fleet: request archive
 	if !requestLogCaptureEnabled(cfg) {
 		return
 	}
@@ -319,6 +337,7 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 
 // RecordAPIWebsocketHandshake stores the upstream websocket handshake response metadata.
 func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
+	archive.TapUpstreamWSHandshake(ctx, status, headers) // fleet: request archive
 	logging.SetResponseHeaders(ctx, headers)
 	if !requestLogCaptureEnabled(cfg) {
 		return
@@ -343,6 +362,7 @@ func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status
 
 // RecordAPIWebsocketUpgradeRejection stores a rejected websocket upgrade as an HTTP attempt.
 func RecordAPIWebsocketUpgradeRejection(ctx context.Context, cfg *config.Config, info UpstreamRequestLog, status int, headers http.Header, body []byte) {
+	archive.TapUpstreamWSRejection(ctx, archiveUpstreamRequest(info), status, headers, body) // fleet: request archive
 	logging.SetResponseHeaders(ctx, headers)
 	if !requestLogCaptureEnabled(cfg) {
 		return
@@ -352,9 +372,10 @@ func RecordAPIWebsocketUpgradeRejection(ctx context.Context, cfg *config.Config,
 		return
 	}
 
-	RecordAPIRequest(ctx, cfg, info)
-	RecordAPIResponseMetadata(ctx, cfg, status, headers)
-	AppendAPIResponseChunk(ctx, cfg, body)
+	// fleet: the untapped forms, so the archive records the rejection once.
+	recordAPIRequest(ctx, cfg, info)
+	recordAPIResponseMetadata(ctx, cfg, status, headers)
+	appendAPIResponseChunk(ctx, cfg, body)
 }
 
 // WebsocketUpgradeRequestURL converts a websocket URL back to its HTTP handshake URL for logging.
@@ -378,6 +399,11 @@ func WebsocketUpgradeRequestURL(rawURL string) string {
 
 // AppendAPIWebsocketResponse stores an upstream websocket response frame in Gin context.
 func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload []byte) {
+	archive.TapUpstreamWSFrame(ctx, payload, false) // fleet: request archive
+	appendAPIWebsocketResponse(ctx, cfg, payload)
+}
+
+func appendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload []byte) {
 	if !requestLogCaptureEnabled(cfg) {
 		return
 	}
@@ -403,12 +429,15 @@ func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload
 // AppendCodexAPIWebsocketResponse stores a codex upstream websocket response frame and merges any
 // quota event headers carried by the frame into the request log.
 func AppendCodexAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload []byte) {
+	// fleet: request archive; callers trim Codex frames before this tap.
+	archive.TapUpstreamWSFrame(ctx, payload, true)
 	logging.MergeResponseHeaders(ctx, ParseCodexQuotaEventHeaders(payload))
-	AppendAPIWebsocketResponse(ctx, cfg, payload)
+	appendAPIWebsocketResponse(ctx, cfg, payload)
 }
 
 // RecordAPIWebsocketError stores an upstream websocket error event in Gin context.
 func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage string, err error) {
+	archive.TapUpstreamWSError(ctx, stage, err) // fleet: request archive
 	if !requestLogCaptureEnabled(cfg) || err == nil {
 		return
 	}

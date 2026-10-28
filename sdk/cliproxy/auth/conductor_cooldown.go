@@ -886,6 +886,7 @@ func isStaleExecutionResult(result Result, current *Auth) bool {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	archiveEndAttempt(ctx, result) // fleet: request archive attempt_end (archive_fleet.go)
 	if result.AuthID == "" {
 		return
 	}
@@ -1449,6 +1450,7 @@ func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth
 
 // reportHomeResult only observes a Home dispatch result and never updates local auth state.
 func (m *Manager) reportHomeResult(ctx context.Context, result Result, auth *Auth) {
+	archiveEndAttempt(ctx, result) // fleet: request archive attempt_end (archive_fleet.go)
 	if m == nil || result.AuthID == "" {
 		return
 	}
@@ -1462,6 +1464,7 @@ func (m *Manager) reportHomeResult(ctx context.Context, result Result, auth *Aut
 }
 
 func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Result) {
+	archiveEndAttempt(ctx, result) // fleet: request archive attempt_end (archive_fleet.go)
 	if result.AuthID == "" {
 		return
 	}

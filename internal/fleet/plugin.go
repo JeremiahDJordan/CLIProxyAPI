@@ -338,7 +338,7 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 	decision := PickDecision{At: now, Provider: provider, Model: req.Model, Candidates: len(req.Candidates)}
 	if !settings.SchedulerEnabled || !subscriptionProviders[provider] {
 		decision.Reason = "not-handled"
-		return pluginapi.SchedulerPickResponse{Handled: false}, decision
+		return pluginapi.SchedulerPickResponse{Handled: false, Reason: decision.Reason}, decision
 	}
 	// Prefer the host's canonical identity (derived from headers and body, as in the
 	// before-selection hook); re-deriving from headers alone can be weaker.
@@ -354,7 +354,7 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 	ranked := Rank(p.Book, req.Candidates, req.Model, now)
 	if len(ranked) == 0 {
 		decision.Reason = "all-excluded-fallback"
-		return pluginapi.SchedulerPickResponse{Handled: false}, decision
+		return pluginapi.SchedulerPickResponse{Handled: false, Reason: decision.Reason}, decision
 	}
 	ttl := p.Sessions.TTLFor(settings, provider, session)
 	chosen, reason := ranked[0].AuthID, "weekly-soonest"
@@ -382,7 +382,7 @@ func (p *Plugin) Pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPi
 	}
 	p.Sessions.Bind(provider, session, chosen, now)
 	decision.AuthID, decision.Reason = chosen, reason
-	return pluginapi.SchedulerPickResponse{AuthID: chosen, Handled: true}, decision
+	return pluginapi.SchedulerPickResponse{AuthID: chosen, Handled: true, Reason: reason}, decision
 }
 
 // pickProvider resolves the provider for a pick. Mixed routes (a model served by

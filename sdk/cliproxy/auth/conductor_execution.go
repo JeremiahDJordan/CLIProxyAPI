@@ -26,6 +26,7 @@ import (
 
 func newUpstreamAttemptContext(ctx context.Context) context.Context {
 	ctx = logging.WithFreshResponseHeadersHolder(ctx)
+	ctx = archiveAttemptContext(ctx) // fleet: request archive attempt (archive_fleet.go)
 	return cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
 }
 
@@ -335,6 +336,7 @@ func isRequestTerminatedError(err error) bool {
 }
 
 func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExecutor, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+	archiveDescribeAttempt(ctx, provider, req, opts, requestedModel) // fleet: request archive (archive_fleet.go)
 	if opts.RequestAfterAuthInterceptor == nil {
 		return req, opts, nil
 	}
@@ -370,6 +372,7 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		}
 		opts.Metadata[cliproxyexecutor.RequestPathMetadataKey] = path
 	}
+	archiveNoteGate(ctx, resp.Terminate, resp.StatusCode, resp.ResponseBody) // fleet: request archive gate decision
 	if resp.Terminate {
 		return req, opts, &cliproxyexecutor.RequestTerminatedError{
 			HTTPStatus: resp.StatusCode,

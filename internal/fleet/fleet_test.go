@@ -510,6 +510,19 @@ func TestPickProbesUnknownOnceAndKeepsAffinity(t *testing.T) {
 	}
 }
 
+// The scheduler's reason is part of its response, also when it does not
+// handle the pick (fleet request archive pick_reason).
+func TestPickResponseCarriesItsReason(t *testing.T) {
+	p, _ := newTestPlugin(t, "")
+	p.Book.Observe("claude", "known", "m", claudeHeaders(0.1, 0.5, t0.Add(time.Hour), t0.Add(72*time.Hour), nil), t0)
+	if resp, d := p.Pick(pickReq("s", "known")); resp.Reason == "" || resp.Reason != d.Reason {
+		t.Fatalf("handled pick: response reason %q, decision %q", resp.Reason, d.Reason)
+	}
+	if resp, _ := p.Pick(pluginapi.SchedulerPickRequest{Provider: "gemini", Model: "m", Candidates: candidates("x")}); resp.Handled || resp.Reason != "not-handled" {
+		t.Fatalf("unhandled pick: %+v", resp)
+	}
+}
+
 func pickReq(session string, ids ...string) pluginapi.SchedulerPickRequest {
 	return pluginapi.SchedulerPickRequest{
 		Provider:   "claude",

@@ -1023,6 +1023,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if errPick != nil {
 		return nil, true, errPick
 	}
+	recordSchedulerPickReason(opts.Metadata, resp.Reason) // fleet: request archive pick_reason (archive_fleet.go)
 	if !handled || !resp.Handled {
 		return nil, false, nil
 	}
