@@ -1468,3 +1468,92 @@ func TestArchiveStopFinalizesAPendingBody(t *testing.T) {
 		t.Fatalf("after the read returned: reserved %d, end held %v, drops %d -> %d", tee.reserved, tee.afterEnd != nil, drops, tee.in.Drops())
 	}
 }
+
+// Stop waits for an emission already in progress (on the tee's lock, never
+// on a read), so a body that hit EOF just before Stop is archived with its
+// held ingress_end and leaves nothing reserved.
+func TestArchiveStopWaitsForAnEmissionInProgress(t *testing.T) {
+	s, spool := newArchiveServer(t, nil)
+	_, reader, readDone := serveStalledBody(t, s, "/archive-test/stop-vs-eof", 64)
+	entered, release := make(chan struct{}), make(chan struct{})
+	archiveTapFault = func(where string) {
+		if where == "body.emit" {
+			close(entered)
+			<-release
+		}
+	}
+	t.Cleanup(func() { archiveTapFault = nil })
+	close(reader.release)
+	<-entered
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- archive.Stop(ctx)
+	}()
+	select {
+	case err := <-stopped:
+		close(release)
+		t.Fatalf("Stop returned while an emission was in progress: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	<-readDone
+	events := spoolEvents(t, spool)
+	bodies := eventsFor(events, archive.TypeClientBody, "/archive-test/stop-vs-eof")
+	ends := eventsFor(events, archive.TypeIngressEnd, "/archive-test/stop-vs-eof")
+	var queued float64 = -1
+	for _, ev := range events {
+		if ev["type"] == archive.TypeShutdown {
+			queued = ev["queue_bytes"].(float64)
+		}
+	}
+	if queued != 0 || len(bodies) != 1 || len(ends) != 1 {
+		t.Fatalf("shutdown queue_bytes=%v client_body=%d ingress_end=%d", queued, len(bodies), len(ends))
+	}
+}
+
+// Installing a tee races Stop's finalization without a data race: the tee's
+// lock covers its initialization.
+func TestArchiveTeeInstallRacesStop(t *testing.T) {
+	for round := 0; round < 30; round++ {
+		s, _ := newArchiveServer(t, nil)
+		in := archive.Current().BeginIngress(archive.RouteInference, time.Now())
+		ready := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			<-ready
+			_ = archive.Stop(context.Background())
+		}()
+		close(ready)
+		for i := 0; i < 100; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("payload")))
+			s.installArchiveBodyTee(req, in)
+		}
+		<-done
+	}
+}
+
+// Normal traffic leaves no tee tracked and nothing reserved.
+func TestArchiveNormalTrafficLeavesNoTrackedTees(t *testing.T) {
+	s, spool := newArchiveServer(t, nil)
+	classifyForTest(t, http.MethodPost, "/archive-test/normal")
+	s.engine.POST("/archive-test/normal", func(c *gin.Context) {
+		_, _ = c.Request.Body.Read(make([]byte, 1))
+		c.Status(http.StatusOK)
+	})
+	for i := 0; i < 100; i++ {
+		s.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/archive-test/normal", bytes.NewReader([]byte("hello"))))
+	}
+	spoolEvents(t, spool)
+	if n := reflect.ValueOf(archive.Current()).Elem().FieldByName("captures").Len(); n != 0 {
+		t.Fatalf("normal traffic left %d tees tracked", n)
+	}
+	if q := archiveStopQueueBytes(t, spool); q != 0 {
+		t.Fatalf("shutdown queue_bytes=%v", q)
+	}
+}

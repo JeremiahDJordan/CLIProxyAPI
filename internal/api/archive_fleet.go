@@ -509,12 +509,16 @@ func (s *Server) installArchiveBodyTee(req *http.Request, in *archive.Ingress) *
 		contentLength: req.ContentLength,
 		limit:         s.maxRequestBodyBytes(),
 	}
-	// Tracked until client_body is emitted, so Stop can finalize it. Once
-	// Stop has begun the tee is not tracked and captures nothing.
+	// Tracked until client_body and the deferred ingress_end are emitted, so
+	// Stop can finalize it. Once Stop has begun the tee is not tracked and
+	// captures nothing. The tee's lock covers its initialization, because
+	// Stop can finalize it as soon as it is tracked.
+	tee.mu.Lock()
 	tee.capturing = rec.TrackCapture(tee) && rec.CaptureBodies()
 	if !tee.capturing {
 		tee.dropReason = rec.BodyDropReason()
 	}
+	tee.mu.Unlock()
 	tracker.ReadCloser = tee
 	return tee
 }
@@ -685,14 +689,19 @@ func (t *archiveBodyTee) FinalizeAtStop() {
 }
 
 // runAfterEndLocked runs afterEnd once, after client_body was emitted (or
-// lost to a tap panic, which recoverLocked has counted by then).
+// lost to a tap panic, which recoverLocked has counted by then), and then
+// stops tracking the tee. Until then Stop's FinalizeAtStop waits on the tee's
+// lock (never on a read), so an emission in progress is queued before the
+// writer's final drain.
 func (t *archiveBodyTee) runAfterEndLocked() {
-	if !t.done || t.afterEnd == nil {
+	if !t.done {
 		return
 	}
-	afterEnd := t.afterEnd
-	t.afterEnd = nil
-	afterEnd()
+	if afterEnd := t.afterEnd; afterEnd != nil {
+		t.afterEnd = nil
+		afterEnd()
+	}
+	t.rec.UntrackCapture(t)
 }
 
 // recoverLocked is the deferred guard of every tee step: after a tap panic
@@ -767,7 +776,6 @@ func (t *archiveBodyTee) emitLocked(ended string) {
 		return
 	}
 	t.done = true
-	t.rec.UntrackCapture(t)
 	archiveFault("body.emit")
 	data := archiveClientBodyData{
 		WireBytes:       t.consumed,
