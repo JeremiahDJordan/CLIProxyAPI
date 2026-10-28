@@ -16,7 +16,10 @@
    native Anthropic Messages requests confirmed as Claude Code by upstream's detector
    (`helps.DetectClaudeCodeRequest`: `x-app: cli`, Claude Code User-Agent and betas,
    structured `metadata.user_id`, native entrypoint `cli`, `sdk-cli`, `sdk-ts` or
-   `claude-vscode`). Requests targeting `codex` must be Responses/WebSocket requests
+   `claude-vscode`). Claude Code helper requests that omit only the `claude-code` beta
+   (for example session titles under the Agent SDK) are accepted when every other
+   signal is present. The fork leaves upstream's Claude cloaking (`auto`) unchanged
+   for them. Requests targeting `codex` must be Responses/WebSocket requests
    from an official Codex client (`helps.IsOfficialCodexClient`:
    `multiagentv2.IsCodexClientUserAgent` **and** an `Originator` of `codex_cli_rs`,
    `codex-tui`, `Codex Desktop`, `codex_exec` or `T3 Code`, case-insensitive, optionally

@@ -50,8 +50,11 @@ func Classify(req pluginapi.RequestInterceptRequest) Classification {
 	if c.SourceFormat == sourceClaude {
 		path, _ := req.Metadata["request_path"].(string)
 		countTokens := strings.Contains(path, "count_tokens")
-		// Confirmed already requires a native Claude Code entrypoint.
-		c.ClaudeConfirmed = helps.DetectClaudeCodeRequest(req.Headers, req.Body, countTokens).Confirmed
+		// Confirmed already requires a native Claude Code entrypoint. Claude Code's helper
+		// requests (for example session titles under the Agent SDK) omit the claude-code
+		// beta but keep every other signal, so those are accepted as well.
+		d := helps.DetectClaudeCodeRequest(req.Headers, req.Body, countTokens)
+		c.ClaudeConfirmed = d.Confirmed || (d.NativeClient && d.XAppCLI && d.UserAgent && d.MetadataUserID)
 		c.ExtendedCache = helps.ClaudePayloadHas1hTTL(req.Body)
 	}
 	c.CodexClient = helps.IsOfficialCodexClient(req.Headers)

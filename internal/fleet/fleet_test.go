@@ -182,6 +182,14 @@ func TestGateAcceptsNativeClaudeCodeAndCodex(t *testing.T) {
 	if d := Evaluate(s, Classify(codexRequest()), "codex", scopeFor(s, "codex")); !d.Allow {
 		t.Fatalf("official Codex rejected: %+v", d)
 	}
+	// Claude Code helper requests under the Agent SDK (session titles) omit the claude-code
+	// beta but keep the native entrypoint, x-app, User-Agent and metadata.user_id.
+	helper := claudeCodeRequest("")
+	helper.Headers.Set("User-Agent", "claude-cli/2.1.310 (external, sdk-ts)")
+	helper.Headers.Set("Anthropic-Beta", "interleaved-thinking-2025-05-14,structured-outputs-2025-12-15")
+	if d := Evaluate(s, Classify(helper), "claude", scopeFor(s, "claude-code")); !d.Allow {
+		t.Fatalf("Claude Code helper request rejected: %+v", d)
+	}
 	// T3 Code (and Z6) run the official Codex app-server under the "T3 Code" originator.
 	t3 := codexRequest()
 	t3.Headers.Set("User-Agent", "T3 Code/0.164.0 (Mac OS 27.0.1; arm64) xterm-256color (T3 Code; 0.1.2)")
@@ -205,6 +213,12 @@ func TestGateRejectsImpostorsAndTranslation(t *testing.T) {
 	openAIForClaude.SourceFormat = "openai"
 	if d := Evaluate(s, Classify(openAIForClaude), "claude", claudeScope); d.Allow || d.Code != "fleet_claude_format" {
 		t.Errorf("translated OpenAI request allowed for Claude: %+v", d)
+	}
+
+	noUserID := claudeCodeRequest(`{"model":"claude-opus-5-5"}`)
+	noUserID.Headers.Set("Anthropic-Beta", "structured-outputs-2025-12-15")
+	if d := Evaluate(s, Classify(noUserID), "claude", claudeScope); d.Allow || d.Code != "fleet_claude_client" {
+		t.Errorf("request without the claude-code beta or metadata.user_id allowed: %+v", d)
 	}
 
 	sdkPy := claudeCodeRequest("")
