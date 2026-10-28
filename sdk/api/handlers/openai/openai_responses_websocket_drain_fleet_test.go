@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,7 +86,13 @@ func newDrainWebsocketWithConfig(t *testing.T, cfg *sdkconfig.SDKConfig) (*fleet
 	router.Use(func(c *gin.Context) { // as the API server's drain middleware does
 		end := tracker.BeginRequest()
 		defer end()
-		c.Request = c.Request.WithContext(fleetdrain.WithRequest(fleetdrain.WithTracker(c.Request.Context(), tracker), end))
+		var once sync.Once
+		handoff := func() {
+			// The upgraded socket must already be counted when the request stops counting.
+			once.Do(func() { drainHandoffSockets.Store(int64(tracker.Snapshot().WebSockets)) })
+			end()
+		}
+		c.Request = c.Request.WithContext(fleetdrain.WithRequest(fleetdrain.WithTracker(c.Request.Context(), tracker), handoff))
 		c.Next()
 	})
 	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
@@ -100,6 +108,9 @@ func newDrainWebsocketWithConfig(t *testing.T, cfg *sdkconfig.SDKConfig) (*fleet
 	waitDrainActivity(t, tracker, func(a fleetdrain.Activity) bool { return a.WebSockets == 1 && a.Requests == 0 })
 	return tracker, executor, conn
 }
+
+// drainHandoffSockets records the open-socket count seen when the request count ended.
+var drainHandoffSockets atomic.Int64
 
 func waitDrainActivity(t *testing.T, tracker *fleetdrain.Tracker, ok func(fleetdrain.Activity) bool) {
 	t.Helper()
@@ -228,5 +239,90 @@ func TestResponsesWebsocketSteeringSessionCountsAsBusy(t *testing.T) {
 	tracker, _, _ := newDrainWebsocketWithConfig(t, &sdkconfig.SDKConfig{CodexResponseSteering: true})
 	if got := tracker.Snapshot(); got.SteeringWebSockets != 1 || got.Quiet {
 		t.Fatalf("a steering session must not look quiet: %+v", got)
+	}
+}
+
+func TestResponsesWebsocketUpgradeCountsSocketBeforeEndingRequest(t *testing.T) {
+	drainHandoffSockets.Store(-1)
+	newDrainWebsocket(t)
+	if got := drainHandoffSockets.Load(); got != 1 {
+		t.Fatalf("open sockets when the request stopped counting = %d, want 1 (no uncounted window)", got)
+	}
+}
+
+func TestResponsesWebsocketDrainRefusesTurnsSentAfterIt(t *testing.T) {
+	tracker, executor, conn := newDrainWebsocket(t)
+	request := `{"type":"response.create","model":"drain-model","input":[{"type":"message","role":"user","content":"hi"}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first turn never reached the executor")
+	}
+	tracker.StartDrain()
+	// A new turn sent after the drain began is left for the next process.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	waitDrainActivity(t, tracker, func(a fleetdrain.Activity) bool { return a.WebSocketTurns == 1 })
+	close(executor.release)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+		t.Fatalf("first turn = %q, %v; want %s", payload, err, wsEventTypeCompleted)
+	}
+	expectServiceRestartClose(t, conn)
+	select {
+	case <-executor.started:
+		t.Fatal("a turn sent after the drain began was executed")
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracker.Wait(ctx); err != nil {
+		t.Fatalf("drain did not finish: %v (%+v)", err, tracker.Snapshot())
+	}
+}
+
+func TestResponsesWebsocketDrainClosesAfterAnInterruptItHeld(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	resume := make(chan struct{})
+	var once sync.Once
+	responsesWebsocketReadHookForTest = func() {
+		once.Do(func() {
+			reached <- struct{}{}
+			<-resume
+		})
+	}
+	t.Cleanup(func() { responsesWebsocketReadHookForTest = nil })
+	tracker, _, conn := newDrainWebsocket(t)
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"resp-none"}`)); err != nil {
+		t.Fatalf("write interrupt: %v", err)
+	}
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader never read the interrupt")
+	}
+	tracker.StartDrain()
+	time.Sleep(50 * time.Millisecond)
+	if got := tracker.Snapshot(); got.WebSockets != 1 {
+		t.Fatalf("socket closed while its interrupt was held: %+v", got)
+	}
+	close(resume)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(payload, "type").String() != "error" {
+		t.Fatalf("interrupt reply = %q, %v; want an error event", payload, err)
+	}
+	expectServiceRestartClose(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracker.Wait(ctx); err != nil {
+		t.Fatalf("drain did not finish after the interrupt: %v (%+v)", err, tracker.Snapshot())
 	}
 }

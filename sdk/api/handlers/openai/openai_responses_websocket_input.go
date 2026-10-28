@@ -99,7 +99,8 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			// fleet: count the frame before parsing it; once the socket closes for a
 			// drain the client sees the close and resends (drain_fleet.go).
 			admission := responsesWebsocketAdmissionFrom(ctx)
-			if !admission.admit() {
+			afterDrain, admitted := admission.admit()
+			if !admitted {
 				return
 			}
 			if responsesWebsocketReadHookForTest != nil {
@@ -110,13 +111,14 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			if json.Valid(payload) && gjson.GetBytes(payload, "type").String() == "response.interrupt" {
 				appendResponsesInterruptDiagnostic(timeline, payload, "")
 				errInterrupt := interrupt(payload)
-				admission.unadmit()
 				switch {
 				case errInterrupt == nil:
 					appendResponsesInterruptDiagnostic(timeline, payload, "handled")
+					admission.unadmit()
 					continue
 				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) && local.deliver(payload):
 					appendResponsesInterruptDiagnostic(timeline, payload, "local_http")
+					admission.unadmit()
 					continue
 				default:
 					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
@@ -126,12 +128,18 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 						StatusCode: http.StatusBadRequest,
 						Error:      errInterrupt,
 					})
+					admission.unadmit()
 					if errWrite != nil {
 						cancel(errWrite)
 						return
 					}
 					continue
 				}
+			}
+			if afterDrain {
+				// fleet: a turn sent after the drain began is left for the next process.
+				admission.unadmit()
+				continue
 			}
 			message := cliproxyexecutor.WebsocketInput{Payload: payload, Epoch: msgEpoch}
 			select {

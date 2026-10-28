@@ -109,8 +109,9 @@ streaming and every open Codex WebSocket. `internal/fleetdrain`, `internal/api/d
   response, including the writes net/http makes after the handler returns, and closes.
   `http.Server.Shutdown` is not used for this because net/http drops a request read after
   Shutdown starts; it runs last, for HTTP/2 GOAWAY. Idle Responses WebSockets close with
-  1012 (service restart) and busy ones after their current turn, and frames read after
-  that are dropped (the client sees the close and resends). Codex checks its cached socket
+  1012 (service restart) and busy ones after the turns read before the drain began; a
+  turn read after that is dropped (the client sees the close and resends to the next
+  process), while interrupts are still handled. Codex checks its cached socket
   before each turn and reconnects when it is closed.
 - Limits: with `codex.response-steering` on (off at homelab; the archive also refuses it),
   the duplex executor keeps a session in one handler turn and reports no per-response

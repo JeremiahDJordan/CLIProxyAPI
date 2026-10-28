@@ -21,39 +21,53 @@ var responsesWebsocketReadHookForTest func()
 
 // responsesWebsocketAdmission coordinates the socket's reader with a drain. The
 // reader admits every data frame the moment it is read, so a frame being parsed
-// or queued is never mistaken for an idle socket; the handler closes for a drain
-// only while nothing admitted waits, and the reader drops frames read after that.
-// Each admitted frame counts as a turn until the handler finishes it. Nil-safe.
+// or queued is never mistaken for an idle socket. Frames read before the drain
+// began are answered; a turn read after it is dropped (the client gets the 1012
+// close and resends to the next process), while interrupts are still handled.
+// The handler closes only while nothing admitted waits, and is woken whenever the
+// reader finishes a frame itself. Each admitted frame counts as a turn until it
+// is finished. Nil-safe.
 type responsesWebsocketAdmission struct {
 	mu      sync.Mutex
 	tracker *fleetdrain.Tracker // nil when turns are not counted (steering mode)
 	closing bool
-	pending int      // admitted frames the handler has not taken
+	pending int      // admitted frames not yet taken by the handler or finished by the reader
 	ends    []func() // their turn counts, in reader order
+	changed chan struct{}
 }
 
 func newResponsesWebsocketAdmission(tracker *fleetdrain.Tracker) *responsesWebsocketAdmission {
-	return &responsesWebsocketAdmission{tracker: tracker}
+	return &responsesWebsocketAdmission{tracker: tracker, changed: make(chan struct{}, 1)}
 }
 
-// admit counts a frame the reader has just read; false once the socket is closing.
-func (a *responsesWebsocketAdmission) admit() bool {
+// admit counts a frame the reader has just read. ok is false once the socket is
+// closing; afterDrain reports that the drain had already begun.
+func (a *responsesWebsocketAdmission) admit() (afterDrain, ok bool) {
 	if a == nil {
-		return true
+		return false, true
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closing {
-		return false
+		return false, false
 	}
 	a.pending++
 	if a.tracker != nil {
 		a.ends = append(a.ends, a.tracker.BeginTurn())
 	}
-	return true
+	return a.tracker.IsDraining(), true
 }
 
-// unadmit ends the newest frame's count when the reader handled it itself (interrupts).
+// changes wakes the handler when the reader has finished a frame itself.
+func (a *responsesWebsocketAdmission) changes() <-chan struct{} {
+	if a == nil {
+		return nil
+	}
+	return a.changed
+}
+
+// unadmit ends the count of the frame the reader holds once it has finished it
+// itself (an interrupt, or a turn dropped during a drain), and wakes the handler.
 func (a *responsesWebsocketAdmission) unadmit() {
 	if a == nil {
 		return
@@ -69,6 +83,10 @@ func (a *responsesWebsocketAdmission) unadmit() {
 	a.mu.Unlock()
 	if end != nil {
 		end()
+	}
+	select {
+	case a.changed <- struct{}{}:
+	default:
 	}
 }
 

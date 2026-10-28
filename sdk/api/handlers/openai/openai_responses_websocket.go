@@ -356,8 +356,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	writer := newResponsesWebsocketWriter(conn)
 	// fleet: from here the connection, not the request, is counted (drain_fleet.go)
 	drainTracker := fleetdrain.FromContext(c.Request.Context())
+	defer drainTracker.BeginWebSocket()() // counted before the request stops counting
 	fleetdrain.EndRequest(c.Request.Context())
-	defer drainTracker.BeginWebSocket()()
 	passthroughSessionID := uuid.NewString()
 	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
 	defer cancelSocket(nil)
@@ -545,6 +545,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var errReadMessage error
 		select {
 		case <-drainCh:
+			continue
+		case <-admission.changes(): // the reader finished a frame itself; recheck
 			continue
 		case message, ok := <-input:
 			if !ok {
