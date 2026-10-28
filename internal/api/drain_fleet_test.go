@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -313,5 +314,12 @@ func TestFleetListenRejectsSeveralSockets(t *testing.T) {
 	}
 	if _, set := os.LookupEnv("LISTEN_FDS"); set {
 		t.Fatal("activation variables should be cleared")
+	}
+}
+
+func TestDrainTrackerIsOutermostWithoutArchive(t *testing.T) {
+	s := newTestServer(t)
+	if name := handlerName(s.engine.Handlers[0]); !strings.Contains(name, "installDrainTracker") {
+		t.Fatalf("first middleware is %s", name)
 	}
 }

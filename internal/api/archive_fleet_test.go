@@ -326,8 +326,11 @@ func TestArchiveObserverIsOutermostMiddleware(t *testing.T) {
 		if name := handlerName(server.engine.Handlers[0]); !strings.Contains(name, "archiveObserverMiddleware") {
 			t.Fatalf("first middleware is %s", name)
 		}
-		if name := handlerName(server.engine.Handlers[1]); !strings.Contains(name, "GinLogrusLogger") {
+		if name := handlerName(server.engine.Handlers[1]); !strings.Contains(name, "installDrainTracker") {
 			t.Fatalf("second middleware is %s", name)
+		}
+		if name := handlerName(server.engine.Handlers[2]); !strings.Contains(name, "GinLogrusLogger") {
+			t.Fatalf("third middleware is %s", name)
 		}
 	})
 	t.Run("engine configurator added middleware", func(t *testing.T) {
