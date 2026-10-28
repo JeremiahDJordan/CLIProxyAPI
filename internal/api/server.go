@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/fleetdrain"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
@@ -44,6 +45,8 @@ type Server struct {
 
 	// server is the underlying HTTP server.
 	server *http.Server
+
+	drain *fleetdrain.Tracker // fleet: work in flight (drain_fleet.go)
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
@@ -169,6 +172,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
 
+	s.installDrainTracker(engine)         // fleet: work in flight (drain_fleet.go)
 	s.installArchiveObserver(engine, cfg) // fleet: request archive (archive_fleet.go), outermost middleware
 
 	// Add middleware
@@ -303,7 +307,7 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
-	listener, errListen := net.Listen("tcp", addr)
+	listener, errListen := fleetListen(addr) // fleet: systemd socket activation (drain_fleet.go)
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}

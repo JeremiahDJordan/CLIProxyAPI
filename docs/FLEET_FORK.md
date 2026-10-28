@@ -87,6 +87,34 @@ attach to the `*archive.Ingress` carried in the request context
 Core hooks: two lines in `internal/api/server.go` (install in `NewServer`, stop in `Stop`),
 the `Archive` field in `internal/config/config.go` and its v8 path in `config_v8.go`.
 
+## 4. Restarts without interrupting work
+
+Upstream closes the HTTP server at once on SIGTERM, cutting off responses that are still
+streaming and every open Codex WebSocket. `internal/fleetdrain`, `internal/api/drain_fleet.go`,
+`sdk/cliproxy/drain_fleet.go` and `openai_responses_websocket_drain_fleet.go` change that:
+
+- A tracker per API server counts HTTP requests in flight (outermost middleware, inside the
+  archive observer; WebSocket upgrades and the activity route are not counted), open
+  Responses WebSockets and WebSocket turns (one per iteration of the handler's read loop).
+  `GET /v0/management/fleet/activity` (management key) reports
+  `{requests, websockets, websocket_turns, draining, quiet}`; `quiet` means no request or
+  turn is in flight. An installer restarts in such a moment.
+- On SIGTERM, before anything else stops, the server closes its listeners, disables
+  keep-alives, closes idle Responses WebSockets with 1012 (service restart) and busy ones
+  after their current turn, and waits up to 75 s for the rest; shutdown then proceeds as
+  upstream (30 s), within systemd's `TimeoutStopSec=120`. Codex checks its cached socket
+  before each turn and reconnects when it is closed. The realtime/live WebSockets are not
+  tracked; the fleet gate refuses those routes.
+- Under systemd socket activation (`LISTEN_PID`/`LISTEN_FDS`, one TCP socket) the server
+  serves on the inherited socket, which outlives the process, so connections arriving
+  during a drain or restart wait in the kernel queue for the next process instead of being
+  refused. The socket's address wins over the configured one (logged when they differ).
+
+Core hooks: the `drain` field, its install line and the listener call in
+`internal/api/server.go`, one route in `server_management.go`, one line in
+`sdk/cliproxy/service_lifecycle.go` (drain before `Shutdown`), and three small blocks in
+`openai_responses_websocket.go` (count the socket, count each turn, close when draining).
+
 Run `go test ./internal/fleet/ ./internal/client/codex/models ./internal/runtime/executor`
 then `go test ./...`. On v8.0.45, upstream's own
 `TestDevinApplyPatchRejectionCarriesLogDiagnostic`, `TestModelsMultiAgentClientConfigAndReload`

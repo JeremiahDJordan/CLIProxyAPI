@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/fleetdrain"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -353,6 +354,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	writer := newResponsesWebsocketWriter(conn)
+	// fleet: counted until the connection is closed below (drain_fleet.go)
+	drainTracker := fleetdrain.FromContext(c.Request.Context())
+	defer drainTracker.BeginWebSocket()()
 	passthroughSessionID := uuid.NewString()
 	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
 	defer cancelSocket(nil)
@@ -503,12 +507,37 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		pinnedAuthID = ""
 	}
 
+	// fleet: one turn per loop iteration, ended when the loop comes back for input.
+	var endTurn func()
+	defer func() {
+		if endTurn != nil {
+			endTurn()
+		}
+	}()
 	for {
+		if endTurn != nil {
+			endTurn()
+			endTurn = nil
+		}
+		drainCh := drainTracker.Draining()
+		if drainTracker.IsDraining() {
+			// Answer a request that was already read; otherwise hand the client to the next process.
+			if len(input) == 0 {
+				if errClose := writer.closeForDrain(); errClose != nil && !isWebsocketConnectionClosedError(errClose) {
+					log.Debugf("responses websocket: drain close id=%s error=%v", passthroughSessionID, errClose)
+				}
+				log.Infof("responses websocket: closed for server restart id=%s", passthroughSessionID)
+				return
+			}
+			drainCh = nil
+		}
 		var msgType int
 		var payload []byte
 		var msgEpoch uint64
 		var errReadMessage error
 		select {
+		case <-drainCh:
+			continue
 		case message, ok := <-input:
 			if !ok {
 				errReadMessage = context.Cause(socketCtx)
@@ -541,6 +570,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
+		endTurn = drainTracker.BeginTurn()
 		// log.Infof(
 		// 	"responses websocket: downstream_in id=%s type=%d event=%s payload=%s",
 		// 	passthroughSessionID,

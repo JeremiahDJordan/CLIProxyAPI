@@ -67,6 +67,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
+		s.drainFleetServer() // fleet: finish work in flight first (drain_fleet.go)
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer shutdownCancel()
 		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {

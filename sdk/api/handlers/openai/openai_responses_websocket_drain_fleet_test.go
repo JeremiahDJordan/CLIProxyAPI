@@ -1,0 +1,172 @@
+package openai
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/fleetdrain"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/tidwall/gjson"
+)
+
+// drainGatedExecutor holds each turn open until the test releases it.
+type drainGatedExecutor struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*drainGatedExecutor) Identifier() string { return "codex" }
+
+func (*drainGatedExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *drainGatedExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	e.started <- struct{}{}
+	go func() {
+		defer close(chunks)
+		select {
+		case <-e.release:
+		case <-ctx.Done():
+			return
+		}
+		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"resp-drain","output":[]}}`)}
+	}()
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*drainGatedExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (*drainGatedExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (*drainGatedExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+// newDrainWebsocket serves the Responses WebSocket with a tracker in the request
+// context, as the API server's drain middleware provides it, and dials it.
+func newDrainWebsocket(t *testing.T) (*fleetdrain.Tracker, *drainGatedExecutor, *websocket.Conn) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	executor := &drainGatedExecutor{started: make(chan struct{}, 4), release: make(chan struct{})}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-drain", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "drain-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	tracker := fleetdrain.New()
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Request = c.Request.WithContext(fleetdrain.WithTracker(c.Request.Context(), tracker))
+	})
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses/ws", nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	waitDrainActivity(t, tracker, func(a fleetdrain.Activity) bool { return a.WebSockets == 1 })
+	return tracker, executor, conn
+}
+
+func waitDrainActivity(t *testing.T, tracker *fleetdrain.Tracker, ok func(fleetdrain.Activity) bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !ok(tracker.Snapshot()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("activity never reached the expected state: %+v", tracker.Snapshot())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func expectServiceRestartClose(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if !websocket.IsCloseError(err, websocket.CloseServiceRestart) {
+		t.Fatalf("read = %q, %v; want close 1012 (service restart)", payload, err)
+	}
+}
+
+func TestResponsesWebsocketDrainClosesIdleSocket(t *testing.T) {
+	tracker, _, conn := newDrainWebsocket(t)
+	if got := tracker.Snapshot(); !got.Quiet || got.WebSocketTurns != 0 {
+		t.Fatalf("an idle socket should be quiet: %+v", got)
+	}
+	tracker.StartDrain()
+	expectServiceRestartClose(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracker.Wait(ctx); err != nil {
+		t.Fatalf("drain did not finish after the idle socket closed: %v (%+v)", err, tracker.Snapshot())
+	}
+}
+
+func TestResponsesWebsocketDrainFinishesTurnBeforeClosing(t *testing.T) {
+	tracker, executor, conn := newDrainWebsocket(t)
+	request := `{"type":"response.create","model":"drain-model","input":[{"type":"message","role":"user","content":"hi"}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn never reached the executor")
+	}
+	if got := tracker.Snapshot(); got.WebSocketTurns != 1 || got.Quiet {
+		t.Fatalf("a turn in flight should not be quiet: %+v", got)
+	}
+
+	tracker.StartDrain()
+	waited := make(chan error, 1)
+	go func() { waited <- tracker.Wait(context.Background()) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("drain finished with a turn in flight: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(executor.release)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("turn in flight was cut off: %v", err)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("response type = %q, want %q: %s", got, wsEventTypeCompleted, payload)
+	}
+	expectServiceRestartClose(t, conn)
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("drain did not finish after the turn: %+v", tracker.Snapshot())
+	}
+}
