@@ -99,17 +99,25 @@ func isCredentialHeader(lower string) bool {
 	if _, ok := keptHeaders[lower]; ok {
 		return false
 	}
-	// Rate-limit headers (x-ratelimit-remaining-tokens) carry counts.
-	if strings.Contains(lower, "ratelimit") {
-		return false
-	}
 	for _, part := range credentialNameParts {
-		if strings.Contains(lower, part) {
-			return true
+		if !strings.Contains(lower, part) {
+			continue
 		}
+		// A rate-limit count header's one "tokens" is a count, not a token.
+		if part == "token" && strings.Count(lower, part) == 1 && rateLimitTokenCount.MatchString(lower) {
+			continue
+		}
+		return true
 	}
 	return false
 }
+
+// rateLimitTokenCount matches the token-count rate-limit headers: OpenAI's
+// x-ratelimit-{limit,remaining,reset}-tokens, Anthropic's
+// anthropic-ratelimit-{,input-,output-}tokens-{limit,remaining,reset} and the
+// per-window variants (x-ratelimit-remaining-tokens-minute). It exempts only
+// the "token" part; every other credential part still redacts the header.
+var rateLimitTokenCount = regexp.MustCompile(`(^|[-_])ratelimit-((limit|remaining|reset)-)?((input|output)-)?tokens(-(limit|remaining|reset))?(-(second|minute|hour|day))?$`)
 
 func isURLHeader(lower string) bool {
 	_, ok := urlHeaders[lower]
@@ -239,7 +247,7 @@ func RedactQuery(rawQuery string, allow QueryAllowlist) string {
 		rawName, rawValue, hasValue := strings.Cut(part, "=")
 		name, errName := url.QueryUnescape(rawName)
 		rule, allowed := allow[name]
-		if errName != nil || !safeQueryName.MatchString(name) {
+		if errName != nil || !isQueryName(name) {
 			out = append(out, Redacted)
 			continue
 		}
@@ -275,11 +283,17 @@ func QueryNames(rawQuery string) []string {
 		}
 		rawName, _, hasValue := strings.Cut(part, "=")
 		name, err := url.QueryUnescape(rawName)
-		if err != nil || !hasValue || !safeQueryName.MatchString(name) {
+		if err != nil || !hasValue || !isQueryName(name) {
 			out = append(out, Redacted)
 			continue
 		}
 		out = append(out, name)
 	}
 	return out
+}
+
+// isQueryName reports a parameter name that is safe to keep: shaped like a
+// name and not like a key (a key sent as a bare name, ?sk-...=1).
+func isQueryName(name string) bool {
+	return safeQueryName.MatchString(name) && !looksLikeKey(name)
 }

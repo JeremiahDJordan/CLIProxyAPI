@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -13,8 +14,12 @@ type fsStat struct {
 	free   uint64
 }
 
+// Test hooks. TestOverrides, SetTestOverrides and FlushForTest are exported
+// only for the internal/api tests, which start a recorder on a temporary,
+// non-ZFS spool. Outside a test binary SetTestOverrides and FlushForTest do
+// nothing, so no override can reach a production recorder.
+
 // TestOverrides adjusts recorder start-up so tests can run on any platform.
-// Production code never sets it.
 type TestOverrides struct {
 	// StateDir replaces DefaultStateDir.
 	StateDir string
@@ -43,33 +48,45 @@ var (
 	writerBackoff = time.Second
 )
 
-// SetTestOverrides installs o and returns a function that stops any running
-// recorder, releases its boot lock and clears the overrides so the next test
-// can start a fresh recorder.
+// SetTestOverrides resets the process's start-once state, so the test can
+// start a fresh recorder, and installs o. It returns a function that stops
+// any running recorder, releases its boot lock and clears the overrides. It
+// does nothing outside a test binary.
 func SetTestOverrides(o TestOverrides) (restore func()) {
+	if !testing.Testing() {
+		return func() {}
+	}
+	resetForTest()
 	overrides.Store(&o)
 	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = Stop(ctx)
-		lifecycleMu.Lock()
-		startAttempted = false
-		for _, f := range heldLocks {
-			_ = f.Close()
-		}
-		heldLocks = nil
-		lifecycleMu.Unlock()
+		resetForTest()
 		overrides.Store(nil)
 		traceHook.Store(nil)
 		faultHook.Store(nil)
 	}
 }
 
+// resetForTest stops any running recorder and forgets that Start ran, so
+// every test (also one after a server built with archive disabled, which
+// counts as the process's first configuration) starts from scratch.
+func resetForTest() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = Stop(ctx)
+	lifecycleMu.Lock()
+	startAttempted = false
+	for _, f := range heldLocks {
+		_ = f.Close()
+	}
+	heldLocks = nil
+	lifecycleMu.Unlock()
+}
+
 // FlushForTest waits until the running recorder has written everything
-// queued so far.
+// queued so far. It does nothing outside a test binary.
 func FlushForTest(ctx context.Context) error {
 	rec := Current()
-	if rec == nil {
+	if rec == nil || !testing.Testing() {
 		return nil
 	}
 	return rec.flush(ctx)

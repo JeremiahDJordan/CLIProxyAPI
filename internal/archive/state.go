@@ -60,6 +60,9 @@ type dropLedger struct {
 	carried bool
 	total   map[string]DropCount
 	dirty   bool
+	// closed ignores drops counted after the final persist at Stop, which
+	// nothing would persist or report.
+	closed bool
 }
 
 func newDropLedger(dir string) *dropLedger {
@@ -69,12 +72,23 @@ func newDropLedger(dir string) *dropLedger {
 func (l *dropLedger) add(reason string, d DropCount) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
 	if len(l.pending) == 0 {
 		l.since = time.Now()
 	}
 	l.pending[reason] = l.pending[reason].add(d)
 	l.total[reason] = l.total[reason].add(d)
 	l.dirty = true
+}
+
+// close makes later adds no-ops; drops counted before it are persisted by
+// the persist that follows.
+func (l *dropLedger) close() {
+	l.mu.Lock()
+	l.closed = true
+	l.mu.Unlock()
 }
 
 // pendingSnapshot returns the drops not yet reported, and whether some

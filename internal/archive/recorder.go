@@ -360,7 +360,10 @@ func (r *Recorder) stop(ctx context.Context) error {
 	select {
 	case <-r.done:
 		// Taps still finishing may have counted drops after the writer's
-		// last write of the state file.
+		// last write of the state file. Persist those; later ones, which
+		// nothing could persist, are not counted (their requests have no
+		// ingress_end, so they show as incomplete).
+		r.ledger.close()
 		r.w.persistLedger()
 		return nil
 	case <-ctx.Done():

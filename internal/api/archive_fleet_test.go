@@ -12,7 +12,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -298,6 +300,23 @@ func TestArchiveDisabledInstallsNothing(t *testing.T) {
 	entries, _ := os.ReadDir(spool)
 	if len(entries) != 2 {
 		t.Fatalf("disabled archive wrote to the spool: %v", entries)
+	}
+
+	// The first configuration wins: a later enabled server in the same
+	// process starts no recorder and installs nothing.
+	enabled := &proxyconfig.Config{}
+	enabled.Archive = proxyconfig.ArchiveConfig{Enabled: true, SpoolDir: spool}
+	later := newTestServerWithConfig(t, enabled)
+	if archive.Current() != nil {
+		t.Fatal("an enabled server after a disabled one started the recorder")
+	}
+	for _, h := range later.engine.Handlers {
+		if strings.Contains(handlerName(h), "archive") {
+			t.Fatalf("an enabled server after a disabled one installed %s", handlerName(h))
+		}
+	}
+	if entries, _ = os.ReadDir(spool); len(entries) != 2 {
+		t.Fatalf("an enabled server after a disabled one wrote to the spool: %v", entries)
 	}
 }
 
@@ -941,7 +960,11 @@ func TestArchiveBodyReadInFlightAtRequestEnd(t *testing.T) {
 
 type archiveFailingReader struct{}
 
-func (archiveFailingReader) Read([]byte) (int, error) { return 0, errors.New("fake read failure") }
+// The error text carries what a transport error can: URL user information,
+// a key in a query and an OAuth code.
+func (archiveFailingReader) Read([]byte) (int, error) {
+	return 0, errors.New(`read "https://user:fake-pass-0001@upstream.example/v1?key=fake-key-0002&code=fake-code-0003": failed`)
+}
 
 func TestArchiveBodyReadErrorIsNotUnread(t *testing.T) {
 	server, spool := newArchiveServer(t, nil)
@@ -956,10 +979,187 @@ func TestArchiveBodyReadErrorIsNotUnread(t *testing.T) {
 		t.Fatalf("status %d", rec.Code)
 	}
 	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/echo")
-	if len(bodies) != 1 || bodies[0]["capture"] == archive.CaptureBodyUnread || bodies[0]["read_error"] != "fake read failure" {
+	if len(bodies) != 1 || bodies[0]["capture"] == archive.CaptureBodyUnread || bodies[0]["read_error"] != "other" {
 		t.Fatalf("client_body = %v", bodies)
 	}
+	files, _ := filepath.Glob(filepath.Join(spool, "*.jsonl"))
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("fake-")) {
+			t.Fatalf("%s keeps the read error's text", filepath.Base(path))
+		}
+	}
 }
+
+func TestArchiveReadErrorClass(t *testing.T) {
+	timeout := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	cases := map[string]error{
+		"eof_unexpected": fmt.Errorf("chunked: %w", io.ErrUnexpectedEOF),
+		"max_bytes":      &http.MaxBytesError{Limit: 64},
+		"canceled":       fmt.Errorf("body: %w", context.Canceled),
+		"timeout":        timeout,
+		"closed":         http.ErrBodyReadAfterClose,
+		"other":          errors.New("https://user:fake-pass-0001@example.test/?key=fake-key-0002"),
+	}
+	for want, err := range cases {
+		if got := archiveReadErrorClass(err); got != want {
+			t.Errorf("archiveReadErrorClass(%v) = %q, want %q", err, got, want)
+		}
+	}
+	if got := archiveReadErrorClass(context.DeadlineExceeded); got != "timeout" {
+		t.Errorf("context.DeadlineExceeded = %q", got)
+	}
+}
+
+// A body read still in progress when the request ends may be dropped later;
+// ingress_end waits for that body, so its capture_drops counts the drop.
+func TestArchiveIngressEndCountsALateBodyDrop(t *testing.T) {
+	var free atomic.Uint64
+	free.Store(1 << 50)
+	server, spool := newArchiveServerWithOverrides(t,
+		func(o *archive.TestOverrides) {
+			o.FreeBytes = free.Load
+			o.SpaceCheckInterval = 5 * time.Millisecond
+		},
+		func(cfg *proxyconfig.Config) {
+			cfg.Archive.BodyFreeGB = 2
+			cfg.Archive.HardFreeGB = 1
+		})
+	classifyForTest(t, http.MethodPost, "/archive-test/late-drop")
+	readDone := make(chan []byte, 1)
+	server.engine.POST("/archive-test/late-drop", func(c *gin.Context) {
+		tee := archiveTee(t, c)
+		body := c.Request.Body
+		go func() {
+			data, _ := io.ReadAll(body)
+			readDone <- data
+		}()
+		waitUntil(t, "the read to start", func() bool {
+			tee.mu.Lock()
+			defer tee.mu.Unlock()
+			return tee.reading > 0
+		})
+		c.Status(http.StatusAccepted)
+	})
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPost, "/archive-test/late-drop", pr)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d", rec.Code)
+	}
+	// Space runs low after the request ended, before its body arrives.
+	free.Store(3 << 29)
+	waitUntil(t, "bodies to stop", func() bool { return !archive.Current().CaptureBodies() })
+	_, _ = pw.Write([]byte("late body"))
+	_ = pw.Close()
+	if got := <-readDone; string(got) != "late body" {
+		t.Fatalf("the read returned %q", got)
+	}
+	events := spoolEvents(t, spool)
+	bodies := eventsFor(events, archive.TypeClientBody, "/archive-test/late-drop")
+	ends := eventsFor(events, archive.TypeIngressEnd, "/archive-test/late-drop")
+	if len(bodies) != 1 || bodies[0]["capture"] != archive.CaptureDroppedBody || bodies[0]["drop_reason"] != archive.DropLowSpaceBody {
+		t.Fatalf("client_body = %v", bodies)
+	}
+	if len(ends) != 1 || ends[0]["capture_drops"] != float64(1) {
+		t.Fatalf("ingress_end = %v, want capture_drops 1 for the late body", ends)
+	}
+	if ends[0]["seq"].(float64) < bodies[0]["seq"].(float64) {
+		t.Fatal("ingress_end was written before the late client_body")
+	}
+}
+
+// When doubling the buffer does not fit in the queue, the exact size is
+// tried, so a chunked body larger than half the queue is still captured.
+func TestArchiveChunkedBodyFallsBackToExactReservation(t *testing.T) {
+	server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.QueueBytes = 1000 << 10 }, nil)
+	classifyForTest(t, http.MethodPost, "/archive-test/echo")
+	server.engine.POST("/archive-test/echo", echoBody)
+	payload := bytes.Repeat([]byte("0123456789abcdef"), (528<<10)/16)
+	req := httptest.NewRequest(http.MethodPost, "/archive-test/echo", bytes.NewReader(payload))
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/echo")
+	if len(bodies) != 1 || bodies[0]["capture"] != archive.CaptureFull {
+		t.Fatalf("client_body = %v; a 528 KiB chunked body was dropped from a 1000 KiB queue", bodies)
+	}
+	if got := spoolBody(t, spool, bodies[0]); !bytes.Equal(got, payload) {
+		t.Fatalf("captured %d bytes, want %d", len(got), len(payload))
+	}
+	if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+		t.Fatalf("%v queue bytes still reserved", queued)
+	}
+}
+
+// Two concurrent reads: one sees EOF while the other is still returning
+// data. client_body waits for the last read, so the data is not lost.
+func TestArchiveConcurrentEOFWaitsForOtherReads(t *testing.T) {
+	server, spool := newArchiveServer(t, nil)
+	classifyForTest(t, http.MethodPost, "/archive-test/racing")
+	body := &archiveRacingReader{release: make(chan struct{})}
+	server.engine.POST("/archive-test/racing", func(c *gin.Context) {
+		// Read the tee itself: the tracker and MaxBytesReader above it are
+		// not safe for concurrent reads.
+		tee := archiveTee(t, c)
+		delivered := make(chan int, 1)
+		go func() {
+			n, _ := tee.Read(make([]byte, 64))
+			delivered <- n
+		}()
+		waitUntil(t, "the first read to start", func() bool { return body.calls.Load() == 1 })
+		if n, err := tee.Read(make([]byte, 64)); n != 0 || !errors.Is(err, io.EOF) {
+			t.Errorf("second read = %d, %v; want EOF", n, err)
+		}
+		close(body.release)
+		if n := <-delivered; n != 9 {
+			t.Errorf("first read delivered %d bytes", n)
+		}
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/archive-test/racing", body)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/racing")
+	if len(bodies) != 1 || bodies[0]["capture"] != archive.CaptureFull || bodies[0]["wire_bytes"] != float64(9) || bodies[0]["eof"] != true || bodies[0]["ended"] != "eof" {
+		t.Fatalf("client_body = %v; the bytes of the read still in progress at EOF were lost", bodies)
+	}
+	if got := spoolBody(t, spool, bodies[0]); string(got) != "late body" {
+		t.Fatalf("captured %q", got)
+	}
+}
+
+// archiveRacingReader's first Read waits for release and returns data; every
+// later Read returns EOF at once.
+type archiveRacingReader struct {
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (r *archiveRacingReader) Read(p []byte) (int, error) {
+	if r.calls.Add(1) == 1 {
+		<-r.release
+		return copy(p, "late body"), nil
+	}
+	return 0, io.EOF
+}
+
+func (r *archiveRacingReader) Close() error { return nil }
 
 func TestArchiveBodyStopsWhenSpaceRunsLow(t *testing.T) {
 	var free atomic.Uint64

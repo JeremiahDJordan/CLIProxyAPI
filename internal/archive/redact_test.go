@@ -64,6 +64,10 @@ func TestRedactQuery(t *testing.T) {
 		"%zz=1":                              "[redacted]",
 		"":                                   "",
 		"beta=true&&beta=false":              "beta=true&beta=false",
+		// A key sent as a parameter name is redacted with its value.
+		"sk-ant-fake0008=1&beta=true": "[redacted]&beta=true",
+		"AIzaFAKEFAKE0009=x":          "[redacted]",
+		"abcdefghFAKE0123456789=x":    "[redacted]",
 	}
 	for in, want := range cases {
 		if got := RedactQuery(in, allow); got != want {
@@ -73,8 +77,8 @@ func TestRedactQuery(t *testing.T) {
 }
 
 func TestQueryNames(t *testing.T) {
-	got := QueryNames("code=fake-0001&state=fake-0002&password=x&AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE0003&value=")
-	want := []string{"code", "state", "password", Redacted, "value"}
+	got := QueryNames("code=fake-0001&state=fake-0002&password=x&AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE0003&value=&sk-fake0004=1&AIzaFAKEFAKE0005=")
+	want := []string{"code", "state", "password", Redacted, "value", Redacted, Redacted}
 	if !slices.Equal(got, want) {
 		t.Fatalf("QueryNames = %v, want %v", got, want)
 	}
@@ -182,6 +186,58 @@ func TestQueryValueRules(t *testing.T) {
 	for value, want := range versions {
 		if got := VersionValue(value); got != want {
 			t.Errorf("VersionValue(%q) = %v, want %v", value, got, want)
+		}
+	}
+}
+
+// Only the token-count rate-limit headers keep their values; a rate-limit
+// name never exempts any other credential part, nor a singular "token".
+func TestRedactRateLimitHeaders(t *testing.T) {
+	kept := []string{
+		"Anthropic-Ratelimit-Tokens-Remaining",
+		"Anthropic-Ratelimit-Tokens-Limit",
+		"Anthropic-Ratelimit-Input-Tokens-Reset",
+		"Anthropic-Ratelimit-Output-Tokens-Remaining",
+		"Anthropic-Ratelimit-Requests-Remaining",
+		"Anthropic-Ratelimit-Unified-5h-Utilization",
+		"X-Ratelimit-Limit-Tokens",
+		"X-Ratelimit-Remaining-Tokens",
+		"X-Ratelimit-Reset-Tokens",
+		"X-Ratelimit-Remaining-Tokens-Minute",
+		"X-Ratelimit-Remaining-Requests",
+		"Ratelimit-Remaining",
+	}
+	redacted := []string{
+		"X-Ratelimit-Api-Key",
+		"X-Ratelimit-Secret",
+		"X-Ratelimit-Bypass-Token",
+		"X-Ratelimit-Access-Tokens",
+		"X-Ratelimit-Token",
+		"X-Ratelimit-Auth",
+		"X-Ratelimit-Session",
+		"X-Ratelimit-Signature",
+		"X-Ratelimit-Password",
+		"X-Ratelimit-Cookie",
+		"X-Secret-Ratelimit-Remaining-Tokens",
+		"X-Token-Ratelimit-Remaining-Tokens",
+		"X-Ratelimit-Remaining-Tokens-Key",
+	}
+	h := http.Header{}
+	for _, name := range kept {
+		h[name] = []string{"12345"}
+	}
+	for _, name := range redacted {
+		h[name] = []string{"fake-ratelimit-credential-0001"}
+	}
+	out := RedactHeaders(h)
+	for _, name := range kept {
+		if got := out[name]; !slices.Equal(got, []string{"12345"}) {
+			t.Errorf("%s = %v, want the count kept", name, got)
+		}
+	}
+	for _, name := range redacted {
+		if got := out[name]; !slices.Equal(got, []string{Redacted}) {
+			t.Errorf("%s = %v, want %s", name, got, Redacted)
 		}
 	}
 }

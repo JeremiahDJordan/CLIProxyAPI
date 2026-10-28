@@ -38,10 +38,13 @@ var archiveTapFault func(where string)
 
 // installArchiveObserver starts the recorder once per process and installs
 // the transport observer as the outermost middleware, outside logging,
-// recovery, the body limit, CORS and response compression. With
-// archive.enabled false it installs nothing.
+// recovery, the body limit, CORS and response compression. A disabled
+// configuration also goes through Start's once-per-process guard, so the
+// first configuration wins: with archive.enabled false Start does nothing (no
+// goroutine, no file), a later enabled server starts nothing either, and
+// nothing is installed.
 func (s *Server) installArchiveObserver(engine *gin.Engine, cfg *config.Config) {
-	if s == nil || engine == nil || cfg == nil || !cfg.Archive.Enabled {
+	if s == nil || engine == nil || cfg == nil {
 		return
 	}
 	rec := archive.Start(archive.StartParams{Config: cfg.Archive, ResponseSteering: cfg.Codex.ResponseSteering})
@@ -206,9 +209,6 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 	}
 	archiveFault("observer.finish")
 	end := time.Now()
-	if o.tee != nil {
-		o.tee.end("request_end")
-	}
 	summary := archiveResponseSummary{DurationUS: end.Sub(o.in.Started()).Microseconds()}
 	switch {
 	case aborted && recovered == nil:
@@ -243,7 +243,19 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 	if o.class == archive.RouteInference {
 		data := archiveIngressEndData{archiveResponseSummary: summary, Headers: headers}
 		// The writer fills in capture_drops when it writes the event.
-		o.in.Emit(&archive.Event{Type: archive.TypeIngressEnd, Time: end, Capture: archive.CaptureFull, Data: data, SizeHint: data.sizeHint(), ReportDrops: true})
+		ev := &archive.Event{Type: archive.TypeIngressEnd, Time: end, Capture: archive.CaptureFull, Data: data, SizeHint: data.sizeHint(), ReportDrops: true}
+		emitEnd := func() {
+			defer recoverArchiveTap("observer.finish")
+			o.in.Emit(ev)
+		}
+		if o.tee == nil {
+			emitEnd()
+			return
+		}
+		// ingress_end follows client_body so its capture_drops counts a
+		// body drop. When a read is still in progress both wait for that
+		// read (on its goroutine, never on this one); ts stays the request end.
+		o.tee.endThen("request_end", emitEnd)
 		return
 	}
 	data := archiveMetadataOnlyData{
@@ -504,9 +516,11 @@ const archiveBodyMinBuffer = 4 << 10
 
 // archiveBodyTee copies the wire bytes the handler consumes. Its queue
 // reservation always covers its buffer's capacity. It emits client_body
-// once, at EOF or Close, or at the end of the request when no read is in
-// progress; a read in progress then emits it when it returns. Later reads
-// pass through.
+// once, at EOF or Close, or at the end of the request, but never while
+// another read is in progress: the last read to return then emits it. Later
+// reads pass through. net/http request bodies are not safe for concurrent
+// reads, so the order of bytes from concurrent reads is not meaningful; the
+// tee only makes sure none of them is lost and the reservation is returned.
 type archiveBodyTee struct {
 	inner         io.ReadCloser
 	in            *archive.Ingress
@@ -525,8 +539,10 @@ type archiveBodyTee struct {
 	readErr    string
 	reading    int
 	endPending string
-	done       bool
-	handedOff  bool
+	// afterEnd runs once client_body has been emitted (ingress_end).
+	afterEnd  func()
+	done      bool
+	handedOff bool
 }
 
 func (t *archiveBodyTee) Read(p []byte) (n int, errRead error) {
@@ -567,12 +583,38 @@ func (t *archiveBodyTee) observe(p []byte, n int, errRead error) {
 	switch {
 	case errors.Is(errRead, io.EOF):
 		t.sawEOF = true
+		if t.reading > 1 {
+			// Another read is still in progress; the last to return emits,
+			// with whatever it delivered.
+			if t.endPending == "" {
+				t.endPending = "eof"
+			}
+			return
+		}
 		t.emitLocked("eof")
 	case errRead != nil && t.readErr == "":
-		t.readErr = errRead.Error()
-		if len(t.readErr) > 256 {
-			t.readErr = t.readErr[:256]
-		}
+		t.readErr = archiveReadErrorClass(errRead)
+	}
+}
+
+// archiveReadErrorClass names a body read error by category. Its text is
+// never kept: it can carry URLs with credentials, keys or OAuth codes.
+func archiveReadErrorClass(err error) string {
+	var maxErr *http.MaxBytesError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "eof_unexpected"
+	case errors.As(err, &maxErr):
+		return "max_bytes"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	case errors.Is(err, http.ErrBodyReadAfterClose):
+		return "closed"
+	default:
+		return "other"
 	}
 }
 
@@ -581,6 +623,7 @@ func (t *archiveBodyTee) observe(p []byte, n int, errRead error) {
 func (t *archiveBodyTee) endRead() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	defer t.runAfterEndLocked()
 	defer t.recoverLocked("body.read")
 	t.reading--
 	if t.reading == 0 && t.endPending != "" {
@@ -591,9 +634,19 @@ func (t *archiveBodyTee) endRead() {
 // end emits the event now, or leaves it to the read in progress. It never
 // waits and is idempotent.
 func (t *archiveBodyTee) end(ended string) {
+	t.endThen(ended, nil)
+}
+
+// endThen is end, and then runs afterEnd once the event has been emitted:
+// now, or when the last read in progress returns.
+func (t *archiveBodyTee) endThen(ended string, afterEnd func()) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	defer t.runAfterEndLocked()
 	defer t.recoverLocked("body.finish")
+	if t.afterEnd == nil {
+		t.afterEnd = afterEnd
+	}
 	if t.done {
 		return
 	}
@@ -604,6 +657,17 @@ func (t *archiveBodyTee) end(ended string) {
 		return
 	}
 	t.emitLocked(ended)
+}
+
+// runAfterEndLocked runs afterEnd once, after client_body was emitted (or
+// lost to a tap panic, which recoverLocked has counted by then).
+func (t *archiveBodyTee) runAfterEndLocked() {
+	if !t.done || t.afterEnd == nil {
+		return
+	}
+	afterEnd := t.afterEnd
+	t.afterEnd = nil
+	afterEnd()
 }
 
 // recoverLocked is the deferred guard of every tee step: after a tap panic
@@ -634,8 +698,12 @@ func (t *archiveBodyTee) captureLocked(data []byte) {
 			size = min(size, t.contentLength)
 		}
 		if !t.rec.ReserveBody(size - have) {
-			t.dropLocked(t.rec.BodyDropReason())
-			return
+			// A doubled buffer may not fit where the exact size does.
+			if size == need || !t.rec.ReserveBody(need-have) {
+				t.dropLocked(t.rec.BodyDropReason())
+				return
+			}
+			size = need
 		}
 		t.reserved += size - have
 		grown := make([]byte, len(t.buf), size)

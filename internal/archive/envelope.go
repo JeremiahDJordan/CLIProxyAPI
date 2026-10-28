@@ -80,10 +80,12 @@ type BodyData struct {
 	ContentEncoding string
 }
 
+// reservation charges a body's buffer by its capacity, which is what the
+// event keeps in memory until it is written; slack never pays for metadata.
 func (e *Event) reservation() int64 {
 	n := int64(eventOverhead) + e.SizeHint
 	if e.Body != nil {
-		n += int64(len(e.Body.Bytes))
+		n += int64(cap(e.Body.Bytes))
 	}
 	return n
 }

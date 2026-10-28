@@ -73,7 +73,8 @@ attach to the `*archive.Ingress` carried in the request context
 
 - Configuration `archive: {enabled, spool_dir, segment_seconds, segment_max_mb, queue_mb,
   blob_threshold_mb, body_free_gb, hard_free_gb}` (v8 layout: `observability.archive`), read
-  once when the server is built. Disabled installs nothing and opens no file.
+  once per process, when the first server is built; that first configuration wins, also when
+  it is disabled. Disabled installs nothing and opens no file.
 - Start refuses (logged and counted as a gap in `/var/lib/cliproxyapi/archive-state`) unless
   the spool is on ZFS and holds `.fleet-archive-spool`, and the spool root and `blobs/` are
   both mode 2770 and owned by group `fleet-archive`; it also refuses while

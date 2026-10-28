@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -140,11 +141,29 @@ func segmentFiles(t *testing.T, spool string) []string {
 
 type event map[string]any
 
+// readEvents reads every segment. The writer may rename or remove a segment
+// between the listing and the read (closing it, or ending it after a
+// failure); the listing is then taken again.
 func readEvents(t *testing.T, spool string) []event {
 	t.Helper()
-	var out []event
+	for attempt := 0; ; attempt++ {
+		out, vanished := readEventsOnce(t, spool)
+		if !vanished {
+			return out
+		}
+		if attempt == 100 {
+			t.Fatal("segments kept vanishing while being read")
+		}
+	}
+}
+
+func readEventsOnce(t *testing.T, spool string) (out []event, vanished bool) {
+	t.Helper()
 	for _, path := range segmentFiles(t, spool) {
 		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, true
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +183,7 @@ func readEvents(t *testing.T, spool string) []event {
 			t.Fatal(err)
 		}
 	}
-	return out
+	return out, false
 }
 
 func ofType(events []event, typ string) []event {
@@ -1218,5 +1237,64 @@ func TestBlobReuseCompletesDurability(t *testing.T) {
 	bodies := ofType(readEvents(t, env.spool), TypeClientBody)
 	if len(bodies) != 1 || bodies[0]["body"].(map[string]any)["form"] != FormBlob {
 		t.Fatalf("client_body events = %v", bodies)
+	}
+}
+
+// A body buffer is charged by its capacity: slack in the buffer must not pay
+// for the event's metadata, which needs its own reservation.
+func TestBodyBufferSlackDoesNotFundMetadata(t *testing.T) {
+	env := setup(t, "", func(o *TestOverrides) { o.QueueBytes = 4096 })
+	rec := mustStart(t, env)
+	in := rec.BeginIngress(RouteInference, time.Now())
+	if !rec.ReserveBody(4096) {
+		t.Fatal("cannot reserve the buffer")
+	}
+	body := &BodyData{Bytes: make([]byte, 1, 4096)}
+	if in.EmitReserved(&Event{Type: TypeClientBody, Capture: CaptureFull, Body: body}, 4096) {
+		t.Fatal("a 1-byte body in a 4096-byte buffer filled a 4096-byte queue with no metadata reserved")
+	}
+	if used := rec.q.used.Load(); used != 0 {
+		t.Fatalf("the refused body left %d bytes reserved", used)
+	}
+	if got := rec.ledger.totals()[DropQueueFull]; got.Bodies != 1 || got.Bytes != 1 {
+		t.Fatalf("queue_full drops = %+v", got)
+	}
+	// With room for the metadata the same body is accepted, and the writer
+	// returns the whole reservation.
+	if !rec.ReserveBody(2048) {
+		t.Fatal("cannot reserve the smaller buffer")
+	}
+	small := &BodyData{Bytes: make([]byte, 1, 2048)}
+	if !in.EmitReserved(&Event{Type: TypeClientBody, Capture: CaptureFull, Body: small}, 2048) {
+		t.Fatal("a body with room for its metadata was refused")
+	}
+	flush(t)
+	if used := rec.q.used.Load(); used != 0 {
+		t.Fatalf("queue still holds %d bytes", used)
+	}
+}
+
+// Drops counted after Stop's final persist could never be persisted or
+// reported, so they are not counted at all.
+func TestDropsAfterStopAreNotCounted(t *testing.T) {
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+	in := rec.BeginIngress(RouteInference, time.Now())
+	stop(t)
+	before := rec.ledger.totals()
+	rec.CountDrop(DropStopped, DropCount{Events: 1})
+	in.Emit(&Event{Type: TypeClientBody, Body: &BodyData{Bytes: []byte("late")}})
+	if rec.ReserveBody(1) {
+		t.Fatal("a body reservation succeeded after Stop")
+	}
+	if after := rec.ledger.totals(); !maps.Equal(before, after) {
+		t.Fatalf("drops counted after Stop: %+v -> %+v", before, after)
+	}
+	st, err := readState(env.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Drops) != 0 {
+		t.Fatalf("persisted drops = %+v", st.Drops)
 	}
 }
