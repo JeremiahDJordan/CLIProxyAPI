@@ -209,4 +209,7 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// Archive configures the fleet request archive recorder (archive_fleet.go).
+	Archive ArchiveConfig `yaml:"archive,omitempty" json:"archive"`
 }

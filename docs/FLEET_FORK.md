@@ -62,6 +62,29 @@ multi-agent v2) and `cliproxyauth.IsCodexClientUserAgent` (SIWC credential choic
 Upstream v8.0.45 would instead rewrite it to its built-in `codex-tui` identity. Tests:
 `*t3*_fleet_test.go` and the T3 Code cases in the gate and cloak-mode tests.
 
+## 3. Request archive recorder, slice 1a (off by default)
+
+`internal/archive` and `internal/api/archive*_fleet.go` implement the first slice of the
+fleet request archive (fleet repository, `docs/PROXY-REQUEST-ARCHIVE-DESIGN.md`, revision 6,
+sections 1-7): the recorder core, the transport observer and the client body tee. Executor
+taps, attempts, usage, WebSocket turns, the v8 status route and the shipper come later; they
+attach to the `*archive.Ingress` carried in the request context
+(`archive.IngressFromContext`).
+
+- Configuration `archive: {enabled, spool_dir, segment_seconds, segment_max_mb, queue_mb,
+  blob_threshold_mb, body_free_gb, hard_free_gb}` (v8 layout: `observability.archive`), read
+  once when the server is built. Disabled installs nothing and opens no file.
+- Start refuses (logged and counted as a gap in `/var/lib/cliproxyapi/archive-state`) unless
+  the spool is on ZFS, holds `.fleet-archive-spool` and has `blobs/` at mode 2770 with the
+  spool's group, and while `codex.response-steering` is on.
+- The observer is the outermost gin middleware. Inference routes record redacted headers,
+  the typed-allowlisted query and the client body; credential and control routes record
+  metadata only. `archive_routes_fleet.go` classifies every registered route and
+  `TestArchiveRouteClassificationIsExhaustive` fails on a new unclassified route.
+
+Core hooks: two lines in `internal/api/server.go` (install in `NewServer`, stop in `Stop`),
+the `Archive` field in `internal/config/config.go` and its v8 path in `config_v8.go`.
+
 Run `go test ./internal/fleet/ ./internal/client/codex/models ./internal/runtime/executor`
 then `go test ./...`. On v8.0.45, upstream's own
 `TestDevinApplyPatchRejectionCarriesLogDiagnostic`, `TestModelsMultiAgentClientConfigAndReload`

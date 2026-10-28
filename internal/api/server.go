@@ -169,6 +169,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
 
+	s.installArchiveObserver(engine, cfg) // fleet: request archive (archive_fleet.go), outermost middleware
+
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
@@ -453,6 +455,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.codexLiveHandler != nil {
 		s.codexLiveHandler.Close()
 	}
+	s.stopArchiveRecorder(ctx) // fleet: request archive shutdown event (archive_fleet.go)
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
 	}
