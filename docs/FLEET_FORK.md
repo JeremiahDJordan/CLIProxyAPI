@@ -75,8 +75,9 @@ attach to the `*archive.Ingress` carried in the request context
   blob_threshold_mb, body_free_gb, hard_free_gb}` (v8 layout: `observability.archive`), read
   once when the server is built. Disabled installs nothing and opens no file.
 - Start refuses (logged and counted as a gap in `/var/lib/cliproxyapi/archive-state`) unless
-  the spool is on ZFS, holds `.fleet-archive-spool` and has `blobs/` at mode 2770 with the
-  spool's group, and while `codex.response-steering` is on.
+  the spool is on ZFS and holds `.fleet-archive-spool`, and the spool root and `blobs/` are
+  both mode 2770 and owned by group `fleet-archive`; it also refuses while
+  `codex.response-steering` is on.
 - The observer is the outermost gin middleware. Inference routes record redacted headers,
   the typed-allowlisted query and the client body; credential and control routes record
   metadata only. `archive_routes_fleet.go` classifies every registered route and

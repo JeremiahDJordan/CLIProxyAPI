@@ -79,6 +79,7 @@ func (in *Ingress) EmitReserved(ev *Event, reserved int64) bool {
 		return false
 	}
 	ev.IngressID = in.id
+	ev.ingress = in
 	if !in.rec.emit(ev, reserved) {
 		in.drops.Add(1)
 		return false

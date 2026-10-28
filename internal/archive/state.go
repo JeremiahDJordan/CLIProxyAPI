@@ -52,15 +52,14 @@ type stateFile struct {
 // dropLedger counts drops. Pending drops become a gap event once capture is
 // healthy again; until then they are persisted so they survive a restart.
 type dropLedger struct {
-	mu       sync.Mutex
-	dir      string
-	pending  map[string]DropCount
-	since    time.Time
-	priorID  string
-	carried  bool
-	total    map[string]DropCount
-	dirty    bool
-	disabled bool
+	mu      sync.Mutex
+	dir     string
+	pending map[string]DropCount
+	since   time.Time
+	priorID string
+	carried bool
+	total   map[string]DropCount
+	dirty   bool
 }
 
 func newDropLedger(dir string) *dropLedger {
@@ -137,11 +136,11 @@ func (l *dropLedger) load() error {
 // persist writes the pending drops when they changed since the last write.
 func (l *dropLedger) persist(bootID string) error {
 	l.mu.Lock()
-	if !l.dirty || l.disabled {
+	if !l.dirty {
 		l.mu.Unlock()
 		return nil
 	}
-	st := stateFile{V: 1, BootID: bootID, Updated: formatTime(time.Now()), Drops: maps.Clone(l.pending)}
+	st := stateFile{V: 1, BootID: bootID, Updated: FormatTime(time.Now()), Drops: maps.Clone(l.pending)}
 	if !l.since.IsZero() {
 		st.Since = l.since.UTC().Format(time.RFC3339Nano)
 	}
@@ -215,7 +214,7 @@ func recordRefusal(dir, reason string) error {
 		st.Since = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	st.V = 1
-	st.Updated = formatTime(time.Now())
+	st.Updated = FormatTime(time.Now())
 	st.Drops[reason] = st.Drops[reason].add(DropCount{Events: 1})
 	return writeState(dir, st)
 }

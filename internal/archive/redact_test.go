@@ -79,3 +79,109 @@ func TestQueryNames(t *testing.T) {
 		t.Fatalf("QueryNames = %v, want %v", got, want)
 	}
 }
+
+func TestRedactHeadersByNameAndURL(t *testing.T) {
+	h := http.Header{
+		"X-Custom-Token":                       {"fake-custom-token-0001"},
+		"X-Auth-Token":                         {"fake-auth-token-0002"},
+		"Api-Key":                              {"fake-api-key-0003"},
+		"X-Amz-Security-Token":                 {"fake-amz-token-0004"},
+		"X-Client-Secret":                      {"fake-client-secret-0005"},
+		"X-Upstream-Password":                  {"fake-password-0006"},
+		"X-Request-Signature":                  {"fake-signature-0007"},
+		"X-Session-Cookie":                     {"fake-session-cookie-0008"},
+		"Www-Authenticate":                     {"Bearer realm=fake-realm-0009"},
+		"Referer":                              {"https://app.example/oauth/cb?code=fake-code-0010&state=fake-state-0011"},
+		"Location":                             {"https://app.example/cb?code=fake-code-0012#access_token=fake-token-0013&state=fake-state-0014"},
+		"Content-Location":                     {"/v1/files?sig=fake-sig-0015"},
+		"Link":                                 {`<https://api.example/v1/models?page_token=fake-page-0016>; rel="next"`},
+		"X-Original-Url":                       {"/v1/messages?key=fake-key-0017"},
+		"Origin":                               {"https://app.example"},
+		"Session_id":                           {"019a-session"},
+		"X-Claude-Code-Session-Id":             {"claude-session"},
+		"X-Parent-Session-Id":                  {"parent-session"},
+		"X-Codex-Turn-Metadata":                {`{"turn_id":"t1"}`},
+		"Anthropic-Ratelimit-Tokens-Remaining": {"12345"},
+		"User-Agent":                           {"claude-cli/2.0"},
+	}
+	out := RedactHeaders(h)
+	for name, values := range out {
+		for _, value := range values {
+			if strings.Contains(value, "fake") {
+				t.Fatalf("%s kept a credential: %q", name, value)
+			}
+		}
+	}
+	want := map[string]string{
+		"Referer":          "https://app.example/oauth/cb?code=[redacted]&state=[redacted]",
+		"Location":         "https://app.example/cb?code=[redacted]#access_token=[redacted]&state=[redacted]",
+		"Content-Location": "/v1/files?sig=[redacted]",
+		"Link":             `<https://api.example/v1/models?page_token=[redacted]>; rel="next"`,
+		"X-Original-Url":   "/v1/messages?key=[redacted]",
+		"Origin":           "https://app.example",
+		"X-Custom-Token":   Redacted,
+		"Www-Authenticate": Redacted,
+
+		"Session_id":                           "019a-session",
+		"X-Claude-Code-Session-Id":             "claude-session",
+		"X-Parent-Session-Id":                  "parent-session",
+		"X-Codex-Turn-Metadata":                `{"turn_id":"t1"}`,
+		"Anthropic-Ratelimit-Tokens-Remaining": "12345",
+		"User-Agent":                           "claude-cli/2.0",
+	}
+	for name, value := range want {
+		if got := out[name]; !slices.Equal(got, []string{value}) {
+			t.Errorf("%s = %v, want %q", name, got, value)
+		}
+	}
+	urls := map[string]string{
+		"https://user:fake-pass-0018@app.example/x": "https://app.example/x",
+		"mailto:fake-0019@example.com":              Redacted,
+		"http://[::1":                               Redacted,
+		"null":                                      "null",
+	}
+	for value, want := range urls {
+		if got := RedactURL(value); got != want {
+			t.Errorf("RedactURL(%q) = %q, want %q", value, got, want)
+		}
+	}
+}
+
+func TestQueryValueRules(t *testing.T) {
+	models := map[string]bool{
+		"gpt-realtime":                         true,
+		"gpt-4o-realtime-preview-2024-12-17":   true,
+		"gemini-2.0-flash-live-001":            true,
+		"claude-sonnet-4-5@20250929":           true,
+		"models/gemini-2.5-flash":              true,
+		"sk-proj-fakefakefake":                 false,
+		"sk-ant-api03-fake":                    false,
+		"AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKE00": false,
+		"ya29.a0fakefake":                      false,
+		"0123456789abcdef0123456789abcdef":     false,
+		"gpt-" + strings.Repeat("a", 70):       false,
+		"GPT-4o":                               false,
+		"":                                     false,
+	}
+	for value, want := range models {
+		if got := ModelValue(value); got != want {
+			t.Errorf("ModelValue(%q) = %v, want %v", value, got, want)
+		}
+	}
+	versions := map[string]bool{
+		"0.50.0":                              true,
+		"1.2.3-beta.1":                        true,
+		"0.46.0-alpha.3+build.7":              true,
+		"v1.2":                                true,
+		"abc":                                 false,
+		"sk-fake":                             false,
+		"1.2.3-AbCdEfGhIjKlMnOp":              false,
+		"1;rm":                                false,
+		"1." + strings.Repeat("1.", 40) + "1": false,
+	}
+	for value, want := range versions {
+		if got := VersionValue(value); got != want {
+			t.Errorf("VersionValue(%q) = %v, want %v", value, got, want)
+		}
+	}
+}

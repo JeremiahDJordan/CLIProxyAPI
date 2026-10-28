@@ -65,18 +65,19 @@ type StartParams struct {
 
 // Start starts the recorder once per process. Later calls return the running
 // recorder (or nil) without reading the configuration again, so a reload
-// never turns capture on or off. It returns nil when capture is disabled or
-// refused; refusals are logged and counted as a gap.
+// never turns capture on or off, whichever configuration came first. It
+// returns nil when capture is disabled or refused; refusals are logged and
+// counted as a gap.
 func Start(p StartParams) *Recorder {
-	if !p.Config.Enabled {
-		return nil
-	}
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
 	if startAttempted {
 		return current.Load()
 	}
 	startAttempted = true
+	if !p.Config.Enabled {
+		return nil
+	}
 	rec, err := start(p)
 	if err != nil {
 		log.WithError(err).Warn("request archive: capture is off")
@@ -107,7 +108,6 @@ type Recorder struct {
 	q           *queue
 	w           *writer
 	ledger      *dropLedger
-	lock        *os.File
 
 	spaceMode atomic.Int32
 	writerOK  atomic.Bool
@@ -163,7 +163,6 @@ func start(p StartParams) (*Recorder, error) {
 		return nil, refuse(opts.StateDir, DropStartRefusedSpool, fmt.Errorf("create boot lock: %w", errLock))
 	}
 	heldLocks = append(heldLocks, lock)
-	rec.lock = lock
 
 	if errLoad := rec.ledger.load(); errLoad != nil {
 		log.WithError(errLoad).Warn("request archive: cannot read persisted drop counters")
@@ -199,8 +198,8 @@ func checkSpool(opts Options) (fsStat, error) {
 	if !sentinel.Mode().IsRegular() {
 		return info, fmt.Errorf("spool sentinel %s is not a regular file", SentinelName)
 	}
-	if err = checkBlobDir(opts.SpoolDir, filepath.Join(opts.SpoolDir, BlobDirName)); err != nil {
-		return info, fmt.Errorf("spool blobs: %w", err)
+	if err = checkSpoolDirs(opts.SpoolDir, filepath.Join(opts.SpoolDir, BlobDirName), opts.SpoolGroup); err != nil {
+		return info, fmt.Errorf("spool permissions: %w", err)
 	}
 	return info, nil
 }
@@ -249,12 +248,6 @@ func createBootLock(spool, bootID string) (*os.File, error) {
 	return f, nil
 }
 
-// BootID identifies this process's capture.
-func (r *Recorder) BootID() string { return r.bootID }
-
-// BlobThreshold is the body size above which bodies become blobs.
-func (r *Recorder) BlobThreshold() int64 { return r.opts.BlobThresholdBytes }
-
 // CaptureEvents reports whether new events would be accepted.
 func (r *Recorder) CaptureEvents() bool {
 	return r != nil && !r.stopping.Load() && r.writerOK.Load() && r.spaceMode.Load() != spaceStopped
@@ -265,9 +258,10 @@ func (r *Recorder) CaptureBodies() bool {
 	return r.CaptureEvents() && r.spaceMode.Load() == spaceOK
 }
 
-// ReserveBody claims queue bytes for body data read so far.
+// ReserveBody claims queue bytes for a body buffer. It fails while bodies
+// are not being captured, so a body in progress stops when space runs low.
 func (r *Recorder) ReserveBody(n int64) bool {
-	return r != nil && r.q.reserve(n)
+	return r != nil && r.CaptureBodies() && r.q.reserve(n)
 }
 
 // ReleaseBody returns bytes claimed by ReserveBody when the body is dropped.
@@ -317,7 +311,7 @@ func (r *Recorder) emit(ev *Event, reserved int64) bool {
 		r.ledger.add(reason, d)
 		return false
 	}
-	if !r.CaptureEvents() {
+	if !r.CaptureEvents() || (ev.Body != nil && !r.CaptureBodies()) {
 		return drop(r.BodyDropReason())
 	}
 	if extra := ev.reservation() - reserved; extra > 0 {
@@ -365,6 +359,9 @@ func (r *Recorder) stop(ctx context.Context) error {
 	})
 	select {
 	case <-r.done:
+		// Taps still finishing may have counted drops after the writer's
+		// last write of the state file.
+		r.w.persistLedger()
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

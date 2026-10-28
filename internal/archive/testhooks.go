@@ -18,6 +18,8 @@ type fsStat struct {
 type TestOverrides struct {
 	// StateDir replaces DefaultStateDir.
 	StateDir string
+	// SpoolGroup replaces DefaultSpoolGroup.
+	SpoolGroup string
 	// FreeBytes, when set, replaces statfs: the spool counts as ZFS (unless
 	// NotZFS) with this much free space.
 	FreeBytes func() uint64
@@ -80,6 +82,9 @@ func applyOverrides(opts Options) Options {
 	}
 	if o.StateDir != "" {
 		opts.StateDir = o.StateDir
+	}
+	if o.SpoolGroup != "" {
+		opts.SpoolGroup = o.SpoolGroup
 	}
 	if o.FsyncInterval > 0 {
 		opts.FsyncInterval = o.FsyncInterval

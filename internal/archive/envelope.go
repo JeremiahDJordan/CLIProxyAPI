@@ -64,6 +64,14 @@ type Event struct {
 	Data any
 	// SizeHint estimates Data's encoded size for the queue reservation.
 	SizeHint int64
+	// ReportDrops makes the writer record the ingress's drop count as
+	// capture_drops when it writes the event (ingress_end), so drops the
+	// writer counted for earlier events of the request are included.
+	ReportDrops bool
+
+	// ingress is set by Ingress.EmitReserved so writer-side drops count
+	// against the request.
+	ingress *Ingress
 }
 
 // BodyData is a captured body.
@@ -90,6 +98,7 @@ type envelope struct {
 	ConnectionID string        `json:"connection_id,omitempty"`
 	Body         *bodyEnvelope `json:"body,omitempty"`
 	Capture      string        `json:"capture,omitempty"`
+	CaptureDrops int64         `json:"capture_drops,omitempty"`
 }
 
 type bodyEnvelope struct {
@@ -100,8 +109,8 @@ type bodyEnvelope struct {
 	Value           *string `json:"value,omitempty"`
 }
 
-// formatTime renders RFC 3339 UTC with microseconds.
-func formatTime(t time.Time) string {
+// FormatTime renders RFC 3339 UTC with microseconds, the spool time format.
+func FormatTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02T15:04:05.000000Z")
 }
 

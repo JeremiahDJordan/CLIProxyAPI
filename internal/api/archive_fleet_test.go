@@ -16,11 +16,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +38,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// archiveTestSpool provisions a spool: root and blobs/ 2770, owned by the
+// process's effective group, which archiveTestOverrides names.
 func archiveTestSpool(tb testing.TB) string {
 	tb.Helper()
 	spool := tb.TempDir()
@@ -45,16 +50,26 @@ func archiveTestSpool(tb testing.TB) string {
 	if err := os.Mkdir(blobs, 0o770); err != nil {
 		tb.Fatal(err)
 	}
-	if err := os.Chmod(blobs, os.ModeSetgid|0o770); err != nil {
-		tb.Fatal(err)
+	for _, dir := range []string{spool, blobs} {
+		if err := os.Chown(dir, -1, os.Getegid()); err != nil {
+			tb.Fatal(err)
+		}
+		if err := os.Chmod(dir, os.ModeSetgid|0o770); err != nil {
+			tb.Fatal(err)
+		}
 	}
 	return spool
 }
 
 func archiveTestOverrides(tb testing.TB, mutate func(*archive.TestOverrides)) {
 	tb.Helper()
+	group, err := user.LookupGroupId(strconv.Itoa(os.Getegid()))
+	if err != nil {
+		tb.Skipf("cannot name the effective group: %v", err)
+	}
 	o := archive.TestOverrides{
 		StateDir:           filepath.Join(tb.TempDir(), "archive-state"),
+		SpoolGroup:         group.Name,
 		FreeBytes:          func() uint64 { return 1 << 50 },
 		FsyncInterval:      20 * time.Millisecond,
 		HeartbeatInterval:  time.Hour,
@@ -179,6 +194,49 @@ func spoolBody(tb testing.TB, spool string, ev spoolEvent) []byte {
 	return data
 }
 
+// archiveStopQueueBytes stops the recorder and returns the queue bytes its
+// shutdown event reports: anything above zero is a stranded reservation.
+func archiveStopQueueBytes(tb testing.TB, spool string) float64 {
+	tb.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := archive.Stop(ctx); err != nil {
+		tb.Fatal(err)
+	}
+	for _, ev := range spoolEvents(tb, spool) {
+		if ev["type"] == archive.TypeShutdown {
+			return ev["queue_bytes"].(float64)
+		}
+	}
+	tb.Fatal("no shutdown event")
+	return 0
+}
+
+// archiveTee returns the body tee of the request c is handling.
+func archiveTee(tb testing.TB, c *gin.Context) *archiveBodyTee {
+	tb.Helper()
+	cw := findCloseWriter(c.Writer)
+	if cw == nil {
+		tb.Fatal("no body tracker")
+	}
+	tee, ok := cw.tracker.ReadCloser.(*archiveBodyTee)
+	if !ok {
+		tb.Fatal("no body tee")
+	}
+	return tee
+}
+
+func waitUntil(tb testing.TB, what string, cond func() bool) {
+	tb.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			tb.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func handlerName(h gin.HandlerFunc) string {
 	return runtime.FuncForPC(reflect.ValueOf(h).Pointer()).Name()
 }
@@ -269,6 +327,7 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 	classifyForTest(t, http.MethodGet, "/archive-test/cookie")
 	server.engine.GET("/archive-test/cookie", func(c *gin.Context) {
 		c.Header("Set-Cookie", "sid=fake-set-cookie-0014; Path=/")
+		c.Header("Location", "https://app.example/cb?code=fake-location-code-0019#access_token=fake-fragment-token-0020")
 		c.String(http.StatusOK, "ok")
 	})
 	secrets := []string{
@@ -276,6 +335,8 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		"fake-cookie-0005", "sk-fake-wsproto-0006", "AIzaFAKEquerykey0007", "fake-value-0008",
 		"fake-code-0009", "fake-state-0010", "fake-password-0011", "fake-oauth-code-0012",
 		"fake-oauth-state-0013", "fake-set-cookie-0014", "fake-management-key-0015",
+		"fake-referer-code-0016", "fake-referer-state-0017", "fake-custom-token-0018",
+		"fake-location-code-0019", "fake-fragment-token-0020",
 	}
 	credentialHeaders := http.Header{
 		"Authorization":          {"Bearer sk-fake-bearer-0001"},
@@ -285,6 +346,9 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		"Cookie":                 {"session=fake-cookie-0005"},
 		"Sec-Websocket-Protocol": {"realtime, openai-insecure-api-key.sk-fake-wsproto-0006"},
 		"X-Management-Key":       {"fake-management-key-0015"},
+		"Referer":                {"https://app.example/oauth/cb?code=fake-referer-code-0016&state=fake-referer-state-0017"},
+		"X-Custom-Token":         {"fake-custom-token-0018"},
+		"Session_id":             {"019a0000-session"},
 	}
 	requests := []struct{ method, target string }{
 		{http.MethodPost, "/v1/messages?beta=true&key=AIzaFAKEquerykey0007"},
@@ -338,6 +402,12 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 	headers := start[0]["headers"].(map[string]any)
 	if got := headers["Authorization"].([]any)[0]; got != archive.Redacted {
 		t.Fatalf("Authorization = %v", got)
+	}
+	if got := headers["Referer"].([]any)[0]; got != "https://app.example/oauth/cb?code=[redacted]&state=[redacted]" {
+		t.Fatalf("Referer = %v", got)
+	}
+	if got := headers["Session_id"].([]any)[0]; got != "019a0000-session" {
+		t.Fatalf("Session_id = %v; session IDs are kept for joins", got)
 	}
 	gemini := eventsFor(events, archive.TypeIngressStart, "/v1beta/models/gemini-pro:streamGenerateContent")
 	if len(gemini) != 1 || gemini[0]["query"] != "alt=sse&key=[redacted]" {
@@ -439,11 +509,11 @@ func TestArchiveClientBodyRoundTrip(t *testing.T) {
 }
 
 func TestArchiveLargeBodyBecomesBlob(t *testing.T) {
-	server, spool := newArchiveServer(t, nil)
+	const threshold = 64 << 10
+	server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.BlobThresholdBytes = threshold }, nil)
 	classifyForTest(t, http.MethodPost, "/archive-test/echo")
 	server.engine.POST("/archive-test/echo", echoBody)
-	threshold := archive.Current().BlobThreshold()
-	payload := bytes.Repeat([]byte("0123456789abcdef"), int(threshold/16)+1)
+	payload := bytes.Repeat([]byte("0123456789abcdef"), threshold/16+1)
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/archive-test/echo", bytes.NewReader(payload)))
 	if rec.Code != http.StatusOK {
@@ -532,19 +602,30 @@ func TestArchiveTeeUnderMaxBytesReader(t *testing.T) {
 
 type archiveTestPanic struct{ id int }
 
+//go:noinline
+func archiveTestPanicSite(value *archiveTestPanic) { panic(value) }
+
 func TestArchiveObserverRepanicsWithTheSameValue(t *testing.T) {
 	server, spool := newArchiveServer(t, nil)
 	engine := gin.New()
 	engine.Use(server.archiveObserverMiddleware())
 	value := &archiveTestPanic{id: 7}
-	engine.GET("/archive-test/panic", func(*gin.Context) { panic(value) })
+	engine.GET("/archive-test/panic", func(*gin.Context) { archiveTestPanicSite(value) })
+	var logged bytes.Buffer
+	out := log.StandardLogger().Out
+	log.SetOutput(&logged)
 	recovered := func() (rv any) {
 		defer func() { rv = recover() }()
 		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/archive-test/panic", nil))
 		return nil
 	}()
+	log.SetOutput(out)
 	if recovered != value {
 		t.Fatalf("observer re-panicked with %v, want the original value", recovered)
+	}
+	// The re-panic's trace starts in the observer; the log keeps the original.
+	if !strings.Contains(logged.String(), "archiveTestPanicSite") {
+		t.Fatalf("the original panic stack was not logged:\n%s", logged.String())
 	}
 	got := eventsFor(spoolEvents(t, spool), archive.TypeMetadataOnly, "/archive-test/panic")
 	if len(got) != 1 || got[0]["abort"] != "panic" || got[0]["panic_type"] != "*api.archiveTestPanic" {
@@ -697,6 +778,13 @@ func TestArchiveTapPanicDoesNotAffectRequest(t *testing.T) {
 		c.Writer.Flush()
 		echoBody(c)
 	})
+	// Reads part of the body, so the tee ends with the request, not at EOF.
+	classifyForTest(t, http.MethodPost, "/archive-test/partial")
+	server.engine.POST("/archive-test/partial", func(c *gin.Context) {
+		head := make([]byte, 4)
+		_, _ = io.ReadFull(c.Request.Body, head)
+		c.Data(http.StatusOK, "application/octet-stream", head)
+	})
 	stages := []string{"observer.start", "observer.finish", "writer.commit", "writer.write", "body.read", "body.emit"}
 	for _, stage := range stages {
 		t.Run(stage, func(t *testing.T) {
@@ -712,18 +800,222 @@ func TestArchiveTapPanicDoesNotAffectRequest(t *testing.T) {
 			if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload) {
 				t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
 			}
+			rec = httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/archive-test/partial", bytes.NewReader(payload)))
+			if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), payload[:4]) {
+				t.Fatalf("partial: status %d body %q", rec.Code, rec.Body.String())
+			}
 		})
 	}
+	reported := false
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	for !reported && time.Now().Before(deadline) {
 		for _, ev := range spoolEvents(t, spool) {
 			if drops, ok := ev["drops"].(map[string]any); ok && ev["type"] == archive.TypeGap && drops[archive.DropTapPanic] != nil {
-				return
+				reported = true
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("tap panics were not reported as a gap")
+	if !reported {
+		t.Fatal("tap panics were not reported as a gap")
+	}
+	if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+		t.Fatalf("tap panics stranded %v reserved queue bytes", queued)
+	}
+}
+
+func TestArchiveBodyTeeReservesItsBuffer(t *testing.T) {
+	server, spool := newArchiveServer(t, nil)
+	classifyForTest(t, http.MethodPost, "/archive-test/peek")
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 1<<16) // 1 MiB, declared
+	type state struct{ cap, reserved int64 }
+	var afterHead, beforeEOF state
+	server.engine.POST("/archive-test/peek", func(c *gin.Context) {
+		tee := archiveTee(t, c)
+		snapshot := func() state {
+			tee.mu.Lock()
+			defer tee.mu.Unlock()
+			return state{int64(cap(tee.buf)), tee.reserved}
+		}
+		head := make([]byte, 1024)
+		_, _ = io.ReadFull(c.Request.Body, head)
+		afterHead = snapshot()
+		rest := make([]byte, len(payload)-len(head))
+		_, _ = io.ReadFull(c.Request.Body, rest)
+		beforeEOF = snapshot()
+		_, _ = io.ReadAll(c.Request.Body)
+		c.Status(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/archive-test/peek", bytes.NewReader(payload)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	// The buffer grows with what was read, and is always reserved.
+	if afterHead.cap > afterHead.reserved || afterHead.reserved >= int64(len(payload)) {
+		t.Fatalf("after 1 KiB: buffer %d bytes, reserved %d", afterHead.cap, afterHead.reserved)
+	}
+	if beforeEOF.cap != int64(len(payload)) || beforeEOF.reserved != beforeEOF.cap {
+		t.Fatalf("whole body: buffer %d bytes, reserved %d, want %d", beforeEOF.cap, beforeEOF.reserved, len(payload))
+	}
+	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/peek")
+	if len(bodies) != 1 || !bytes.Equal(spoolBody(t, spool, bodies[0]), payload) {
+		t.Fatalf("client_body = %v", bodies)
+	}
+	if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+		t.Fatalf("%v queue bytes still reserved", queued)
+	}
+}
+
+func TestArchiveMetadataReservationCountsQueryNames(t *testing.T) {
+	server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.QueueBytes = 64 << 10 }, nil)
+	names := make([]string, 0, 50000)
+	for i := 0; i < cap(names); i++ {
+		names = append(names, "name"+strconv.Itoa(i)+"=x")
+	}
+	big := "/archive-test/unrouted?" + strings.Join(names, "&") // about 750 KB of names
+	small := "/archive-test/unrouted-small?a=1"
+	for _, target := range []string{big, small} {
+		server.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, target, nil))
+	}
+	events := spoolEvents(t, spool)
+	if got := eventsFor(events, archive.TypeMetadataOnly, "/archive-test/unrouted"); len(got) != 0 {
+		t.Fatal("a metadata_only event larger than the queue was accepted")
+	}
+	if got := eventsFor(events, archive.TypeMetadataOnly, "/archive-test/unrouted-small"); len(got) != 1 {
+		t.Fatalf("small metadata_only events = %v", got)
+	}
+	waitUntil(t, "a queue_full gap", func() bool {
+		for _, ev := range spoolEvents(t, spool) {
+			if drops, ok := ev["drops"].(map[string]any); ok && ev["type"] == archive.TypeGap && drops[archive.DropQueueFull] != nil {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestArchiveBodyReadInFlightAtRequestEnd(t *testing.T) {
+	server, spool := newArchiveServer(t, nil)
+	classifyForTest(t, http.MethodPost, "/archive-test/background")
+	readDone := make(chan []byte, 1)
+	server.engine.POST("/archive-test/background", func(c *gin.Context) {
+		tee := archiveTee(t, c)
+		body := c.Request.Body
+		go func() {
+			data := make([]byte, 64)
+			n, _ := body.Read(data)
+			readDone <- data[:n]
+		}()
+		// Return while that read waits for the client.
+		waitUntil(t, "the read to start", func() bool {
+			tee.mu.Lock()
+			defer tee.mu.Unlock()
+			return tee.reading > 0
+		})
+		c.Status(http.StatusAccepted)
+	})
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPost, "/archive-test/background", pr)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d", rec.Code)
+	}
+	_, _ = pw.Write([]byte("late body"))
+	if got := <-readDone; string(got) != "late body" {
+		t.Fatalf("the read returned %q", got)
+	}
+	_ = pw.Close()
+	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/background")
+	if len(bodies) != 1 || bodies[0]["capture"] != archive.CaptureFull || bodies[0]["wire_bytes"] != float64(9) || bodies[0]["ended"] != "request_end" {
+		t.Fatalf("client_body = %v; the read in flight at request end was lost", bodies)
+	}
+	if got := spoolBody(t, spool, bodies[0]); string(got) != "late body" {
+		t.Fatalf("captured %q", got)
+	}
+}
+
+type archiveFailingReader struct{}
+
+func (archiveFailingReader) Read([]byte) (int, error) { return 0, errors.New("fake read failure") }
+
+func TestArchiveBodyReadErrorIsNotUnread(t *testing.T) {
+	server, spool := newArchiveServer(t, nil)
+	classifyForTest(t, http.MethodPost, "/archive-test/echo")
+	server.engine.POST("/archive-test/echo", echoBody)
+	req := httptest.NewRequest(http.MethodPost, "/archive-test/echo", archiveFailingReader{})
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d", rec.Code)
+	}
+	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/echo")
+	if len(bodies) != 1 || bodies[0]["capture"] == archive.CaptureBodyUnread || bodies[0]["read_error"] != "fake read failure" {
+		t.Fatalf("client_body = %v", bodies)
+	}
+}
+
+func TestArchiveBodyStopsWhenSpaceRunsLow(t *testing.T) {
+	var free atomic.Uint64
+	free.Store(1 << 50)
+	server, spool := newArchiveServerWithOverrides(t,
+		func(o *archive.TestOverrides) {
+			o.FreeBytes = free.Load
+			o.SpaceCheckInterval = 5 * time.Millisecond
+		},
+		func(cfg *proxyconfig.Config) {
+			cfg.Archive.BodyFreeGB = 2
+			cfg.Archive.HardFreeGB = 1
+		})
+	classifyForTest(t, http.MethodPost, "/archive-test/space")
+	server.engine.POST("/archive-test/space", func(c *gin.Context) {
+		head := make([]byte, 5)
+		_, _ = io.ReadFull(c.Request.Body, head)
+		free.Store(3 << 29) // 1.5 GiB: below body_free_gb
+		waitUntil(t, "bodies to stop", func() bool { return !archive.Current().CaptureBodies() })
+		if c.Query("rest") == "1" {
+			_, _ = io.ReadAll(c.Request.Body)
+		}
+		c.Status(http.StatusOK)
+	})
+	for _, tc := range []struct {
+		target string
+		body   []byte
+	}{
+		// Ends with the request, after the last reservation.
+		{"/archive-test/space?case=ended", []byte("0123456789")},
+		// Keeps reading, past its first buffer.
+		{"/archive-test/space?rest=1", bytes.Repeat([]byte("x"), 64<<10)},
+	} {
+		free.Store(1 << 50)
+		waitUntil(t, "bodies to resume", archive.Current().CaptureBodies)
+		req := httptest.NewRequest(http.MethodPost, tc.target, bytes.NewReader(tc.body))
+		req.ContentLength = -1
+		req.TransferEncoding = []string{"chunked"}
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status %d", tc.target, rec.Code)
+		}
+	}
+	bodies := eventsFor(spoolEvents(t, spool), archive.TypeClientBody, "/archive-test/space")
+	if len(bodies) != 2 {
+		t.Fatalf("client_body events = %v", bodies)
+	}
+	for _, ev := range bodies {
+		if ev["capture"] != archive.CaptureDroppedBody || ev["drop_reason"] != archive.DropLowSpaceBody || ev["body"] != nil {
+			t.Fatalf("client_body = %v, want dropped_body for low space", ev)
+		}
+	}
+	if queued := archiveStopQueueBytes(t, spool); queued != 0 {
+		t.Fatalf("%v queue bytes still reserved", queued)
+	}
 }
 
 func TestArchiveRouteClassificationIsExhaustive(t *testing.T) {

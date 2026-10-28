@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -104,6 +105,11 @@ func (s *Server) archiveObserverMiddleware() gin.HandlerFunc {
 			recovered := recover()
 			obs.finish(c, recovered, true)
 			if recovered != nil {
+				if !isArchiveAbortHandler(recovered) {
+					// The re-panic's own trace starts here; keep the original.
+					log.WithField("panic", fmt.Sprintf("%T: %v", recovered, recovered)).
+						Errorf("request archive: recorded a handler panic; re-panicking\n%s", debug.Stack())
+				}
 				panic(recovered)
 			}
 		}()
@@ -124,6 +130,11 @@ type archiveObservation struct {
 	resp     *archiveResponseState
 	writer   *archiveResponseWriter
 	tee      *archiveBodyTee
+}
+
+func isArchiveAbortHandler(recovered any) bool {
+	err, ok := recovered.(error)
+	return ok && errors.Is(err, http.ErrAbortHandler)
 }
 
 func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context) (obs *archiveObservation) {
@@ -154,6 +165,10 @@ func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context) 
 		upgrade:  strings.EqualFold(strings.TrimSpace(req.Header.Get("Upgrade")), "websocket"),
 		resp:     &archiveResponseState{inference: inference},
 	}
+	o.writer = &archiveResponseWriter{ResponseWriter: c.Writer, state: o.resp}
+	c.Writer = o.writer
+	// From here on finish must run, even if the rest of this tap panics.
+	obs = o
 	var startEvent *archive.Event
 	if inference {
 		data := archiveIngressStartData{
@@ -172,10 +187,6 @@ func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context) 
 		startEvent = &archive.Event{Type: archive.TypeIngressStart, Time: start, Capture: archive.CaptureFull, Data: data, SizeHint: data.sizeHint()}
 		o.tee = s.installArchiveBodyTee(req, in)
 	}
-	o.writer = &archiveResponseWriter{ResponseWriter: c.Writer, state: o.resp}
-	c.Writer = o.writer
-	// From here on finish must run, even if the rest of this tap panics.
-	obs = o
 	c.Request = req.WithContext(archive.WithIngress(req.Context(), in))
 	c.Set(archiveIngressContextKey, in)
 	if startEvent != nil {
@@ -188,10 +199,15 @@ func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context) 
 // observer's deferred function, also while a panic or Goexit unwinds.
 func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool) {
 	defer recoverArchiveTap("observer.finish")
+	if o.tee != nil {
+		// Also when the rest of finish panics, so the tee never strands its
+		// reservation. Ending the tee twice is harmless.
+		defer o.tee.end("request_end")
+	}
 	archiveFault("observer.finish")
 	end := time.Now()
 	if o.tee != nil {
-		o.tee.finish("request_end")
+		o.tee.end("request_end")
 	}
 	summary := archiveResponseSummary{DurationUS: end.Sub(o.in.Started()).Microseconds()}
 	switch {
@@ -200,7 +216,7 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 	case aborted:
 		summary.PanicType = fmt.Sprintf("%T", recovered)
 		summary.Abort = "panic"
-		if err, ok := recovered.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+		if isArchiveAbortHandler(recovered) {
 			summary.Abort = "abort_handler"
 		}
 	}
@@ -213,7 +229,7 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 	headers := snap.headers
 	summary.BytesWritten = o.resp.bytes.Load()
 	if first := o.resp.firstByte.Load(); first != 0 {
-		summary.FirstByteAt = archiveTime(time.Unix(0, first))
+		summary.FirstByteAt = archive.FormatTime(time.Unix(0, first))
 	}
 	if o.resp.hijacked.Load() {
 		summary.Hijacked = true
@@ -225,13 +241,13 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 	summary.AuthDecision, summary.AuthProvider = archiveAuthDecision(c, summary.Status)
 
 	if o.class == archive.RouteInference {
-		summary.CaptureDrops = o.in.Drops()
 		data := archiveIngressEndData{archiveResponseSummary: summary, Headers: headers}
-		o.in.Emit(&archive.Event{Type: archive.TypeIngressEnd, Time: end, Capture: archive.CaptureFull, Data: data, SizeHint: archiveHeaderSize(headers)})
+		// The writer fills in capture_drops when it writes the event.
+		o.in.Emit(&archive.Event{Type: archive.TypeIngressEnd, Time: end, Capture: archive.CaptureFull, Data: data, SizeHint: data.sizeHint(), ReportDrops: true})
 		return
 	}
 	data := archiveMetadataOnlyData{
-		StartedAt:              archiveTime(o.in.Started()),
+		StartedAt:              archive.FormatTime(o.in.Started()),
 		Method:                 o.method,
 		Path:                   o.path,
 		Route:                  o.route,
@@ -240,11 +256,7 @@ func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool)
 		ClientIP:               o.clientIP,
 		archiveResponseSummary: summary,
 	}
-	o.in.Emit(&archive.Event{Type: archive.TypeMetadataOnly, Time: end, Capture: archive.CaptureMetadataOnly, Data: data, SizeHint: int64(len(o.path))})
-}
-
-func archiveTime(t time.Time) string {
-	return t.UTC().Format("2006-01-02T15:04:05.000000Z")
+	o.in.Emit(&archive.Event{Type: archive.TypeMetadataOnly, Time: end, Capture: archive.CaptureMetadataOnly, Data: data, SizeHint: data.sizeHint()})
 }
 
 // archiveAuthDecision reports what the access middleware decided. Fleet gate
@@ -274,17 +286,43 @@ type archiveIngressStartData struct {
 	Headers          map[string][]string `json:"headers,omitempty"`
 }
 
+// The sizeHint methods count every variable-size field, so an event's queue
+// reservation covers what it holds; fixed fields fit in the event overhead.
 func (d archiveIngressStartData) sizeHint() int64 {
-	return int64(len(d.Path)+len(d.Query)+len(d.Host)) + archiveHeaderSize(d.Headers)
+	return archiveStringsSize(d.Method, d.Path, d.Route, d.RouteClass, d.Query, d.ClientIP, d.Proto, d.Host) +
+		archiveStringsSize(d.TransferEncoding...) + archiveHeaderSize(d.Headers)
+}
+
+func (d archiveIngressEndData) sizeHint() int64 {
+	return d.archiveResponseSummary.sizeHint() + archiveHeaderSize(d.Headers)
+}
+
+func (d archiveMetadataOnlyData) sizeHint() int64 {
+	return archiveStringsSize(d.StartedAt, d.Method, d.Path, d.Route, d.RouteClass, d.ClientIP) +
+		archiveStringsSize(d.QueryNames...) + d.archiveResponseSummary.sizeHint()
+}
+
+func (s archiveResponseSummary) sizeHint() int64 {
+	return archiveStringsSize(s.ContentEncoding, s.FirstByteAt, s.Abort, s.PanicType, s.AuthDecision, s.AuthProvider)
+}
+
+func (d archiveClientBodyData) sizeHint() int64 {
+	return archiveStringsSize(d.Ended, d.ContentEncoding, d.DropReason, d.ReadError)
+}
+
+// archiveStringsSize is the length of values plus quotes and a separator each.
+func archiveStringsSize(values ...string) int64 {
+	var n int64
+	for _, value := range values {
+		n += int64(len(value)) + 4
+	}
+	return n
 }
 
 func archiveHeaderSize(h map[string][]string) int64 {
 	var n int64
 	for name, values := range h {
-		n += int64(len(name)) + 8
-		for _, value := range values {
-			n += int64(len(value)) + 4
-		}
+		n += int64(len(name)) + 8 + archiveStringsSize(values...)
 	}
 	return n
 }
@@ -302,7 +340,6 @@ type archiveResponseSummary struct {
 	PanicType       string `json:"panic_type,omitempty"`
 	AuthDecision    string `json:"auth_decision"`
 	AuthProvider    string `json:"auth_provider,omitempty"`
-	CaptureDrops    int64  `json:"capture_drops,omitempty"`
 }
 
 type archiveIngressEndData struct {
@@ -462,9 +499,14 @@ func (s *Server) installArchiveBodyTee(req *http.Request, in *archive.Ingress) *
 	return tee
 }
 
-// archiveBodyTee copies the wire bytes the handler consumes. It reserves
-// queue bytes as it reads and emits client_body once, at EOF, Close or the
-// end of the request, whichever comes first; later reads pass through.
+// archiveBodyMinBuffer is the first buffer for a body of unknown length.
+const archiveBodyMinBuffer = 4 << 10
+
+// archiveBodyTee copies the wire bytes the handler consumes. Its queue
+// reservation always covers its buffer's capacity. It emits client_body
+// once, at EOF or Close, or at the end of the request when no read is in
+// progress; a read in progress then emits it when it returns. Later reads
+// pass through.
 type archiveBodyTee struct {
 	inner         io.ReadCloser
 	in            *archive.Ingress
@@ -480,25 +522,38 @@ type archiveBodyTee struct {
 	capturing  bool
 	dropReason string
 	sawEOF     bool
+	readErr    string
+	reading    int
+	endPending string
 	done       bool
+	handedOff  bool
 }
 
-func (t *archiveBodyTee) Read(p []byte) (int, error) {
-	n, errRead := t.inner.Read(p)
-	t.observe(p, n, errRead)
-	return n, errRead
+func (t *archiveBodyTee) Read(p []byte) (n int, errRead error) {
+	t.beginRead()
+	defer func() {
+		t.observe(p, n, errRead)
+		t.endRead()
+	}()
+	return t.inner.Read(p)
 }
 
 func (t *archiveBodyTee) Close() error {
 	errClose := t.inner.Close()
-	t.finish("close")
+	t.end("close")
 	return errClose
 }
 
+func (t *archiveBodyTee) beginRead() {
+	t.mu.Lock()
+	t.reading++
+	t.mu.Unlock()
+}
+
 func (t *archiveBodyTee) observe(p []byte, n int, errRead error) {
-	defer recoverArchiveTap("body.read")
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	defer t.recoverLocked("body.read")
 	if t.done {
 		return
 	}
@@ -506,34 +561,98 @@ func (t *archiveBodyTee) observe(p []byte, n int, errRead error) {
 	if n > 0 {
 		t.consumed += int64(n)
 		if t.capturing {
-			if t.rec.ReserveBody(int64(n)) {
-				if t.buf == nil && t.contentLength > 0 && t.contentLength <= t.rec.BlobThreshold() {
-					t.buf = make([]byte, 0, t.contentLength+1)
-				}
-				t.buf = append(t.buf, p[:n]...)
-				t.reserved += int64(n)
-			} else {
-				t.dropLocked(archive.DropQueueFull)
-			}
+			t.captureLocked(p[:n])
 		}
 	}
-	if errors.Is(errRead, io.EOF) {
+	switch {
+	case errors.Is(errRead, io.EOF):
 		t.sawEOF = true
 		t.emitLocked("eof")
+	case errRead != nil && t.readErr == "":
+		t.readErr = errRead.Error()
+		if len(t.readErr) > 256 {
+			t.readErr = t.readErr[:256]
+		}
 	}
 }
 
-func (t *archiveBodyTee) finish(ended string) {
-	defer recoverArchiveTap("body.finish")
+// endRead finishes a read; the last read in progress emits the event when
+// the request ended during it.
+func (t *archiveBodyTee) endRead() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	defer t.recoverLocked("body.read")
+	t.reading--
+	if t.reading == 0 && t.endPending != "" {
+		t.emitLocked(t.endPending)
+	}
+}
+
+// end emits the event now, or leaves it to the read in progress. It never
+// waits and is idempotent.
+func (t *archiveBodyTee) end(ended string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	defer t.recoverLocked("body.finish")
+	if t.done {
+		return
+	}
+	if t.reading > 0 {
+		if t.endPending == "" {
+			t.endPending = ended
+		}
+		return
+	}
 	t.emitLocked(ended)
 }
 
-func (t *archiveBodyTee) dropLocked(reason string) {
+// recoverLocked is the deferred guard of every tee step: after a tap panic
+// it returns the reservation and stops capturing, so nothing is stranded.
+func (t *archiveBodyTee) recoverLocked(where string) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	archive.NoteTapPanic(where, recovered)
+	if t.capturing {
+		// Returns the reservation; only a capturing tee holds one.
+		t.dropLocked(archive.DropTapPanic)
+	}
+	if t.done && !t.handedOff {
+		// The panic came while emitting: the event is lost.
+		t.handedOff = true
+		t.in.NoteDrop()
+	}
+}
+
+// captureLocked appends data, first reserving any growth of the buffer.
+func (t *archiveBodyTee) captureLocked(data []byte) {
+	need := int64(len(t.buf)) + int64(len(data))
+	if have := int64(cap(t.buf)); need > have {
+		size := max(need, 2*have, archiveBodyMinBuffer)
+		if t.contentLength >= need {
+			size = min(size, t.contentLength)
+		}
+		if !t.rec.ReserveBody(size - have) {
+			t.dropLocked(t.rec.BodyDropReason())
+			return
+		}
+		t.reserved += size - have
+		grown := make([]byte, len(t.buf), size)
+		copy(grown, t.buf)
+		t.buf = grown
+	}
+	t.buf = append(t.buf, data...)
+}
+
+func (t *archiveBodyTee) releaseLocked() {
 	t.rec.ReleaseBody(t.reserved)
 	t.reserved = 0
 	t.buf = nil
+}
+
+func (t *archiveBodyTee) dropLocked(reason string) {
+	t.releaseLocked()
 	t.capturing = false
 	t.dropReason = reason
 }
@@ -547,6 +666,7 @@ type archiveClientBodyData struct {
 	ContentLength   int64  `json:"content_length"`
 	ContentEncoding string `json:"content_encoding,omitempty"`
 	DropReason      string `json:"drop_reason,omitempty"`
+	ReadError       string `json:"read_error,omitempty"`
 }
 
 func (t *archiveBodyTee) emitLocked(ended string) {
@@ -562,29 +682,36 @@ func (t *archiveBodyTee) emitLocked(ended string) {
 		Ended:           ended,
 		ContentLength:   t.contentLength,
 		ContentEncoding: t.encoding,
+		ReadError:       t.readErr,
 	}
 	// MaxBytesReader reads one byte past its limit before failing.
 	if t.limit > 0 && t.consumed > t.limit {
 		data.DeliveredBytes = t.limit
 		data.Truncated = true
 	}
-	if t.consumed == 0 && !t.sawEOF {
+	if t.consumed == 0 && !t.sawEOF && t.readErr == "" {
 		// Never read by the handler, so not read by the recorder either.
-		t.rec.ReleaseBody(t.reserved)
-		t.reserved = 0
-		t.in.Emit(&archive.Event{Type: archive.TypeClientBody, Capture: archive.CaptureBodyUnread, Data: data})
+		t.releaseLocked()
+		t.handedOff = true
+		t.in.Emit(&archive.Event{Type: archive.TypeClientBody, Capture: archive.CaptureBodyUnread, Data: data, SizeHint: data.sizeHint()})
 		return
+	}
+	if t.capturing && !t.rec.CaptureBodies() {
+		// Space ran low (or capture stopped) after the last read.
+		t.dropLocked(t.rec.BodyDropReason())
 	}
 	if !t.capturing {
 		data.DropReason = t.dropReason
+		t.handedOff = true
 		t.in.NoteDrop()
 		t.rec.CountDrop(t.dropReason, archive.DropCount{Bodies: 1, Bytes: t.consumed})
-		t.in.Emit(&archive.Event{Type: archive.TypeClientBody, Capture: archive.CaptureDroppedBody, Data: data})
+		t.in.Emit(&archive.Event{Type: archive.TypeClientBody, Capture: archive.CaptureDroppedBody, Data: data, SizeHint: data.sizeHint()})
 		return
 	}
 	body := &archive.BodyData{Bytes: t.buf, ContentEncoding: t.encoding}
 	reserved := t.reserved
 	t.buf = nil
 	t.reserved = 0
-	t.in.EmitReserved(&archive.Event{Type: archive.TypeClientBody, Capture: archive.CaptureFull, Body: body, Data: data}, reserved)
+	t.handedOff = true
+	t.in.EmitReserved(&archive.Event{Type: archive.TypeClientBody, Capture: archive.CaptureFull, Body: body, Data: data, SizeHint: data.sizeHint()}, reserved)
 }

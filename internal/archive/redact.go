@@ -24,6 +24,36 @@ var credentialHeaders = map[string]struct{}{
 	"x-management-key":    {},
 }
 
+// credentialNameParts redact any header whose lower-case name contains one
+// of them, so credentials under names nobody listed are covered too.
+var credentialNameParts = []string{"key", "token", "secret", "password", "auth", "cookie", "session", "signature"}
+
+// keptHeaders are not credentials although their names match a part above
+// (or might one day). Session IDs are needed for joins (design section 5).
+var keptHeaders = map[string]struct{}{
+	"anthropic-beta":           {},
+	"x-codex-turn-metadata":    {},
+	"session_id":               {},
+	"session-id":               {},
+	"x-session-id":             {},
+	"x-parent-session-id":      {},
+	"x-claude-code-session-id": {},
+}
+
+// urlHeaders carry URLs whose query and fragment are redacted like a route
+// query without an allowlist (an OAuth redirect's code and state, say).
+var urlHeaders = map[string]struct{}{
+	"referer":          {},
+	"origin":           {},
+	"location":         {},
+	"content-location": {},
+	"link":             {},
+	"x-forwarded-uri":  {},
+	"x-original-uri":   {},
+	"x-original-url":   {},
+	"x-rewrite-url":    {},
+}
+
 // websocketKeyProtocolPrefix marks a Sec-WebSocket-Protocol entry that
 // carries an API key (forwarded upstream by live/websocket.go).
 const websocketKeyProtocolPrefix = "openai-insecure-api-key."
@@ -45,6 +75,16 @@ func RedactHeaders(h http.Header) map[string][]string {
 			out[name] = redacted
 		case lower == "sec-websocket-protocol":
 			out[name] = redactWebsocketProtocols(values)
+		case isURLHeader(lower):
+			redacted := make([]string, len(values))
+			for i, value := range values {
+				if lower == "link" {
+					redacted[i] = redactLinkValue(value)
+				} else {
+					redacted[i] = RedactURL(value)
+				}
+			}
+			out[name] = redacted
 		default:
 			out[name] = slices.Clone(values)
 		}
@@ -53,8 +93,55 @@ func RedactHeaders(h http.Header) map[string][]string {
 }
 
 func isCredentialHeader(lower string) bool {
-	_, ok := credentialHeaders[lower]
+	if _, ok := credentialHeaders[lower]; ok {
+		return true
+	}
+	if _, ok := keptHeaders[lower]; ok {
+		return false
+	}
+	// Rate-limit headers (x-ratelimit-remaining-tokens) carry counts.
+	if strings.Contains(lower, "ratelimit") {
+		return false
+	}
+	for _, part := range credentialNameParts {
+		if strings.Contains(lower, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func isURLHeader(lower string) bool {
+	_, ok := urlHeaders[lower]
 	return ok
+}
+
+// RedactURL keeps a URL's scheme, host and path. Every query and fragment
+// value becomes Redacted, as for a route query without an allowlist, and
+// user information is dropped. A value that does not parse is Redacted.
+func RedactURL(value string) string {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || u.Opaque != "" {
+		return Redacted
+	}
+	u.User = nil
+	u.RawQuery = RedactQuery(u.RawQuery, nil)
+	fragment := u.EscapedFragment()
+	u.Fragment, u.RawFragment = "", ""
+	out := u.String()
+	if fragment != "" {
+		out += "#" + RedactQuery(fragment, nil)
+	}
+	return out
+}
+
+var linkTarget = regexp.MustCompile(`<[^>]*>`)
+
+// redactLinkValue redacts the URL in each <target> of a Link header.
+func redactLinkValue(value string) string {
+	return linkTarget.ReplaceAllStringFunc(value, func(target string) string {
+		return "<" + RedactURL(target[1:len(target)-1]) + ">"
+	})
 }
 
 func redactWebsocketProtocols(values []string) []string {
@@ -82,18 +169,39 @@ type QueryAllowlist map[string]QueryRule
 
 var (
 	safeQueryName = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_.$\-\[\]]{0,31}$`)
-	versionValue  = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
-	modelValue    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$`)
+	// A version is up to four numbers with short dotted pre-release or
+	// build parts: 0.50.0, v1.2, 1.2.3-beta.1, 0.46.0-alpha.3+build.7.
+	versionValue = regexp.MustCompile(`^v?[0-9]{1,9}(\.[0-9]{1,9}){0,3}([-+][0-9A-Za-z]{1,12}(\.[0-9A-Za-z]{1,12}){0,3}){0,2}$`)
+	// A model is lower-case words, numbers and dates joined by - . _ : / @:
+	// gpt-realtime, gemini-2.0-flash-live-001, claude-sonnet-4-5@20250929.
+	modelValue = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/@-]{0,63}$`)
+	// longRun finds an unbroken alphanumeric run as long as a key's body.
+	longRun = regexp.MustCompile(`[A-Za-z0-9]{17,}`)
 )
+
+// keyPrefixes start common credentials (compared in lower case).
+var keyPrefixes = []string{"sk-", "sk_", "rk_", "pk_", "aiza", "ya29.", "ghp_", "gho_", "github_pat_", "glpat-", "xox", "akia"}
+
+// looksLikeKey reports a value shaped like a credential rather than a name:
+// a known key prefix or a long unbroken run of letters and digits.
+func looksLikeKey(value string) bool {
+	lower := strings.ToLower(value)
+	for _, prefix := range keyPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return longRun.MatchString(value)
+}
 
 // BoolValue accepts true or false.
 func BoolValue(value string) bool { return value == "true" || value == "false" }
 
 // VersionValue accepts a client version such as 0.50.0 or 1.2.3-beta.1.
-func VersionValue(value string) bool { return versionValue.MatchString(value) }
+func VersionValue(value string) bool { return len(value) <= 64 && versionValue.MatchString(value) }
 
-// ModelValue accepts a model identifier.
-func ModelValue(value string) bool { return modelValue.MatchString(value) }
+// ModelValue accepts a model identifier and rejects anything shaped like a key.
+func ModelValue(value string) bool { return modelValue.MatchString(value) && !looksLikeKey(value) }
 
 // EnumValue accepts exactly one of values.
 func EnumValue(values ...string) QueryRule {

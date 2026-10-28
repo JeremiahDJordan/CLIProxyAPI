@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +39,8 @@ type testEnv struct {
 	free  atomic.Uint64
 }
 
+// makeSpool provisions a spool like section 7: root and blobs/ 2770, owned
+// by the test's spool group (the process's effective group).
 func makeSpool(t *testing.T) string {
 	t.Helper()
 	spool := t.TempDir()
@@ -47,10 +51,25 @@ func makeSpool(t *testing.T) string {
 	if err := os.Mkdir(blobs, 0o770); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(blobs, os.ModeSetgid|0o770); err != nil {
-		t.Fatal(err)
+	for _, dir := range []string{spool, blobs} {
+		if err := os.Chown(dir, -1, os.Getegid()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, os.ModeSetgid|0o770); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return spool
+}
+
+// testSpoolGroup names the group makeSpool uses.
+func testSpoolGroup(t *testing.T) string {
+	t.Helper()
+	g, err := user.LookupGroupId(strconv.Itoa(os.Getegid()))
+	if err != nil {
+		t.Skipf("cannot name the effective group: %v", err)
+	}
+	return g.Name
 }
 
 // setup installs overrides for one test. stateDir may be shared between
@@ -64,6 +83,7 @@ func setup(t *testing.T, stateDir string, mutate func(*TestOverrides)) *testEnv 
 	env.free.Store(1 << 50)
 	o := TestOverrides{
 		StateDir:           env.state,
+		SpoolGroup:         testSpoolGroup(t),
 		FreeBytes:          env.free.Load,
 		FsyncInterval:      20 * time.Millisecond,
 		HeartbeatInterval:  time.Hour,
@@ -202,6 +222,30 @@ func TestDisabledStartsNothing(t *testing.T) {
 	if _, err := os.Stat(env.state); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("disabled recorder touched the state directory: %v", err)
 	}
+	// The first configuration wins: a later enabled Start starts nothing.
+	if rec := Start(StartParams{Config: enabledConfig(env.spool)}); rec != nil || Current() != nil {
+		t.Fatal("an enabled Start after a disabled one started a recorder")
+	}
+	if after := spoolNames(t, env.spool); !slices.Equal(before, after) {
+		t.Fatalf("a later enabled Start touched the spool: %v -> %v", before, after)
+	}
+}
+
+// otherGroup returns a group the process belongs to, other than its
+// effective group, that has a name.
+func otherGroup(t *testing.T) (int, string) {
+	t.Helper()
+	groups, _ := os.Getgroups()
+	for _, gid := range groups {
+		if gid == os.Getegid() {
+			continue
+		}
+		if g, err := user.LookupGroupId(strconv.Itoa(gid)); err == nil {
+			return gid, g.Name
+		}
+	}
+	t.Skip("no second named group")
+	return 0, ""
 }
 
 func TestStartRefusesUnsafeSpool(t *testing.T) {
@@ -210,8 +254,41 @@ func TestStartRefusesUnsafeSpool(t *testing.T) {
 		name   string
 		mutate func(t *testing.T, env *testEnv) config.ArchiveConfig
 		notZFS bool
+		group  func(t *testing.T) string
 		reason string
 	}{
+		{name: "spool root without setgid", reason: DropStartRefusedSpool, mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
+			if err := os.Chmod(env.spool, 0o770); err != nil {
+				t.Fatal(err)
+			}
+			return enabledConfig(env.spool)
+		}},
+		{name: "spool root world readable", reason: DropStartRefusedSpool, mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
+			if err := os.Chmod(env.spool, os.ModeSetgid|0o775); err != nil {
+				t.Fatal(err)
+			}
+			return enabledConfig(env.spool)
+		}},
+		{name: "spool group does not exist", reason: DropStartRefusedSpool,
+			group: func(*testing.T) string { return "fleet-archive-test-no-such-group" },
+			mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
+				return enabledConfig(env.spool)
+			}},
+		{name: "spool owned by another group", reason: DropStartRefusedSpool,
+			group: func(t *testing.T) string { _, name := otherGroup(t); return name },
+			mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
+				return enabledConfig(env.spool)
+			}},
+		{name: "spool root owned by another group", reason: DropStartRefusedSpool, mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
+			gid, _ := otherGroup(t)
+			if err := os.Chown(env.spool, -1, gid); err != nil {
+				t.Skipf("chown to group %d: %v", gid, err)
+			}
+			if err := os.Chmod(env.spool, os.ModeSetgid|0o770); err != nil {
+				t.Fatal(err)
+			}
+			return enabledConfig(env.spool)
+		}},
 		{name: "missing sentinel", reason: DropStartRefusedSpool, mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
 			if err := os.Remove(filepath.Join(env.spool, SentinelName)); err != nil {
 				t.Fatal(err)
@@ -261,6 +338,7 @@ func TestStartRefusesUnsafeSpool(t *testing.T) {
 			name   string
 			mutate func(t *testing.T, env *testEnv) config.ArchiveConfig
 			notZFS bool
+			group  func(t *testing.T) string
 			reason string
 		}{name: "blobs owned by another group", reason: DropStartRefusedSpool, mutate: func(t *testing.T, env *testEnv) config.ArchiveConfig {
 			blobs := filepath.Join(env.spool, BlobDirName)
@@ -285,7 +363,12 @@ func TestStartRefusesUnsafeSpool(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := setup(t, "", func(o *TestOverrides) { o.NotZFS = tc.notZFS })
+			env := setup(t, "", func(o *TestOverrides) {
+				o.NotZFS = tc.notZFS
+				if tc.group != nil {
+					o.SpoolGroup = tc.group(t)
+				}
+			})
 			cfg := tc.mutate(t, env)
 			before := spoolNames(t, env.spool)
 			if rec := Start(StartParams{Config: cfg}); rec != nil {
@@ -351,8 +434,8 @@ func TestStartReadsConfigOnce(t *testing.T) {
 	if got := Start(StartParams{Config: enabledConfig(other)}); got != rec {
 		t.Fatal("a second Start replaced the recorder")
 	}
-	if got := Start(StartParams{Config: config.ArchiveConfig{}}); got != nil {
-		t.Fatal("Start(disabled) returned a recorder")
+	if got := Start(StartParams{Config: config.ArchiveConfig{}}); got != rec {
+		t.Fatal("a disabled Start did not return the running recorder")
 	}
 	if Current() != rec {
 		t.Fatal("a disabled reload turned capture off")
@@ -374,7 +457,7 @@ func TestBootLockOrderAndModes(t *testing.T) {
 	}
 	traceHook.Store(&hook)
 	rec := mustStart(t, env)
-	id := rec.BootID()
+	id := rec.bootID
 
 	mu.Lock()
 	got := slices.Clone(ops)
@@ -455,7 +538,7 @@ func TestSegmentsRotateBySizeAndClose(t *testing.T) {
 		if m == nil {
 			t.Fatalf("bad segment name %s", filepath.Base(path))
 		}
-		if m[2] != rec.BootID() || m[3] != fmt.Sprintf("%06d", i+1) || m[4] != "closed" {
+		if m[2] != rec.bootID || m[3] != fmt.Sprintf("%06d", i+1) || m[4] != "closed" {
 			t.Fatalf("segment %d named %s", i, filepath.Base(path))
 		}
 		info, err := os.Stat(path)
@@ -472,7 +555,7 @@ func TestSegmentsRotateBySizeAndClose(t *testing.T) {
 		if ev["seq"] != float64(i+1) {
 			t.Fatalf("event %d has seq %v", i, ev["seq"])
 		}
-		if ev["boot_id"] != rec.BootID() || ev["v"] != float64(EnvelopeVersion) {
+		if ev["boot_id"] != rec.bootID || ev["v"] != float64(EnvelopeVersion) {
 			t.Fatalf("bad envelope %v", ev)
 		}
 	}
@@ -575,7 +658,7 @@ func TestBlobPersistedBeforeItsEvent(t *testing.T) {
 	mu.Lock()
 	again := slices.Clone(ops)
 	mu.Unlock()
-	if !slices.Equal(again, []string{"segment.write"}) {
+	if !slices.Equal(again, []string{"blob.reuse", "blob.dirsync", "segment.write"}) {
 		t.Fatalf("second identical blob steps = %v", again)
 	}
 	if leftovers, _ := filepath.Glob(filepath.Join(env.spool, BlobDirName, ".tmp-*")); len(leftovers) != 0 {
@@ -690,9 +773,9 @@ var tsPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z
 func TestEnvelopeAndBootEvent(t *testing.T) {
 	env := setup(t, "", nil)
 	rec := mustStart(t, env)
-	id, err := uuid.Parse(rec.BootID())
+	id, err := uuid.Parse(rec.bootID)
 	if err != nil || id.Version() != 7 {
-		t.Fatalf("boot id %q is not a UUIDv7", rec.BootID())
+		t.Fatalf("boot id %q is not a UUIDv7", rec.bootID)
 	}
 	in := rec.BeginIngress(RouteInference, time.Now())
 	if parsed, errParse := uuid.Parse(in.ID()); errParse != nil || parsed.Version() != 7 {
@@ -864,6 +947,19 @@ func TestFreeSpaceThresholds(t *testing.T) {
 	if !rec.CaptureEvents() || rec.BodyDropReason() != DropLowSpaceBody {
 		t.Fatalf("events %v, reason %s", rec.CaptureEvents(), rec.BodyDropReason())
 	}
+	// A body already in progress can reserve no more, nor be queued.
+	if rec.ReserveBody(10) {
+		t.Fatal("body bytes reserved below body_free_gb")
+	}
+	if rec.Emit(&Event{Type: TypeClientBody, Capture: CaptureFull, Body: &BodyData{Bytes: []byte("late body")}}) {
+		t.Fatal("a body event was queued below body_free_gb")
+	}
+	if got := rec.ledger.totals()[DropLowSpaceBody]; got.Bodies != 1 {
+		t.Fatalf("low_space_body drops = %+v", got)
+	}
+	if used := rec.q.used.Load(); used != 0 {
+		t.Fatalf("queue holds %d bytes after refused bodies", used)
+	}
 	env.free.Store(uint64(gib) / 2)
 	waitFor(t, "capture to stop", func() bool { return !rec.CaptureEvents() })
 	for i := 0; i < 3; i++ {
@@ -919,5 +1015,208 @@ func TestEmitAfterStopIsSafe(t *testing.T) {
 	}
 	if Current() != nil {
 		t.Fatal("Current() set after Stop")
+	}
+}
+
+// traceOps records the named trace operations in order.
+func traceOps(t *testing.T, names ...string) func() []string {
+	t.Helper()
+	var mu sync.Mutex
+	var ops []string
+	hook := func(op, _ string) {
+		if slices.Contains(names, op) {
+			mu.Lock()
+			ops = append(ops, op)
+			mu.Unlock()
+		}
+	}
+	traceHook.Store(&hook)
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(ops)
+	}
+}
+
+func shortBackoff(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := writerBackoff
+	writerBackoff = d
+	t.Cleanup(func() { writerBackoff = old })
+}
+
+func TestLongBatchStillSyncs(t *testing.T) {
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+	release := make(chan struct{})
+	var blocked atomic.Bool
+	hook := func(op string) error {
+		if op == "segment.write" {
+			if blocked.CompareAndSwap(false, true) {
+				<-release
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return nil
+	}
+	faultHook.Store(&hook)
+	ops := traceOps(t, "segment.write", "segment.sync")
+	rec.Emit(&Event{Type: TypeGap, Data: map[string]any{"reason": "first"}})
+	waitFor(t, "the writer to block", blocked.Load)
+	// One batch of 60 slow writes, about 300 ms against a 20 ms interval.
+	for i := 0; i < 60; i++ {
+		rec.Emit(&Event{Type: TypeGap, Data: map[string]any{"reason": "batch", "i": i}})
+	}
+	close(release)
+	flush(t)
+	got := ops()
+	var writes []int
+	for i, op := range got {
+		if op == "segment.write" {
+			writes = append(writes, i)
+		}
+	}
+	if len(writes) < 61 {
+		t.Fatalf("saw %d writes", len(writes))
+	}
+	batch := got[writes[len(writes)-60]:writes[len(writes)-1]]
+	if syncs := strings.Count(strings.Join(batch, " "), "segment.sync"); syncs < 2 {
+		t.Fatalf("%d fsyncs during a 300 ms batch; the batch held off the fsync cadence", syncs)
+	}
+}
+
+func TestGapCountersClearOnlyOnceDurable(t *testing.T) {
+	shortBackoff(t, time.Hour)
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+	flush(t)
+	var armed atomic.Bool
+	hook := func(op string) error {
+		if op == "segment.sync" && armed.CompareAndSwap(true, false) {
+			return errors.New("injected fsync failure")
+		}
+		return nil
+	}
+	faultHook.Store(&hook)
+	armed.Store(true)
+	rec.ledger.add(DropQueueFull, DropCount{Events: 1})
+	waitFor(t, "the writer to fail", func() bool { return !rec.CaptureEvents() })
+	stop(t)
+	st, err := readState(env.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Drops[DropQueueFull].Events != 1 {
+		t.Fatalf("drops cleared although their gap was never synced: %+v", st.Drops)
+	}
+}
+
+func TestWriterDropsCountAgainstTheirRequest(t *testing.T) {
+	shortBackoff(t, 10*time.Millisecond)
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+
+	in := rec.BeginIngress(RouteInference, time.Now())
+	in.Emit(&Event{Type: TypeIngressStart, Data: map[string]any{"unencodable": make(chan int)}})
+	in.Emit(&Event{Type: TypeIngressEnd, ReportDrops: true, Data: map[string]any{"status": 200}})
+	flush(t)
+	if in.Drops() != 1 {
+		t.Fatalf("encode error not counted against the request: %d", in.Drops())
+	}
+	ends := ofType(readEvents(t, env.spool), TypeIngressEnd)
+	if len(ends) != 1 || ends[0]["capture_drops"] != float64(1) {
+		t.Fatalf("ingress_end = %v, want capture_drops 1", ends)
+	}
+
+	var failed atomic.Bool
+	hook := func(op string) error {
+		if op == "segment.write" && failed.CompareAndSwap(false, true) {
+			return errors.New("injected disk error")
+		}
+		return nil
+	}
+	faultHook.Store(&hook)
+	failing := rec.BeginIngress(RouteInference, time.Now())
+	failing.Emit(&Event{Type: TypeIngressStart, Data: map[string]any{"method": "POST"}})
+	waitFor(t, "the writer drop to reach the request", func() bool { return failing.Drops() == 1 })
+}
+
+func TestFailingDiskLeavesNoEmptySegments(t *testing.T) {
+	shortBackoff(t, 5*time.Millisecond)
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+	var writes atomic.Int32
+	hook := func(op string) error {
+		if op == "segment.write" && writes.Add(1) <= 5 {
+			return errors.New("injected disk error")
+		}
+		return nil
+	}
+	faultHook.Store(&hook)
+	rec.Emit(&Event{Type: TypeGap, Data: map[string]any{"reason": "lost"}})
+	waitFor(t, "capture to resume", func() bool { return writes.Load() > 5 && rec.CaptureEvents() })
+	stop(t)
+	files := segmentFiles(t, env.spool)
+	if len(files) != 2 {
+		t.Fatalf("segments = %v, want the failed one and one after recovery", files)
+	}
+	for i, path := range files {
+		m := segmentName.FindStringSubmatch(filepath.Base(path))
+		if m == nil || m[3] != fmt.Sprintf("%06d", i+1) || m[4] != "closed" {
+			t.Fatalf("segment %d named %s", i, filepath.Base(path))
+		}
+		if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+			t.Fatalf("%s is empty (%v)", filepath.Base(path), err)
+		}
+	}
+}
+
+func TestStopPersistsLateDrops(t *testing.T) {
+	env := setup(t, "", nil)
+	rec := mustStart(t, env)
+	var once sync.Once
+	hook := func(op, _ string) {
+		// A tap finishing during shutdown counts a drop after the writer's
+		// last write of the state file.
+		if op == "ledger.persist" && rec.stopping.Load() {
+			once.Do(func() { rec.CountDrop(DropStopped, DropCount{Events: 1}) })
+		}
+	}
+	traceHook.Store(&hook)
+	stop(t)
+	st, err := readState(env.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Drops[DropStopped].Events != 1 {
+		t.Fatalf("a drop counted during shutdown was lost: %+v", st.Drops)
+	}
+}
+
+func TestBlobReuseCompletesDurability(t *testing.T) {
+	shortBackoff(t, 10*time.Millisecond)
+	env := setup(t, "", func(o *TestOverrides) { o.BlobThresholdBytes = 64 })
+	rec := mustStart(t, env)
+	var failed atomic.Bool
+	hook := func(op string) error {
+		if op == "blob.dirsync" && failed.CompareAndSwap(false, true) {
+			return errors.New("injected directory fsync failure")
+		}
+		return nil
+	}
+	faultHook.Store(&hook)
+	payload := bytes.Repeat([]byte("renamed but not synced "), 10)
+	rec.Emit(&Event{Type: TypeClientBody, Capture: CaptureFull, Body: &BodyData{Bytes: payload}})
+	waitFor(t, "the failure and recovery", func() bool { return failed.Load() && rec.CaptureEvents() })
+	flush(t)
+	ops := traceOps(t, "blob.create", "blob.reuse", "blob.dirsync", "segment.write")
+	rec.Emit(&Event{Type: TypeClientBody, Capture: CaptureFull, Body: &BodyData{Bytes: payload}})
+	flush(t)
+	if got := ops(); !slices.Equal(got, []string{"blob.reuse", "blob.dirsync", "segment.write"}) {
+		t.Fatalf("retry steps = %v; the reused blob skipped its directory fsync", got)
+	}
+	bodies := ofType(readEvents(t, env.spool), TypeClientBody)
+	if len(bodies) != 1 || bodies[0]["body"].(map[string]any)["form"] != FormBlob {
+		t.Fatalf("client_body events = %v", bodies)
 	}
 }

@@ -9,7 +9,8 @@ type ArchiveConfig struct {
 	// files are opened.
 	Enabled bool `yaml:"enabled" json:"enabled"`
 	// SpoolDir is the spool dataset root. It must contain the sentinel file
-	// .fleet-archive-spool and a blobs/ directory with mode 2770.
+	// .fleet-archive-spool, and it and its blobs/ directory must be mode 2770
+	// and owned by group fleet-archive.
 	SpoolDir string `yaml:"spool_dir,omitempty" json:"spool_dir,omitempty"`
 	// SegmentSeconds rotates a segment after this many seconds (default 300).
 	SegmentSeconds int `yaml:"segment_seconds,omitempty" json:"segment_seconds,omitempty"`

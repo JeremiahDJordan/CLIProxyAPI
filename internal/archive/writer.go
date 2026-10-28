@@ -31,6 +31,7 @@ type writer struct {
 	seq  uint64
 
 	dirty         bool
+	lastTick      time.Time
 	lastHeartbeat time.Time
 	lastSpace     time.Time
 	lastPersist   time.Time
@@ -68,7 +69,7 @@ func newWriter(r *Recorder, free uint64) *writer {
 	}
 	w.free.Store(free)
 	now := time.Now()
-	w.lastHeartbeat, w.lastSpace, w.lastPersist = now, now, now
+	w.lastTick, w.lastHeartbeat, w.lastSpace, w.lastPersist = now, now, now, now
 	return w
 }
 
@@ -123,7 +124,7 @@ func (w *writer) begin(p StartParams) error {
 		BuildVersion:     buildinfo.Version,
 		BuildCommit:      buildinfo.Commit,
 		BuildDate:        buildinfo.BuildDate,
-		BootStartedAt:    formatTime(w.r.bootStarted),
+		BootStartedAt:    FormatTime(w.r.bootStarted),
 		PID:              os.Getpid(),
 		Hostname:         host,
 		FreeBytes:        w.free.Load(),
@@ -212,12 +213,21 @@ func (w *writer) drain(items []*queued) error {
 		}
 		w.r.q.release(item.reserved)
 		w.inflight = w.inflight[1:]
+		// A long batch must not hold off fsync, space checks or rotation.
+		if now := time.Now(); now.Sub(w.lastTick) >= w.opts.FsyncInterval {
+			if err := w.tick(now); err != nil {
+				return err
+			}
+		}
 	}
 	w.inflight = nil
 	return nil
 }
 
+// tick runs the time-based work. The ticker calls it every FsyncInterval,
+// and drain calls it between events once that interval has passed.
 func (w *writer) tick(now time.Time) error {
+	w.lastTick = now
 	if w.seg != nil && now.Sub(w.seg.opened) >= w.opts.SegmentDuration {
 		if err := w.closeSegment(); err != nil {
 			return err
@@ -235,7 +245,8 @@ func (w *writer) tick(now time.Time) error {
 		}
 		w.lastHeartbeat = now
 	}
-	// Ticks come every FsyncInterval (1 s), so data is synced within 2 s.
+	// Ticks come every FsyncInterval (1 s), also during a long batch, so
+	// data is synced within 2 s.
 	if err := w.sync(); err != nil {
 		return err
 	}
@@ -275,9 +286,13 @@ func (w *writer) flushGap(now time.Time) error {
 		gap.Reason = "carried_over"
 	}
 	if !since.IsZero() {
-		gap.Since = formatTime(since)
+		gap.Since = FormatTime(since)
 	}
 	if err := w.writeEvent(&Event{Type: TypeGap, Time: now, Data: gap}); err != nil {
+		return err
+	}
+	// Clear the counters only once the gap reporting them is durable.
+	if err := w.sync(); err != nil {
 		return err
 	}
 	w.r.ledger.settle(pending)
@@ -322,11 +337,14 @@ func (w *writer) writeEvent(ev *Event) error {
 		V:            EnvelopeVersion,
 		BootID:       w.r.bootID,
 		Seq:          w.seq + 1,
-		TS:           formatTime(ev.Time),
+		TS:           FormatTime(ev.Time),
 		Type:         ev.Type,
 		IngressID:    ev.IngressID,
 		ConnectionID: ev.ConnectionID,
 		Capture:      ev.Capture,
+	}
+	if ev.ReportDrops {
+		env.CaptureDrops = ev.ingress.Drops()
 	}
 	var blob []byte
 	if ev.Body != nil {
@@ -340,6 +358,7 @@ func (w *writer) writeEvent(ev *Event) error {
 			d.Bodies, d.Bytes = 1, int64(len(ev.Body.Bytes))
 		}
 		w.r.ledger.add(DropEncodeError, d)
+		ev.ingress.NoteDrop()
 		return nil
 	}
 	if blob != nil {
@@ -385,27 +404,61 @@ func (w *writer) writeLine(line []byte) error {
 	return nil
 }
 
+// openSegment creates the next segment. The number advances only when the
+// segment exists, so a failed open leaves no gap in the numbering.
 func (w *writer) openSegment() error {
-	w.segN++
-	name := fmt.Sprintf("%s-%06d", w.prefix, w.segN)
+	name := fmt.Sprintf("%s-%06d", w.prefix, w.segN+1)
 	path := filepath.Join(w.spool, name+".open.jsonl")
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o640)
 	if err != nil {
 		return err
 	}
+	w.segN++
 	trace("segment.create", path)
+	seg := &segment{f: f, name: name, path: path, opened: time.Now()}
 	// The unit's UMask=0077 would leave the file 0600.
 	if err = f.Chmod(0o640); err != nil {
-		_ = f.Close()
+		w.discardSegment(seg)
 		return err
 	}
 	trace("segment.chmod", path)
 	if err = syncDir(w.spool); err != nil {
-		_ = f.Close()
+		w.discardSegment(seg)
 		return err
 	}
-	w.seg = &segment{f: f, name: name, path: path, opened: time.Now()}
+	w.seg = seg
 	return nil
+}
+
+// discardSegment removes a segment that holds no event and gives its number
+// back, so a failing disk leaves neither empty segments nor gaps.
+func (w *writer) discardSegment(seg *segment) {
+	_ = seg.f.Close()
+	if err := os.Remove(seg.path); err != nil {
+		log.WithError(err).Warn("request archive: cannot remove an empty segment")
+		return
+	}
+	trace("segment.discard", seg.path)
+	w.segN--
+}
+
+// endFailedSegment ends the open segment on its last complete event after a
+// failure, or removes it when it holds none.
+func (w *writer) endFailedSegment() {
+	seg := w.seg
+	if seg == nil {
+		return
+	}
+	if seg.size == 0 {
+		w.seg = nil
+		w.dirty = false
+		w.discardSegment(seg)
+		return
+	}
+	_ = seg.f.Truncate(seg.size)
+	if err := w.closeSegment(); err != nil {
+		log.WithError(err).Error("request archive: cannot close the failed segment")
+	}
 }
 
 // closeSegment fsyncs, renames to .closed.jsonl and fsyncs the directory.
@@ -437,6 +490,9 @@ func (w *writer) sync() error {
 	if w.seg == nil || !w.dirty {
 		return nil
 	}
+	if err := fault("segment.sync"); err != nil {
+		return err
+	}
 	if err := w.seg.f.Sync(); err != nil {
 		return fmt.Errorf("sync segment %s: %w", w.seg.path, err)
 	}
@@ -449,6 +505,15 @@ func (w *writer) sync() error {
 func (w *writer) writeBlob(sum string, data []byte) error {
 	final := filepath.Join(w.blobDir, sum)
 	if info, err := os.Lstat(final); err == nil && info.Mode().IsRegular() && info.Size() == int64(len(data)) {
+		// An earlier attempt may have renamed the blob into place and then
+		// failed; finish its durability before an event references it.
+		if err = syncFile(final); err != nil {
+			return fmt.Errorf("write blob %s: %w", sum, err)
+		}
+		trace("blob.reuse", final)
+		if err = w.syncBlobDir(); err != nil {
+			return err
+		}
 		w.blobsReused.Add(1)
 		return nil
 	}
@@ -483,12 +548,35 @@ func (w *writer) writeBlob(sum string, data []byte) error {
 		return fmt.Errorf("write blob %s: %w", sum, err)
 	}
 	trace("blob.rename", final)
-	if err = syncDir(w.blobDir); err != nil {
+	if err = w.syncBlobDir(); err != nil {
+		return err
+	}
+	w.blobsWritten.Add(1)
+	return nil
+}
+
+func (w *writer) syncBlobDir() error {
+	if err := fault("blob.dirsync"); err != nil {
+		return err
+	}
+	if err := syncDir(w.blobDir); err != nil {
 		return err
 	}
 	trace("blob.dirsync", w.blobDir)
-	w.blobsWritten.Add(1)
 	return nil
+}
+
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	errSync := f.Sync()
+	errClose := f.Close()
+	if errSync != nil {
+		return errSync
+	}
+	return errClose
 }
 
 func syncDir(dir string) error {
@@ -539,12 +627,7 @@ func (w *writer) handleFailure() {
 		w.dropQueued(item, DropWriterError)
 	}
 	w.inflight = nil
-	if w.seg != nil {
-		_ = w.seg.f.Truncate(w.seg.size)
-		if err := w.closeSegment(); err != nil {
-			log.WithError(err).Error("request archive: cannot close the failed segment")
-		}
-	}
+	w.endFailedSegment()
 	w.persistLedger()
 }
 
@@ -584,17 +667,14 @@ func (w *writer) reopen() error {
 		gap.Error = w.failure.Error()
 	}
 	if !since.IsZero() {
-		gap.Since = formatTime(since)
+		gap.Since = FormatTime(since)
 	}
 	err := w.writeEvent(&Event{Type: TypeGap, Time: time.Now(), Data: gap})
 	if err == nil {
 		err = w.sync()
 	}
 	if err != nil {
-		if w.seg != nil {
-			_ = w.seg.f.Truncate(w.seg.size)
-			_ = w.closeSegment()
-		}
+		w.endFailedSegment()
 		return err
 	}
 	w.r.ledger.settle(pending)
@@ -622,6 +702,9 @@ func (w *writer) dropQueued(item *queued, reason string) {
 		d.Bodies, d.Bytes = 1, int64(len(item.ev.Body.Bytes))
 	}
 	w.r.ledger.add(reason, d)
+	if item.ev != nil {
+		item.ev.ingress.NoteDrop()
+	}
 }
 
 func (w *writer) persistLedger() {
@@ -629,4 +712,5 @@ func (w *writer) persistLedger() {
 		w.lastPersistWarn = time.Now()
 		log.WithError(err).Warn("request archive: cannot persist drop counters")
 	}
+	trace("ledger.persist", w.opts.StateDir)
 }

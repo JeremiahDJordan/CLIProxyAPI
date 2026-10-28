@@ -22,6 +22,8 @@ const (
 
 	// DefaultStateDir holds drop counters that outlive a boot (design section 6).
 	DefaultStateDir = "/var/lib/cliproxyapi/archive-state"
+	// DefaultSpoolGroup must own the spool root and blobs/ (design section 7).
+	DefaultSpoolGroup = "fleet-archive"
 )
 
 // Options is the validated recorder configuration.
@@ -34,6 +36,7 @@ type Options struct {
 	BodyFreeBytes      uint64
 	HardFreeBytes      uint64
 	StateDir           string
+	SpoolGroup         string
 
 	// Writer cadence. Production uses the defaults; tests shorten them.
 	FsyncInterval      time.Duration
@@ -52,6 +55,7 @@ func optionsFromConfig(cfg config.ArchiveConfig) (Options, error) {
 		BodyFreeBytes:      uint64(positiveOr(cfg.BodyFreeGB, defaultBodyFreeGB)) * uint64(gib),
 		HardFreeBytes:      uint64(positiveOr(cfg.HardFreeGB, defaultHardFreeGB)) * uint64(gib),
 		StateDir:           DefaultStateDir,
+		SpoolGroup:         DefaultSpoolGroup,
 		FsyncInterval:      time.Second,
 		HeartbeatInterval:  time.Minute,
 		SpaceCheckInterval: 10 * time.Second,
