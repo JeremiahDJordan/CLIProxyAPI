@@ -124,6 +124,8 @@ type responsesWebsocketWriter struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	closing atomic.Bool
+	// archive records the frames written (fleet: request archive; nil when off).
+	archive *responsesWebsocketArchive
 }
 
 func newResponsesWebsocketWriter(conn *websocket.Conn) *responsesWebsocketWriter {
@@ -192,6 +194,7 @@ func (w *responsesWebsocketWriter) closeWithPayload(payload []byte) (bool, error
 	defer w.writeMu.Unlock()
 
 	errWrite := w.conn.WriteMessage(websocket.TextMessage, payload)
+	w.archive.downstream(websocket.TextMessage, payload, errWrite) // fleet: request archive
 	errClose := w.conn.Close()
 	if errWrite != nil {
 		return false, errWrite
@@ -374,6 +377,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 	}
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
+	// fleet: request archive turns and frames (openai_responses_websocket_archive_fleet.go)
+	writer.archive = newResponsesWebsocketArchive(c, passthroughSessionID, codexResponseSteering)
 	// fleet: duplex streams do not report turns, so a steering session counts as busy.
 	admission := newResponsesWebsocketAdmission(drainTracker)
 	if codexResponseSteering {
@@ -385,7 +390,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	// Advanced on every upstream loss: input read under an older epoch predates the loss.
 	var inputEpoch atomic.Uint64
 	input, inputDone := readResponsesWebsocketInput(withResponsesWebsocketAdmission(socketCtx, admission), cancelSocket, conn, func(payload []byte) error {
-		return h.forwardResponsesWebsocketInterrupt(socketCtx, passthroughSessionID, payload)
+		return h.forwardResponsesWebsocketInterrupt(writer.archive.interruptContext(socketCtx), passthroughSessionID, payload)
 	}, localInterrupt, writer, wsTimelineLog, &inputEpoch)
 	var duplexInput <-chan cliproxyexecutor.WebsocketInput
 	if codexResponseSteering {
@@ -450,6 +455,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		// Finish control-frame diagnostics before snapshotting the timeline.
 		<-inputDone
+		writer.archive.closeTurns() // fleet: turns still queued when the socket closed
 		wsTimelineLog.SetContext(c)
 	}()
 
@@ -517,6 +523,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	// fleet: one turn per loop iteration, ended when the loop comes back for input.
 	var endTurn func()
+	var archiveTurn *responsesWebsocketTurn // fleet: request archive turn being answered
 	defer func() {
 		if endTurn != nil {
 			endTurn()
@@ -552,9 +559,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if !ok {
 				errReadMessage = context.Cause(socketCtx)
 			} else {
-				endTurn = admission.take()
+				archiveTurn = turnFromInput(message)                         // fleet: request archive
+				endTurn = writer.archive.take(archiveTurn, admission.take()) // ends the archive turn too
 				if message.Err == nil && message.Epoch < inputEpoch.Load() {
 					// Read before an upstream loss: never sent, the client resends.
+					archiveTurn.note(wsTurnStaleEpoch, 0)
 					if errWrite := writeResponsesWebsocketPreviousResponseNotFound(writer, wsTimelineLog, message.Payload); errWrite != nil {
 						wsTerminateErr = errWrite
 						return
@@ -600,6 +609,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
 		}
 		if _, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, payload, requestModelName, true); errAuth != nil {
+			archiveTurn.noteError(wsTurnAuthDenied, errAuth)
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errAuth)
 			markAPIResponseTimestamp(c)
 			errorPayload, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, errAuth)
@@ -621,7 +631,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			continue
 		}
+		archiveTurn.noteClientKey(c)
 		if msgEpoch < inputEpoch.Load() {
+			archiveTurn.note(wsTurnStaleEpoch, 0)
 			if errWrite := writeResponsesWebsocketPreviousResponseNotFound(writer, wsTimelineLog, payload); errWrite != nil {
 				wsTerminateErr = errWrite
 				return
@@ -629,6 +641,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 		executionParent := context.WithValue(c.Request.Context(), "gin", c)
+		executionParent = archiveTurn.context(executionParent) // fleet: the turn's own archive ingress
 		executionParent, routeOverridesModelResolution := h.PrepareStreamModelRoute(
 			executionParent,
 			h.HandlerType(),
@@ -678,6 +691,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		requestRequiresCurrentUpstreamWebsocket := responsesWebsocketRequestRequiresCurrentUpstream(payload)
 		if upstreamMode == responsesWebsocketUpstreamModeWS && !nativeWebsocketPassthrough {
 			if requestRequiresCurrentUpstreamWebsocket {
+				archiveTurn.note(wsTurnReplayRequired, 0)
 				replayErr := responsesWebsocketHTTPReplayRequiredError()
 				wsTerminateErr = replayErr
 				matched, errClose := writer.closeForUpstreamError(replayErr)
@@ -801,6 +815,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			)
 		}
 		if errMsg != nil {
+			archiveTurn.noteError(wsTurnRequestError, errMsg)
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
 			errorPayload, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, errMsg)
@@ -838,6 +853,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			observedCompaction.clear()
 			lastResponseID = ""
 			lastResponsePendingToolCallIDs = nil
+			archiveTurn.note(wsTurnPrewarm, http.StatusOK)
 			prewarmID, errWrite := writeResponsesWebsocketSyntheticPrewarm(c, writer, requestJSON, wsTimelineLog, passthroughSessionID)
 			if errWrite != nil {
 				wsTerminateErr = errWrite
@@ -970,6 +986,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			},
 		)
 		if errForward != nil {
+			archiveTurn.note(wsTurnForwardError, 0)
 			wsTerminateErr = errForward
 			switch {
 			case errors.Is(errForward, websocket.ErrCloseSent):
@@ -981,6 +998,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
 			}
 			return
+		}
+		if forwardErrMsg != nil {
+			archiveTurn.noteError(wsTurnUpstreamError, forwardErrMsg)
+		} else {
+			archiveTurn.note(wsTurnCompleted, http.StatusOK)
 		}
 		if forwardErrMsg != nil && cliproxyexecutor.IsUpstreamWebsocketTurnError(forwardErrMsg.Error) {
 			if lossWriteErr != nil {

@@ -15,6 +15,9 @@ type WebsocketInput struct {
 	Err     error
 	// Epoch is the downstream input epoch at read time; a loss advances it.
 	Epoch uint64
+	// Archive is the frame's request-archive turn (fleet fork; nil when
+	// capture is off). It travels with the frame to whoever answers it.
+	Archive any
 }
 type websocketInputKey struct{}
 

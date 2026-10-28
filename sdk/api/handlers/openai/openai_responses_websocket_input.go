@@ -96,11 +96,16 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			if kind != websocket.TextMessage && kind != websocket.BinaryMessage {
 				continue
 			}
+			// fleet: the frame's request-archive turn, allocated on receipt before
+			// any check (openai_responses_websocket_archive_fleet.go).
+			turn := writer.archive.beginTurn(kind, payload)
 			// fleet: count the frame before parsing it; once the socket closes for a
 			// drain the client sees the close and resends (drain_fleet.go).
 			admission := responsesWebsocketAdmissionFrom(ctx)
 			afterDrain, admitted := admission.admit()
 			if !admitted {
+				turn.note(wsTurnNotAdmitted, 0)
+				turn.end(archiveTurnEnded)
 				return
 			}
 			if responsesWebsocketReadHookForTest != nil {
@@ -110,18 +115,26 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			// response_id, mode, and extension fields must reach upstream unchanged.
 			if json.Valid(payload) && gjson.GetBytes(payload, "type").String() == "response.interrupt" {
 				appendResponsesInterruptDiagnostic(timeline, payload, "")
+				forwarded := writer.archive.forwardingInterrupt(turn)
 				errInterrupt := interrupt(payload)
+				forwarded()
 				switch {
 				case errInterrupt == nil:
 					appendResponsesInterruptDiagnostic(timeline, payload, "handled")
+					turn.note(wsTurnInterruptPrefix+"handled", 0)
+					turn.end(archiveTurnEnded)
 					admission.unadmit()
 					continue
 				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) && local.deliver(payload):
 					appendResponsesInterruptDiagnostic(timeline, payload, "local_http")
+					turn.note(wsTurnInterruptPrefix+"local_http", 0)
+					turn.end(archiveTurnEnded)
 					admission.unadmit()
 					continue
 				default:
 					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
+					turn.note(wsTurnInterruptPrefix+"rejected", http.StatusBadRequest)
+					turn.end(archiveTurnEnded)
 					// The sanitized outcome replaces raw error logging here: errors
 					// from transport dependencies may contain credentials or URLs.
 					_, errWrite := writeResponsesWebsocketError(writer, nil, &interfaces.ErrorMessage{
@@ -138,13 +151,20 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			}
 			if afterDrain {
 				// fleet: a turn sent after the drain began is left for the next process.
+				turn.note(wsTurnDrainDropped, 0)
+				turn.end(archiveTurnEnded)
 				admission.unadmit()
 				continue
 			}
 			message := cliproxyexecutor.WebsocketInput{Payload: payload, Epoch: msgEpoch}
+			if turn != nil {
+				message.Archive = turn
+			}
 			select {
 			case input <- message:
 			case <-ctx.Done():
+				turn.note(wsTurnConnectionClosed, 0)
+				turn.end(archiveTurnEnded)
 				return
 			}
 		}

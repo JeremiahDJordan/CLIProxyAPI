@@ -303,7 +303,9 @@ func writeResponsesWebsocketPayload(writer *responsesWebsocketWriter, wsTimeline
 	if writer.closing.Load() {
 		return websocket.ErrCloseSent
 	}
-	return writer.conn.WriteMessage(websocket.TextMessage, payload)
+	errWrite := writer.conn.WriteMessage(websocket.TextMessage, payload)
+	writer.archive.downstream(websocket.TextMessage, payload, errWrite) // fleet: request archive
+	return errWrite
 }
 
 func appendWebsocketTimelineDisconnect(timeline websocketTimelineAppender, err error, timestamp time.Time) {
