@@ -62,30 +62,109 @@ multi-agent v2) and `cliproxyauth.IsCodexClientUserAgent` (SIWC credential choic
 Upstream v8.0.45 would instead rewrite it to its built-in `codex-tui` identity. Tests:
 `*t3*_fleet_test.go` and the T3 Code cases in the gate and cloak-mode tests.
 
-## 3. Request archive recorder, slice 1a (off by default)
+## 3. Request archive recorder, slices 1a and 1b (off by default)
 
-`internal/archive` and `internal/api/archive*_fleet.go` implement the first slice of the
-fleet request archive (fleet repository, `docs/PROXY-REQUEST-ARCHIVE-DESIGN.md`, revision 6,
-sections 1-7): the recorder core, the transport observer and the client body tee. Executor
-taps, attempts, usage, WebSocket turns, the v8 status route and the shipper come later; they
-attach to the `*archive.Ingress` carried in the request context
-(`archive.IngressFromContext`).
+`internal/archive` and the files below implement the recorder of the fleet request archive
+(fleet repository, `docs/PROXY-REQUEST-ARCHIVE-DESIGN.md`, revision 8, sections 1-6). Slice 1a
+built the core, the transport observer and the client body tee; slice 1b (`RecorderVersion
+"1b"`) adds the executor taps, attempts, usage, the gate decision and client key name,
+Responses WebSocket turns and frames, downstream content and the identities of section 5. The
+v8 status route, the shipper's assembly and ClickHouse come later.
 
 - Configuration `archive: {enabled, spool_dir, segment_seconds, segment_max_mb, queue_mb,
   blob_threshold_mb, body_free_gb, hard_free_gb}` (v8 layout: `observability.archive`), read
   once per process, when the first server is built; that first configuration wins, also when
-  it is disabled. Disabled installs nothing and opens no file.
-- Start refuses (logged and counted as a gap in `/var/lib/cliproxyapi/archive-state`) unless
-  the spool is on ZFS and holds `.fleet-archive-spool`, and the spool root and `blobs/` are
-  both mode 2770 and owned by group `fleet-archive`; it also refuses while
-  `codex.response-steering` is on.
-- The observer is the outermost gin middleware. Inference routes record redacted headers,
-  the typed-allowlisted query and the client body; credential and control routes record
-  metadata only. `archive_routes_fleet.go` classifies every registered route and
-  `TestArchiveRouteClassificationIsExhaustive` fails on a new unclassified route.
+  it is disabled. Disabled installs nothing and opens no file; every tap is one nil check.
+- Start runs its disk work (statfs, the boot lock, the boot event) on its own goroutine and
+  gives up after 5 s: capture stays off for the process, and a start that finishes later is
+  stopped at once and reports a `start_timeout` gap. Start refuses (logged and counted as a
+  gap in `/var/lib/cliproxyapi/archive-state`) unless the spool is on ZFS and holds
+  `.fleet-archive-spool`, and the spool root and `blobs/` are both mode 2770 and owned by group
+  `fleet-archive`; it also refuses while `codex.response-steering` is on. The writer re-runs
+  these checks every space check (10 s) and before recovering from a failure, so a spool that
+  is unmounted or changed stops capture until it is safe again.
+- Stop never blocks shutdown on the spool: it waits at most 2 s (or half the context's time)
+  for requests and WebSocket turns in flight to queue their final events, finalizes the rest
+  itself (`ended: shutdown`), and waits at most 10 s for the writer.
+- The observer is the outermost gin middleware. Inference routes record redacted headers, the
+  typed-allowlisted query and the client body; credential and control routes record metadata
+  only. `archive_routes_fleet.go` classifies every registered route and
+  `TestArchiveRouteClassificationIsExhaustive` fails on a new unclassified route. The observer
+  removes every `X-Z6-*` header before any handler runs and records the tags in
+  `ingress_start`.
+- Executor taps: `RecordAPIRequest`, `RecordAPIResponseMetadata`, `AppendAPIResponseChunk`,
+  `RecordAPIResponseError` and the upstream WebSocket helpers in
+  `internal/runtime/executor/helps/logging_helpers.go` call `internal/archive/upstream.go`
+  before their own request-log checks (`RecordAPIWebsocketUpgradeRejection` records once).
+  The usage reporter's record is tapped in `publishRecord`.
+- Attempts: `newUpstreamAttemptContext` opens an archive attempt per upstream attempt; it is
+  described where the after-auth interceptor runs (credential, provider, model, the plugin
+  scheduler's `pick_reason`, carried back in the request metadata like the selection ID) and
+  ended where the conductor records the result (`MarkResult`, `reportHomeResult`,
+  `recordAvailabilityNeutralResult`). An attempt takes its `attempt_seq` when first used, so
+  unused attempt contexts leave no gap; each outbound request is a `sub_attempt`. Attempts left
+  open close with their request.
+- Responses WebSocket: every client frame is a turn (`ws_turn`) with its own `ingress_id`,
+  allocated by the reader on receipt, before admission, epoch or auth checks, including
+  `response.interrupt`. The turn travels in `WebsocketInput.Archive` and is attached to that
+  turn's execution context, so its upstream traffic is recorded on it. With steering on for a
+  connection (possible only through a reload) its turns are not recorded and a
+  `steering_turns` gap is counted.
 
-Core hooks: two lines in `internal/api/server.go` (install in `NewServer`, stop in `Stop`),
-the `Archive` field in `internal/config/config.go` and its v8 path in `config_v8.go`.
+Core hooks: in `internal/api/server.go` the install line, the content tap line after response
+compression and the stop line; one line in `accessAuthMiddleware` (gate code of a fleet
+denial); the `Archive` field in `internal/config/config.go` and its v8 path in `config_v8.go`;
+the taps in `helps/logging_helpers.go` and `usage_helpers.go`; in `sdk/cliproxy/auth` one line
+each in `newUpstreamAttemptContext`, `applyRequestAfterAuthInterceptor` (two),
+`pickViaPluginScheduler`, `MarkResult`, `reportHomeResult` and
+`recordAvailabilityNeutralResult` (`archive_fleet.go` holds the rest); `Reason` in
+`pluginapi.SchedulerPickResponse` (set by the fleet plugin); `Archive` in
+`executor.WebsocketInput`; in the Responses WebSocket handler, reader and writer the turn
+hooks (`openai_responses_websocket_archive_fleet.go` holds the rest).
+
+### 3.1 Spool envelope (version 1)
+
+Each line is one JSON object, written with HTML escaping off. Envelope fields, on every event:
+`v` (1), `boot_id`, `seq` (per boot, from 1, no gaps), `ts` (RFC 3339 UTC, microseconds),
+`type`; when they apply: `ingress_id`, `connection_id` (the WebSocket connection's own
+`ingress_id`), `turn_seq` (from 1), `attempt_seq` (from 1), `sub_attempt` (from 0),
+`capture` (`full`, `metadata_only`, `dropped_body`, `body_unread`), `body_dropped` (why a
+body was not captured), `capture_drops` (on `ingress_end`), and `body`.
+
+**`body` is the only field that holds a body, and the only place a blob is referenced.**
+`body = {form: text|base64|blob, content_encoding?, bytes, sha256, value?}`; `sha256` and
+`bytes` describe the exact bytes; `text` and `base64` carry `value`; `blob` has no `value` and
+names `blobs/<sha256>`, which is in the spool (fsynced) once the event is written. Events that
+may carry `body`: `client_body`, `upstream_request`, `upstream_event`, `upstream_ws`
+(`ws_event` `request`, `upgrade_rejection` or `response`), `downstream_event` and
+`client_ws_frame`. A body-carrying event written while bodies are off has
+`capture: dropped_body` and `body_dropped` instead of `body`.
+
+| `type` | Per-type fields |
+| --- | --- |
+| `boot` | `recorder_version`, `redaction_version`, `envelope_version`, build, `boot_started_at`, `pid`, `hostname`, `free_bytes`, `capture_state`, `response_steering`, `config` |
+| `shutdown`, `heartbeat` | recorder counters: `queue_bytes`, `queue_limit`, `events_written`, `bytes_written`, `segments_closed`, `blobs_written`, `blobs_reused`, `blobs_rewritten`, `writer_errors`, `tap_panics`, `free_bytes`, `capture_state`, `drops`; `reason` on shutdown |
+| `gap` | `reason`, `since`, `drops` (reason → events, bodies, bytes), `prior_boot_id`, `error` |
+| `ingress_start` | `kind` (`http`, `ws_connection`), `method`, `path`, `route`, `route_class`, `query`, `client_ip`, `proto`, `host`, `content_length`, `transfer_encoding`, `headers`, `sessions` (`session_id`, `claude_session_id`, `claude_agent_id`, `codex_session_id`, `codex_turn_id`), `z6` (`z6_environment_id`, `z6_thread_id`, `z6_other`); for a WebSocket turn: `kind: ws_turn`, `message_type`, `frame_type`, `model`, `previous_response_id`, `codex_turn_id` and `codex_turn_id_source` (`frame` from `client_metadata.x-codex-turn-metadata`, or `header`), `ws_session_id` |
+| `client_body` | `wire_bytes`, `delivered_bytes`, `truncated`, `eof`, `ended`, `content_length`, `content_encoding`, `drop_reason`, `read_error` |
+| `attempt_start` | `auth_id`, `provider`, `model`, `requested_model`, `pick_reason`, `session_id` |
+| `upstream_request` | `transport`, `url` (query values allowlisted), `method`, `headers`, `provider`, `auth_id`, `auth_label`, `auth_type`; the outbound body |
+| `upstream_response_meta` | `status`, `headers` |
+| `upstream_event` | `chunk_seq` (per sub-attempt from 1; empty chunks are counted, not written); the chunk exactly as the executor read it (an SSE line, or a whole non-streamed or error body) |
+| `upstream_error` | `class` (`canceled`, `timeout`, `eof_unexpected`, `other`), `error` (redacted text) |
+| `upstream_ws` | `ws_event` (`request`, `handshake`, `upgrade_rejection`, `error`, `response`), `url`, `headers`, `status`, `response_headers`, `stage`, `class`, `error`, `frame_seq`, `trimmed` (Codex frames are whitespace-trimmed before the tap), auth fields; the frame or rejection body |
+| `usage` | `source` (`upstream` or `reporter`), `event` (`message_start`, `message_delta`, `response.completed`, `body`, `usageMetadata`, ...), `model`, `usage` (the provider's usage object, or the reporter's token breakdown) |
+| `attempt_end` | the attempt's description, `success`, `status`, `error` (redacted), `ended` (`result`, `request_end`, `shutdown`), `gate` (`allow`, `deny`), `gate_code`, `requests`, `duration_us`, `upstream_response_ids`, `previous_response_id`, `output_item_ids` |
+| `downstream_event` | `offset`; one write of the response body before compression |
+| `client_ws_frame` | `direction` (`in`, `out`), `message_type`, `write_error`; the frame (client frames before any rewriting, downstream frames after restoration) |
+| `ingress_end` | `kind`, `ended` (`request_end`, `shutdown`; `turn_end` for turns), response summary (`status`, `header_written`, `bytes_written`, `content_encoding`, `first_byte_at`, `duration_us`, `hijacked`, `gin_aborted`, `abort`, `panic_type`, `auth_decision`, `auth_provider`), `headers`, `gate_code`, `client_key` (the key's configured name), `attempts`, `first_token_at`, `upstream_response_ids`, `previous_response_id`, `output_item_ids`; for turns `outcome`, `status`, `frames_out`, `bytes_out` |
+| `metadata_only` | `started_at`, `method`, `path`, `route`, `route_class`, `query_names`, `client_ip`, response summary |
+
+Redaction (version 1) covers every header, URL and error text the taps record, inbound and
+outbound: credential headers and name parts, `Sec-WebSocket-Protocol` key entries, URL-valued
+headers, query values outside the route or upstream allowlist, and in free text URLs,
+authorization schemes, values of credential-like names and key-shaped words. Bodies are kept
+as sent. `TestArchiveRedactsCredentials` feeds fake credentials through every tap.
 
 ## 4. Restarts without interrupting work
 
