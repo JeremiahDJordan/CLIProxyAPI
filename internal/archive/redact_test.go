@@ -241,3 +241,35 @@ func TestRedactRateLimitHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestRedactText(t *testing.T) {
+	cases := map[string]string{
+		`Post "https://user:fake-pass-0001@api.example/v1?key=fake-key-0002&alt=sse": dial tcp: timeout`: `Post "https://api.example/v1?key=[redacted]&alt=[redacted]": dial tcp: timeout`,
+		`401 Unauthorized: Bearer sk-ant-oat01-fake-0003 rejected`:                                       `401 Unauthorized: Bearer [redacted] rejected`,
+		`{"error":{"message":"invalid x-api-key","api_key":"fake-0004"}}`:                                `{"error":{"message":"invalid x-api-key","api_key":"[redacted]"}}`,
+		`refresh_token=fake-0005; access_token: fake-0006`:                                               `refresh_token=[redacted]; access_token: [redacted]`,
+		`key AIzaFAKEgoogleKey0007 is invalid`:                                                           `key [redacted] is invalid`,
+		`prompt is too long: max_tokens: 64000 > 32000, status code: 400`:                                `prompt is too long: max_tokens: 64000 > 32000, status code: 400`,
+		`upstream closed: websocket: close 1011 (internal server error)`:                                 `upstream closed: websocket: close 1011 (internal server error)`,
+	}
+	for in, want := range cases {
+		if got := RedactText(in); got != want {
+			t.Errorf("RedactText(%q)\n got %q\nwant %q", in, got, want)
+		}
+	}
+}
+
+func TestRedactUpstreamURL(t *testing.T) {
+	cases := map[string]string{
+		"https://generativelanguage.example/v1beta/models/g:streamGenerateContent?alt=sse&key=AIzaFAKE0001": "https://generativelanguage.example/v1beta/models/g:streamGenerateContent?alt=sse&key=[redacted]",
+		"wss://chatgpt.example/backend-api/codex/responses":                                                 "wss://chatgpt.example/backend-api/codex/responses",
+		"https://u:fake-pass-0002@api.example/v1/messages?beta=true#frag":                                   "https://api.example/v1/messages?beta=true",
+		"https://azure.example/openai/responses?api-version=2025-04-01-preview&sig=fake-0003":               "https://azure.example/openai/responses?api-version=2025-04-01-preview&sig=[redacted]",
+		"": "",
+	}
+	for in, want := range cases {
+		if got := RedactUpstreamURL(in); got != want {
+			t.Errorf("RedactUpstreamURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

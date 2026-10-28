@@ -15,19 +15,36 @@ import (
 const (
 	EnvelopeVersion  = 1
 	RedactionVersion = 1
-	RecorderVersion  = "1a"
+	RecorderVersion  = "1b"
 )
 
-// Event types (design section 4). Slice 1a emits only a subset.
+// Event types (design section 4; docs/FLEET_FORK.md section 3 lists their fields).
 const (
-	TypeBoot         = "boot"
-	TypeShutdown     = "shutdown"
-	TypeHeartbeat    = "heartbeat"
-	TypeGap          = "gap"
-	TypeIngressStart = "ingress_start"
-	TypeIngressEnd   = "ingress_end"
-	TypeClientBody   = "client_body"
-	TypeMetadataOnly = "metadata_only"
+	TypeBoot                 = "boot"
+	TypeShutdown             = "shutdown"
+	TypeHeartbeat            = "heartbeat"
+	TypeGap                  = "gap"
+	TypeIngressStart         = "ingress_start"
+	TypeIngressEnd           = "ingress_end"
+	TypeClientBody           = "client_body"
+	TypeMetadataOnly         = "metadata_only"
+	TypeAttemptStart         = "attempt_start"
+	TypeAttemptEnd           = "attempt_end"
+	TypeUpstreamRequest      = "upstream_request"
+	TypeUpstreamResponseMeta = "upstream_response_meta"
+	TypeUpstreamEvent        = "upstream_event"
+	TypeUpstreamError        = "upstream_error"
+	TypeUpstreamWS           = "upstream_ws"
+	TypeDownstreamEvent      = "downstream_event"
+	TypeClientWSFrame        = "client_ws_frame"
+	TypeUsage                = "usage"
+)
+
+// Ingress kinds (design section 5).
+const (
+	KindHTTP         = "http"
+	KindWSConnection = "ws_connection"
+	KindWSTurn       = "ws_turn"
 )
 
 // Capture states (design section 4).
@@ -56,7 +73,17 @@ type Event struct {
 	Time         time.Time
 	IngressID    string
 	ConnectionID string
-	Capture      string
+	// TurnSeq is the WebSocket turn's order on its connection (from 1).
+	TurnSeq uint32
+	// AttemptSeq numbers the request's provider attempts (from 1); zero
+	// when the event belongs to no attempt.
+	AttemptSeq uint16
+	// SubAttempt numbers the attempt's outbound requests (from 0) on
+	// events about one of them; nil otherwise.
+	SubAttempt *uint16
+	Capture    string
+	// BodyDropped names why a body the event would carry was not captured.
+	BodyDropped string
 	// Body holds the exact bytes; the writer chooses the form and hashes them.
 	Body *BodyData
 	// Data holds per-type fields. It must marshal to a JSON object whose keys
@@ -74,20 +101,59 @@ type Event struct {
 	ingress *Ingress
 }
 
-// BodyData is a captured body.
+// BodyData is a captured body: Bytes, or Chunks in order when the capture
+// grew by appending buffers (the client body tee never copies what it read).
 type BodyData struct {
 	Bytes           []byte
+	Chunks          [][]byte
 	ContentEncoding string
 }
 
-// reservation charges a body's buffer by its capacity, which is what the
-// event keeps in memory until it is written; slack never pays for metadata.
-func (e *Event) reservation() int64 {
-	n := int64(eventOverhead) + e.SizeHint
-	if e.Body != nil {
-		n += int64(cap(e.Body.Bytes))
+// Len is the body's length in bytes.
+func (b *BodyData) Len() int64 {
+	if b == nil {
+		return 0
+	}
+	n := int64(len(b.Bytes))
+	for _, chunk := range b.Chunks {
+		n += int64(len(chunk))
 	}
 	return n
+}
+
+// capacity is what the body's buffers hold in memory.
+func (b *BodyData) capacity() int64 {
+	if b == nil {
+		return 0
+	}
+	n := int64(cap(b.Bytes))
+	for _, chunk := range b.Chunks {
+		n += int64(cap(chunk))
+	}
+	return n
+}
+
+// flat returns the body as one buffer. Only the writer joins chunks, off the
+// request path.
+func (b *BodyData) flat() []byte {
+	if len(b.Chunks) == 0 {
+		return b.Bytes
+	}
+	if len(b.Chunks) == 1 && len(b.Bytes) == 0 {
+		return b.Chunks[0]
+	}
+	out := make([]byte, 0, b.Len())
+	out = append(out, b.Bytes...)
+	for _, chunk := range b.Chunks {
+		out = append(out, chunk...)
+	}
+	return out
+}
+
+// reservation charges a body's buffers by their capacity, which is what the
+// event keeps in memory until it is written; slack never pays for metadata.
+func (e *Event) reservation() int64 {
+	return int64(eventOverhead) + e.SizeHint + e.Body.capacity()
 }
 
 type envelope struct {
@@ -98,8 +164,12 @@ type envelope struct {
 	Type         string        `json:"type"`
 	IngressID    string        `json:"ingress_id,omitempty"`
 	ConnectionID string        `json:"connection_id,omitempty"`
+	TurnSeq      uint32        `json:"turn_seq,omitempty"`
+	AttemptSeq   uint16        `json:"attempt_seq,omitempty"`
+	SubAttempt   *uint16       `json:"sub_attempt,omitempty"`
 	Body         *bodyEnvelope `json:"body,omitempty"`
 	Capture      string        `json:"capture,omitempty"`
+	BodyDropped  string        `json:"body_dropped,omitempty"`
 	CaptureDrops int64         `json:"capture_drops,omitempty"`
 }
 
@@ -120,23 +190,24 @@ func FormatTime(t time.Time) string {
 // bytes after decoding), anything else base64, and bodies over the threshold
 // are blobs referenced by hash. It returns the blob payload when one is due.
 func encodeBody(b *BodyData, threshold int64) (*bodyEnvelope, []byte) {
-	sum := sha256.Sum256(b.Bytes)
+	data := b.flat()
+	sum := sha256.Sum256(data)
 	env := &bodyEnvelope{
 		ContentEncoding: b.ContentEncoding,
-		Bytes:           int64(len(b.Bytes)),
+		Bytes:           int64(len(data)),
 		SHA256:          hex.EncodeToString(sum[:]),
 	}
 	switch {
-	case threshold > 0 && int64(len(b.Bytes)) > threshold:
+	case threshold > 0 && int64(len(data)) > threshold:
 		env.Form = FormBlob
-		return env, b.Bytes
-	case utf8.Valid(b.Bytes):
+		return env, data
+	case utf8.Valid(data):
 		env.Form = FormText
-		value := string(b.Bytes)
+		value := string(data)
 		env.Value = &value
 	default:
 		env.Form = FormBase64
-		value := base64.StdEncoding.EncodeToString(b.Bytes)
+		value := base64.StdEncoding.EncodeToString(data)
 		env.Value = &value
 	}
 	return env, nil

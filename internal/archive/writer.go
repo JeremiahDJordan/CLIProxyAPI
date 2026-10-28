@@ -29,6 +29,9 @@ type writer struct {
 	seg  *segment
 	segN int
 	seq  uint64
+	// unclosed holds segments whose close failed; recovery retries them, so
+	// a failed close never strands an .open.jsonl for the life of the process.
+	unclosed []*segment
 
 	dirty         bool
 	lastTick      time.Time
@@ -48,6 +51,7 @@ type writer struct {
 	segmentsClosed atomic.Uint64
 	blobsWritten   atomic.Uint64
 	blobsReused    atomic.Uint64
+	blobsRewritten atomic.Uint64
 	writerErrors   atomic.Uint64
 }
 
@@ -57,6 +61,8 @@ type segment struct {
 	path   string
 	opened time.Time
 	size   int64
+	// Close progress, so a retry resumes where the failed close stopped.
+	synced, fileClosed, renamed bool
 }
 
 func newWriter(r *Recorder, free uint64) *writer {
@@ -106,6 +112,7 @@ type statsData struct {
 	SegmentsClosed uint64               `json:"segments_closed"`
 	BlobsWritten   uint64               `json:"blobs_written"`
 	BlobsReused    uint64               `json:"blobs_reused"`
+	BlobsRewritten uint64               `json:"blobs_rewritten"`
 	WriterErrors   uint64               `json:"writer_errors"`
 	TapPanics      int64                `json:"tap_panics"`
 	FreeBytes      uint64               `json:"free_bytes"`
@@ -205,6 +212,7 @@ func (w *writer) drain(items []*queued) error {
 		item := w.inflight[0]
 		if item.flushed != nil {
 			close(item.flushed)
+			w.inflight[0] = nil
 			w.inflight = w.inflight[1:]
 			continue
 		}
@@ -212,6 +220,9 @@ func (w *writer) drain(items []*queued) error {
 			return err
 		}
 		w.r.q.release(item.reserved)
+		// Drop the written item from the batch's backing array, so its body
+		// can be collected before the rest of the batch is written.
+		w.inflight[0] = nil
 		w.inflight = w.inflight[1:]
 		// A long batch must not hold off fsync, space checks or rotation.
 		if now := time.Now(); now.Sub(w.lastTick) >= w.opts.FsyncInterval {
@@ -234,7 +245,9 @@ func (w *writer) tick(now time.Time) error {
 		}
 	}
 	if now.Sub(w.lastSpace) >= w.opts.SpaceCheckInterval {
-		w.checkSpace(now)
+		if err := w.checkSpace(now); err != nil {
+			return err
+		}
 	}
 	if err := w.flushGap(now); err != nil {
 		return err
@@ -257,18 +270,22 @@ func (w *writer) tick(now time.Time) error {
 	return nil
 }
 
-func (w *writer) checkSpace(now time.Time) {
+// checkSpace re-runs the start-up spool checks (ZFS, sentinel, modes and
+// group) and reads the free space. A spool that fails them (the pool was
+// unmounted, say) is a writer failure: capture stops until recovery finds
+// the spool safe again.
+func (w *writer) checkSpace(now time.Time) error {
 	w.lastSpace = now
-	st, err := statFS(w.spool)
+	st, err := checkSpool(w.opts)
 	if err != nil {
-		log.WithError(err).Warn("request archive: cannot read spool free space")
-		return
+		return fmt.Errorf("spool check: %w", err)
 	}
 	w.free.Store(st.free)
 	mode := spaceModeFor(st.free, w.opts)
 	if old := w.r.spaceMode.Swap(mode); old != mode {
 		log.WithFields(log.Fields{"free_bytes": st.free, "capture_state": w.captureState()}).Warn("request archive: spool free space changed capture")
 	}
+	return nil
 }
 
 // flushGap reports pending drops once capture is healthy. While space is low
@@ -323,6 +340,7 @@ func (w *writer) stats(reason string) statsData {
 		SegmentsClosed: w.segmentsClosed.Load(),
 		BlobsWritten:   w.blobsWritten.Load(),
 		BlobsReused:    w.blobsReused.Load(),
+		BlobsRewritten: w.blobsRewritten.Load(),
 		WriterErrors:   w.writerErrors.Load(),
 		TapPanics:      tapPanics.Load(),
 		FreeBytes:      w.free.Load(),
@@ -341,7 +359,11 @@ func (w *writer) writeEvent(ev *Event) error {
 		Type:         ev.Type,
 		IngressID:    ev.IngressID,
 		ConnectionID: ev.ConnectionID,
+		TurnSeq:      ev.TurnSeq,
+		AttemptSeq:   ev.AttemptSeq,
+		SubAttempt:   ev.SubAttempt,
 		Capture:      ev.Capture,
+		BodyDropped:  ev.BodyDropped,
 	}
 	if ev.ReportDrops {
 		env.CaptureDrops = ev.ingress.Drops()
@@ -355,19 +377,32 @@ func (w *writer) writeEvent(ev *Event) error {
 		log.WithError(errEncode).WithField("type", ev.Type).Error("request archive: dropping an event that cannot be encoded")
 		d := DropCount{Events: 1}
 		if ev.Body != nil {
-			d.Bodies, d.Bytes = 1, int64(len(ev.Body.Bytes))
+			d.Bodies, d.Bytes = 1, ev.Body.Len()
 		}
 		w.r.ledger.add(DropEncodeError, d)
 		ev.ingress.NoteDrop()
 		return nil
 	}
+	var reused *os.File
 	if blob != nil {
-		if err := w.writeBlob(env.Body.SHA256, blob); err != nil {
+		var err error
+		if reused, err = w.writeBlob(env.Body.SHA256, blob); err != nil {
 			return err
 		}
 	}
-	if err := w.writeLine(line); err != nil {
-		return err
+	errLine := w.writeLine(line)
+	if reused != nil {
+		// The shipper deletes a blob once it has archived an earlier segment
+		// that references it, so a reused blob can vanish before this event
+		// is written. Write it again then: the event's blob is in the spool
+		// once its event is.
+		errKeep := w.keepReusedBlob(reused, env.Body.SHA256, blob)
+		if errLine == nil {
+			errLine = errKeep
+		}
+	}
+	if errLine != nil {
+		return errLine
 	}
 	w.seq++
 	w.eventsWritten.Add(1)
@@ -457,32 +492,71 @@ func (w *writer) endFailedSegment() {
 	}
 	_ = seg.f.Truncate(seg.size)
 	if err := w.closeSegment(); err != nil {
-		log.WithError(err).Error("request archive: cannot close the failed segment")
+		log.WithError(err).Error("request archive: cannot close the failed segment; recovery retries it")
 	}
 }
 
-// closeSegment fsyncs, renames to .closed.jsonl and fsyncs the directory.
+// closeSegment fsyncs, renames to .closed.jsonl and fsyncs the directory. A
+// segment whose close fails is kept in unclosed for recovery to finish.
 func (w *writer) closeSegment() error {
 	seg := w.seg
 	w.seg = nil
 	w.dirty = false
-	if err := seg.f.Sync(); err != nil {
-		_ = seg.f.Close()
-		return fmt.Errorf("sync segment %s: %w", seg.path, err)
+	if err := w.finishSegment(seg); err != nil {
+		w.unclosed = append(w.unclosed, seg)
+		return err
 	}
-	trace("segment.sync", seg.path)
-	if err := seg.f.Close(); err != nil {
-		return fmt.Errorf("close segment %s: %w", seg.path, err)
+	return nil
+}
+
+// finishSegment runs the close steps not yet done for seg.
+func (w *writer) finishSegment(seg *segment) error {
+	if !seg.fileClosed {
+		if !seg.synced {
+			if err := fault("segment.close"); err != nil {
+				return fmt.Errorf("sync segment %s: %w", seg.path, err)
+			}
+			if err := seg.f.Sync(); err != nil {
+				return fmt.Errorf("sync segment %s: %w", seg.path, err)
+			}
+			seg.synced = true
+			trace("segment.sync", seg.path)
+		}
+		// The descriptor is released even when Close reports an error.
+		errClose := seg.f.Close()
+		seg.fileClosed = true
+		if errClose != nil {
+			return fmt.Errorf("close segment %s: %w", seg.path, errClose)
+		}
 	}
 	closed := filepath.Join(w.spool, seg.name+".closed.jsonl")
-	if err := os.Rename(seg.path, closed); err != nil {
-		return fmt.Errorf("close segment %s: %w", seg.path, err)
+	if !seg.renamed {
+		if err := fault("segment.rename"); err != nil {
+			return fmt.Errorf("close segment %s: %w", seg.path, err)
+		}
+		if err := os.Rename(seg.path, closed); err != nil {
+			return fmt.Errorf("close segment %s: %w", seg.path, err)
+		}
+		seg.renamed = true
+		trace("segment.rename", closed)
 	}
-	trace("segment.rename", closed)
 	if err := syncDir(w.spool); err != nil {
 		return err
 	}
 	w.segmentsClosed.Add(1)
+	return nil
+}
+
+// finishUnclosed retries the close of every segment whose close failed.
+func (w *writer) finishUnclosed() error {
+	for len(w.unclosed) > 0 {
+		if err := w.finishSegment(w.unclosed[0]); err != nil {
+			return err
+		}
+		w.unclosed[0] = nil
+		w.unclosed = w.unclosed[1:]
+	}
+	w.unclosed = nil
 	return nil
 }
 
@@ -501,22 +575,54 @@ func (w *writer) sync() error {
 	return nil
 }
 
-// writeBlob persists a blob durably before any event references it.
-func (w *writer) writeBlob(sum string, data []byte) error {
+// writeBlob persists a blob durably before any event references it. When a
+// blob of that name and size is already there it is reused, and returned
+// open so keepReusedBlob can check it is still the same file once the event
+// is written.
+func (w *writer) writeBlob(sum string, data []byte) (*os.File, error) {
 	final := filepath.Join(w.blobDir, sum)
 	if info, err := os.Lstat(final); err == nil && info.Mode().IsRegular() && info.Size() == int64(len(data)) {
-		// An earlier attempt may have renamed the blob into place and then
-		// failed; finish its durability before an event references it.
-		if err = syncFile(final); err != nil {
-			return fmt.Errorf("write blob %s: %w", sum, err)
+		f, errOpen := os.Open(final)
+		if errOpen == nil {
+			// An earlier attempt may have renamed the blob into place and
+			// then failed; finish its durability before an event references it.
+			if err = f.Sync(); err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("write blob %s: %w", sum, err)
+			}
+			trace("blob.reuse", final)
+			if err = w.syncBlobDir(); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			w.blobsReused.Add(1)
+			return f, nil
 		}
-		trace("blob.reuse", final)
-		if err = w.syncBlobDir(); err != nil {
-			return err
-		}
-		w.blobsReused.Add(1)
+		// Gone since the Lstat: write it again below.
+	}
+	return nil, w.writeBlobFile(sum, final, data)
+}
+
+// keepReusedBlob closes a reused blob and writes it again when the name no
+// longer refers to that file (the shipper deleted it meanwhile).
+func (w *writer) keepReusedBlob(reused *os.File, sum string, data []byte) error {
+	held, errHeld := reused.Stat()
+	_ = reused.Close()
+	final := filepath.Join(w.blobDir, sum)
+	if current, err := os.Lstat(final); err == nil && errHeld == nil && os.SameFile(current, held) {
 		return nil
 	}
+	trace("blob.rewrite", final)
+	if err := w.writeBlobFile(sum, final, data); err != nil {
+		return err
+	}
+	w.blobsRewritten.Add(1)
+	return nil
+}
+
+// writeBlobFile writes data to a temporary name, fsyncs, makes it 0640,
+// renames it to final and fsyncs the directory.
+func (w *writer) writeBlobFile(sum, final string, data []byte) error {
 	tmp, err := os.CreateTemp(w.blobDir, ".tmp-"+sum+"-*")
 	if err != nil {
 		return err
@@ -566,19 +672,6 @@ func (w *writer) syncBlobDir() error {
 	return nil
 }
 
-func syncFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	errSync := f.Sync()
-	errClose := f.Close()
-	if errSync != nil {
-		return errSync
-	}
-	return errClose
-}
-
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -595,6 +688,9 @@ func syncDir(dir string) error {
 func (w *writer) shutdown() error {
 	if err := w.drain(w.r.q.close()); err != nil {
 		return err
+	}
+	if err := w.finishUnclosed(); err != nil {
+		log.WithError(err).Error("request archive: a segment could not be closed at shutdown; the shipper recovers it after exit")
 	}
 	now := time.Now()
 	if err := w.flushGap(now); err != nil {
@@ -661,6 +757,17 @@ func (w *writer) recoverFromFailure(backoff *time.Duration) bool {
 }
 
 func (w *writer) reopen() error {
+	// The spool may have been unmounted or changed: check it as at start
+	// before writing anything, then finish the segments left unclosed.
+	st, errCheck := checkSpool(w.opts)
+	if errCheck != nil {
+		return fmt.Errorf("spool check: %w", errCheck)
+	}
+	w.free.Store(st.free)
+	w.r.spaceMode.Store(spaceModeFor(st.free, w.opts))
+	if err := w.finishUnclosed(); err != nil {
+		return err
+	}
 	pending, since, prior, _ := w.r.ledger.pendingSnapshot()
 	gap := gapData{Reason: DropWriterError, Drops: pending, PriorBootID: prior}
 	if w.failure != nil {
@@ -699,7 +806,7 @@ func (w *writer) dropQueued(item *queued, reason string) {
 	w.r.q.release(item.reserved)
 	d := DropCount{Events: 1}
 	if item.ev != nil && item.ev.Body != nil {
-		d.Bodies, d.Bytes = 1, int64(len(item.ev.Body.Bytes))
+		d.Bodies, d.Bytes = 1, item.ev.Body.Len()
 	}
 	w.r.ledger.add(reason, d)
 	if item.ev != nil {

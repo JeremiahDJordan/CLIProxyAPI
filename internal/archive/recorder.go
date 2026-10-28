@@ -37,13 +37,32 @@ const (
 	spaceStopped
 )
 
+// Bounds on the recorder's work outside its writer goroutine, so a spool
+// that hangs (a suspended pool with ZFS failmode=wait) never holds up the
+// proxy's start or shutdown.
+const (
+	// startTimeout bounds Start: the disk work runs on its own goroutine and
+	// capture stays off when it does not finish in time.
+	startTimeout = 5 * time.Second
+	// stopObserverWait bounds how long Stop waits for requests and turns in
+	// flight to queue their final events before it finalizes them itself.
+	stopObserverWait = 2 * time.Second
+	// stopWriterWait bounds how long Stop waits for the writer's final drain.
+	stopWriterWait = 10 * time.Second
+	// lateStopTimeout bounds stopping a recorder whose start finished late.
+	lateStopTimeout = 30 * time.Second
+)
+
 var (
 	current atomic.Pointer[Recorder]
 
 	lifecycleMu    sync.Mutex
 	startAttempted bool
+
 	// heldLocks keeps every boot lock descriptor reachable (and therefore
-	// open and locked) for the life of the process.
+	// open and locked) for the life of the process. Its own lock, because a
+	// start that runs late appends to it while Start no longer waits.
+	locksMu   sync.Mutex
 	heldLocks []*os.File
 
 	tapPanics    atomic.Int64
@@ -68,6 +87,11 @@ type StartParams struct {
 // never turns capture on or off, whichever configuration came first. It
 // returns nil when capture is disabled or refused; refusals are logged and
 // counted as a gap.
+//
+// The start's disk work (statfs, the boot lock, the boot event) runs on its
+// own goroutine. When it does not finish within startTimeout, Start returns
+// nil and capture stays off for the process; a start that finishes later
+// counts start_timeout as a gap and stops at once.
 func Start(p StartParams) *Recorder {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
@@ -78,18 +102,61 @@ func Start(p StartParams) *Recorder {
 	if !p.Config.Enabled {
 		return nil
 	}
-	rec, err := start(p)
-	if err != nil {
-		log.WithError(err).Warn("request archive: capture is off")
+	type started struct {
+		rec *Recorder
+		err error
+	}
+	done := make(chan started, 1)
+	go func() {
+		var res started
+		defer func() {
+			if rv := recover(); rv != nil {
+				res = started{err: fmt.Errorf("start panicked: %v", rv)}
+			}
+			done <- res
+		}()
+		res.rec, res.err = start(p)
+	}()
+	timer := time.NewTimer(startTimeoutFor())
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			log.WithError(res.err).Warn("request archive: capture is off")
+			return nil
+		}
+		current.Store(res.rec)
+		log.WithFields(log.Fields{"boot_id": res.rec.bootID, "spool": res.rec.opts.SpoolDir}).Info("request archive: capture started")
+		return res.rec
+	case <-timer.C:
+		log.WithField("timeout", startTimeoutFor().String()).Warn("request archive: start did not finish in time (is the spool pool suspended?); capture is off for this process")
+		go func() {
+			res := <-done
+			if res.rec != nil {
+				res.rec.abandonLateStart()
+			}
+		}()
 		return nil
 	}
-	current.Store(rec)
-	log.WithFields(log.Fields{"boot_id": rec.bootID, "spool": rec.opts.SpoolDir}).Info("request archive: capture started")
-	return rec
 }
 
-// Stop drains the queue, writes the shutdown event and closes the open
-// segment. The boot lock stays held until the process exits.
+// abandonLateStart stops a recorder whose start finished after Start gave
+// up on it. It was never installed; its boot records the timeout as a gap.
+func (r *Recorder) abandonLateStart() {
+	r.ledger.add(DropStartTimeout, DropCount{Events: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), lateStopTimeout)
+	defer cancel()
+	if err := r.stop(ctx); err != nil {
+		log.WithError(err).Warn("request archive: stopping the late start did not finish")
+	}
+	log.WithField("boot_id", r.bootID).Warn("request archive: a late start finished and was stopped; capture stays off")
+	trace("start.abandoned", r.opts.SpoolDir)
+}
+
+// Stop finalizes what is in flight, drains the queue, writes the shutdown
+// event and closes the open segment. Its waits are bounded (stopObserverWait,
+// stopWriterWait, and ctx), so a hung spool never holds up shutdown. The boot
+// lock stays held until the process exits.
 func Stop(ctx context.Context) error {
 	lifecycleMu.Lock()
 	rec := current.Swap(nil)
@@ -121,6 +188,14 @@ type Recorder struct {
 	capturesMu     sync.Mutex
 	captures       map[PendingCapture]struct{}
 	capturesClosed bool
+
+	// observers holds requests and WebSocket turns that have not queued
+	// their final event yet. Stop waits for them (bounded) and then
+	// finalizes the rest; observersChanged is signalled on each untrack.
+	observersMu      sync.Mutex
+	observers        map[PendingCapture]struct{}
+	observersClosed  bool
+	observersChanged chan struct{}
 }
 
 type refusal struct {
@@ -141,6 +216,9 @@ func start(p StartParams) (*Recorder, error) {
 		return nil, refuse(opts.StateDir, DropStartRefusedSteering,
 			errors.New("codex.response-steering is on; capture refuses to start until duplex turn tagging exists"))
 	}
+	if err := fault("start.check"); err != nil {
+		return nil, refuse(opts.StateDir, DropStartRefusedSpool, err)
+	}
 	fsInfo, errCheck := checkSpool(opts)
 	if errCheck != nil {
 		return nil, refuse(opts.StateDir, DropStartRefusedSpool, errCheck)
@@ -160,6 +238,9 @@ func start(p StartParams) (*Recorder, error) {
 		stopCh:      make(chan struct{}),
 		done:        make(chan struct{}),
 		captures:    map[PendingCapture]struct{}{},
+
+		observers:        map[PendingCapture]struct{}{},
+		observersChanged: make(chan struct{}, 1),
 	}
 	rec.spaceMode.Store(spaceModeFor(fsInfo.free, opts))
 
@@ -168,7 +249,9 @@ func start(p StartParams) (*Recorder, error) {
 	if errLock != nil {
 		return nil, refuse(opts.StateDir, DropStartRefusedSpool, fmt.Errorf("create boot lock: %w", errLock))
 	}
+	locksMu.Lock()
 	heldLocks = append(heldLocks, lock)
+	locksMu.Unlock()
 
 	if errLoad := rec.ledger.load(); errLoad != nil {
 		log.WithError(errLoad).Warn("request archive: cannot read persisted drop counters")
@@ -259,6 +342,12 @@ func (r *Recorder) CaptureEvents() bool {
 	return r != nil && !r.stopping.Load() && r.writerOK.Load() && r.spaceMode.Load() != spaceStopped
 }
 
+// acceptsEvents reports whether emit queues events at all. Unlike
+// CaptureEvents it stays true while Stop finalizes what is in flight.
+func (r *Recorder) acceptsEvents() bool {
+	return r.writerOK.Load() && r.spaceMode.Load() != spaceStopped
+}
+
 // CaptureBodies reports whether bodies would be accepted.
 func (r *Recorder) CaptureBodies() bool {
 	return r.CaptureEvents() && r.spaceMode.Load() == spaceOK
@@ -312,7 +401,7 @@ func (r *Recorder) emit(ev *Event, reserved int64) bool {
 		d := DropCount{Events: 1}
 		if ev.Body != nil {
 			d.Bodies = 1
-			d.Bytes = int64(len(ev.Body.Bytes))
+			d.Bytes = ev.Body.Len()
 		}
 		r.ledger.add(reason, d)
 		return false
@@ -320,7 +409,7 @@ func (r *Recorder) emit(ev *Event, reserved int64) bool {
 	// Stopping refuses new captures and reservations, not events: Stop
 	// finalizes the pending captures after it begins, and the writer's
 	// close of the queue is the cut-off.
-	if !r.writerOK.Load() || r.spaceMode.Load() == spaceStopped || (ev.Body != nil && !r.CaptureBodies()) {
+	if !r.acceptsEvents() || (ev.Body != nil && !r.CaptureBodies()) {
 		return drop(r.BodyDropReason())
 	}
 	if extra := ev.reservation() - reserved; extra > 0 {
@@ -369,6 +458,77 @@ func (r *Recorder) UntrackCapture(p PendingCapture) {
 	r.capturesMu.Unlock()
 }
 
+// TrackObserver registers a request or WebSocket turn whose final event is
+// not queued yet. It fails once Stop has begun finalizing observers.
+func (r *Recorder) TrackObserver(p PendingCapture) bool {
+	if r == nil || p == nil {
+		return false
+	}
+	r.observersMu.Lock()
+	defer r.observersMu.Unlock()
+	if r.observersClosed {
+		return false
+	}
+	r.observers[p] = struct{}{}
+	return true
+}
+
+// UntrackObserver removes p once its final event is queued (or handed to a
+// tracked capture).
+func (r *Recorder) UntrackObserver(p PendingCapture) {
+	if r == nil || p == nil {
+		return
+	}
+	r.observersMu.Lock()
+	delete(r.observers, p)
+	r.observersMu.Unlock()
+	select {
+	case r.observersChanged <- struct{}{}:
+	default:
+	}
+}
+
+// finalizeObservers waits until every tracked observer has queued its final
+// event, at most until the earlier of stopObserverWait and half of ctx's
+// remaining time (the writer's drain needs the rest), and then finalizes
+// those still open. A WebSocket's handler finishes before its observer, and
+// HTTP shutdown ignores hijacked connections, so without this wait a clean
+// drain could lose the connection's ingress_end.
+func (r *Recorder) finalizeObservers(ctx context.Context) {
+	wait := stopObserverWaitFor()
+	if deadline, ok := ctx.Deadline(); ok {
+		wait = min(wait, time.Until(deadline)/2)
+	}
+	timer := time.NewTimer(max(wait, 0))
+	defer timer.Stop()
+	for waiting := true; waiting; {
+		r.observersMu.Lock()
+		left := len(r.observers)
+		r.observersMu.Unlock()
+		if left == 0 {
+			break
+		}
+		select {
+		case <-r.observersChanged:
+		case <-timer.C:
+			waiting = false
+		case <-ctx.Done():
+			waiting = false
+		}
+	}
+	r.observersMu.Lock()
+	pending := r.observers
+	r.observers = nil
+	r.observersClosed = true
+	r.observersMu.Unlock()
+	if len(pending) > 0 {
+		log.WithField("open", len(pending)).Warn("request archive: finalizing requests still open at shutdown")
+	}
+	for p := range pending {
+		p.FinalizeAtStop()
+	}
+}
+
 // finalizeCaptures closes the registry and finalizes what it held. Captures
 // lock themselves, so it runs without holding capturesMu.
 func (r *Recorder) finalizeCaptures() {
@@ -410,24 +570,42 @@ func (r *Recorder) stop(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	r.stopOnce.Do(func() {
-		// Refuse new captures and reservations, then end the pending ones
-		// without waiting for their reads, so their events are queued before
-		// the writer's final drain and no reservation outlives it.
+		// Refuse new captures and observations, let those in flight queue
+		// their final events (bounded), finalize the rest, then end the
+		// pending body captures without waiting for their reads, so every
+		// event is queued before the writer's final drain and no
+		// reservation outlives it.
 		r.stopping.Store(true)
+		r.finalizeObservers(ctx)
 		r.finalizeCaptures()
 		close(r.stopCh)
 	})
+	timer := time.NewTimer(stopWriterWaitFor())
+	defer timer.Stop()
 	select {
 	case <-r.done:
-		// Taps still finishing may have counted drops after the writer's
-		// last write of the state file. Persist those; later ones, which
-		// nothing could persist, are not counted (their requests have no
-		// ingress_end, so they show as incomplete).
-		r.ledger.close()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errors.New("archive: the writer did not finish its final drain in time")
+	}
+	// Taps still finishing may have counted drops after the writer's last
+	// write of the state file. Persist those (on another goroutine: it is
+	// disk work); later ones, which nothing could persist, are not counted
+	// (their requests have no ingress_end, so they show as incomplete).
+	r.ledger.close()
+	persisted := make(chan struct{})
+	go func() {
+		defer close(persisted)
 		r.w.persistLedger()
+	}()
+	select {
+	case <-persisted:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-timer.C:
+		return errors.New("archive: persisting the drop counters did not finish in time")
 	}
 }
 

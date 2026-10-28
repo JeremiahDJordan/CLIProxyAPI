@@ -297,3 +297,63 @@ func QueryNames(rawQuery string) []string {
 func isQueryName(name string) bool {
 	return safeQueryName.MatchString(name) && !looksLikeKey(name)
 }
+
+// upstreamQuery is the typed allowlist for outbound request URLs: values
+// that select a response format or API version. Every other value (a
+// ?key= API key, say) is redacted.
+var upstreamQuery = QueryAllowlist{
+	"alt":            EnumValue("sse", "json", "proto"),
+	"$alt":           EnumValue("sse", "json", "proto"),
+	"beta":           BoolValue,
+	"client_version": VersionValue,
+	"model":          ModelValue,
+	"api-version":    func(value string) bool { return apiVersionValue.MatchString(value) },
+}
+
+var apiVersionValue = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}(-preview)?$|^v[0-9]{1,2}(beta|alpha)?[0-9]?$`)
+
+// RedactUpstreamURL keeps an outbound URL's scheme, host and path and the
+// values of the upstream allowlist; other query values, the fragment and user
+// information are redacted or dropped. A value that does not parse is Redacted.
+func RedactUpstreamURL(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || u.Opaque != "" {
+		return Redacted
+	}
+	u.User = nil
+	u.RawQuery = RedactQuery(u.RawQuery, upstreamQuery)
+	u.Fragment, u.RawFragment = "", ""
+	return u.String()
+}
+
+var (
+	textURL    = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>` + "`" + `]+`)
+	textScheme = regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=\-]{4,}`)
+	// A name that suggests a credential, an assignment and its value.
+	textPair  = regexp.MustCompile(`(?i)([A-Za-z0-9_.\-]*(?:key|token|secret|password|passwd|signature|credential|cookie)[A-Za-z0-9_.\-]*)(["']?\s*[:=]\s*["']?)([^\s"'&,;}\[\])]+)`)
+	textShape = regexp.MustCompile(`\b(?:sk-|sk_|rk_|pk_|AIza|ya29\.|ghp_|gho_|github_pat_|glpat-|xox[a-z]-|AKIA)[A-Za-z0-9._\-]{6,}`)
+	allDigits = regexp.MustCompile(`^[0-9]+$`)
+)
+
+// RedactText redacts credentials in free text such as error messages: URLs
+// get RedactURL, authorization schemes, values assigned to credential-like
+// names (except plain numbers, such as a token count) and key-shaped words
+// become Redacted.
+func RedactText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = textURL.ReplaceAllStringFunc(s, RedactURL)
+	s = textScheme.ReplaceAllString(s, "${1} "+Redacted)
+	s = textPair.ReplaceAllStringFunc(s, func(match string) string {
+		parts := textPair.FindStringSubmatch(match)
+		if allDigits.MatchString(parts[3]) || parts[3] == Redacted {
+			return match
+		}
+		return parts[1] + parts[2] + Redacted
+	})
+	return textShape.ReplaceAllString(s, Redacted)
+}

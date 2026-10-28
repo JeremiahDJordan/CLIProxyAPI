@@ -37,6 +37,10 @@ type TestOverrides struct {
 	SegmentMaxBytes    int64
 	QueueBytes         int64
 	BlobThresholdBytes int64
+	// Lifecycle bounds; zero keeps the production value.
+	StartTimeout     time.Duration
+	StopObserverWait time.Duration
+	StopWriterWait   time.Duration
 }
 
 var (
@@ -75,11 +79,34 @@ func resetForTest() {
 	_ = Stop(ctx)
 	lifecycleMu.Lock()
 	startAttempted = false
+	lifecycleMu.Unlock()
+	locksMu.Lock()
 	for _, f := range heldLocks {
 		_ = f.Close()
 	}
 	heldLocks = nil
-	lifecycleMu.Unlock()
+	locksMu.Unlock()
+}
+
+func startTimeoutFor() time.Duration {
+	if o := overrides.Load(); o != nil && o.StartTimeout > 0 {
+		return o.StartTimeout
+	}
+	return startTimeout
+}
+
+func stopObserverWaitFor() time.Duration {
+	if o := overrides.Load(); o != nil && o.StopObserverWait > 0 {
+		return o.StopObserverWait
+	}
+	return stopObserverWait
+}
+
+func stopWriterWaitFor() time.Duration {
+	if o := overrides.Load(); o != nil && o.StopWriterWait > 0 {
+		return o.StopWriterWait
+	}
+	return stopWriterWait
 }
 
 // FlushForTest waits until the running recorder has written everything

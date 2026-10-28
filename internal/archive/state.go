@@ -25,6 +25,11 @@ const (
 	DropStartRefusedSteering = "start_refused_steering"
 	DropStartRefusedSpool    = "start_refused_spool"
 	DropStartRefusedConfig   = "start_refused_config"
+	// DropStartTimeout counts a start whose disk work did not finish in time.
+	DropStartTimeout = "start_timeout"
+	// DropSteeringTurns counts WebSocket connections whose turns were not
+	// recorded because codex.response-steering was on for them.
+	DropSteeringTurns = "steering_turns"
 )
 
 const stateFileName = "drops.json"
