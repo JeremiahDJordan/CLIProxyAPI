@@ -96,11 +96,21 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			if kind != websocket.TextMessage && kind != websocket.BinaryMessage {
 				continue
 			}
+			// fleet: count the frame before parsing it; once the socket closes for a
+			// drain the client sees the close and resends (drain_fleet.go).
+			admission := responsesWebsocketAdmissionFrom(ctx)
+			if !admission.admit() {
+				return
+			}
+			if responsesWebsocketReadHookForTest != nil {
+				responsesWebsocketReadHookForTest()
+			}
 			// Control frames bypass response.create normalization. The original
 			// response_id, mode, and extension fields must reach upstream unchanged.
 			if json.Valid(payload) && gjson.GetBytes(payload, "type").String() == "response.interrupt" {
 				appendResponsesInterruptDiagnostic(timeline, payload, "")
 				errInterrupt := interrupt(payload)
+				admission.unadmit()
 				switch {
 				case errInterrupt == nil:
 					appendResponsesInterruptDiagnostic(timeline, payload, "handled")

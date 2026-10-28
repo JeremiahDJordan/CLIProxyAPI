@@ -62,6 +62,10 @@ func (*drainGatedExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Re
 // newDrainWebsocket serves the Responses WebSocket with a tracker in the request
 // context, as the API server's drain middleware provides it, and dials it.
 func newDrainWebsocket(t *testing.T) (*fleetdrain.Tracker, *drainGatedExecutor, *websocket.Conn) {
+	return newDrainWebsocketWithConfig(t, &sdkconfig.SDKConfig{})
+}
+
+func newDrainWebsocketWithConfig(t *testing.T, cfg *sdkconfig.SDKConfig) (*fleetdrain.Tracker, *drainGatedExecutor, *websocket.Conn) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	executor := &drainGatedExecutor{started: make(chan struct{}, 4), release: make(chan struct{})}
@@ -75,10 +79,13 @@ func newDrainWebsocket(t *testing.T) (*fleetdrain.Tracker, *drainGatedExecutor, 
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 
 	tracker := fleetdrain.New()
-	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, manager))
 	router := gin.New()
-	router.Use(func(c *gin.Context) {
-		c.Request = c.Request.WithContext(fleetdrain.WithTracker(c.Request.Context(), tracker))
+	router.Use(func(c *gin.Context) { // as the API server's drain middleware does
+		end := tracker.BeginRequest()
+		defer end()
+		c.Request = c.Request.WithContext(fleetdrain.WithRequest(fleetdrain.WithTracker(c.Request.Context(), tracker), end))
+		c.Next()
 	})
 	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
 	server := httptest.NewServer(router)
@@ -89,7 +96,8 @@ func newDrainWebsocket(t *testing.T) (*fleetdrain.Tracker, *drainGatedExecutor, 
 		t.Fatalf("dial websocket: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	waitDrainActivity(t, tracker, func(a fleetdrain.Activity) bool { return a.WebSockets == 1 })
+	// Once upgraded, the connection is counted instead of the request.
+	waitDrainActivity(t, tracker, func(a fleetdrain.Activity) bool { return a.WebSockets == 1 && a.Requests == 0 })
 	return tracker, executor, conn
 }
 
@@ -168,5 +176,57 @@ func TestResponsesWebsocketDrainFinishesTurnBeforeClosing(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("drain did not finish after the turn: %+v", tracker.Snapshot())
+	}
+}
+
+func TestResponsesWebsocketDrainAnswersAFrameAlreadyRead(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	resume := make(chan struct{})
+	responsesWebsocketReadHookForTest = func() {
+		reached <- struct{}{}
+		<-resume
+	}
+	t.Cleanup(func() { responsesWebsocketReadHookForTest = nil })
+	tracker, executor, conn := newDrainWebsocket(t)
+	close(executor.release)
+
+	request := `{"type":"response.create","model":"drain-model","input":[{"type":"message","role":"user","content":"hi"}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-reached: // read, not yet parsed or queued
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader never read the frame")
+	}
+	if got := tracker.Snapshot(); got.WebSocketTurns != 1 || got.Quiet {
+		t.Fatalf("a frame being read is a turn in flight: %+v", got)
+	}
+	tracker.StartDrain()
+	time.Sleep(100 * time.Millisecond)
+	if got := tracker.Snapshot(); got.WebSockets != 1 || got.WebSocketTurns != 1 {
+		t.Fatalf("socket closed while its frame was held: %+v", got)
+	}
+	close(resume)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("the held frame was dropped: %v", err)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("response type = %q, want %q: %s", got, wsEventTypeCompleted, payload)
+	}
+	expectServiceRestartClose(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracker.Wait(ctx); err != nil {
+		t.Fatalf("drain did not finish after the held frame: %v (%+v)", err, tracker.Snapshot())
+	}
+}
+
+func TestResponsesWebsocketSteeringSessionCountsAsBusy(t *testing.T) {
+	tracker, _, _ := newDrainWebsocketWithConfig(t, &sdkconfig.SDKConfig{CodexResponseSteering: true})
+	if got := tracker.Snapshot(); got.SteeringWebSockets != 1 || got.Quiet {
+		t.Fatalf("a steering session must not look quiet: %+v", got)
 	}
 }

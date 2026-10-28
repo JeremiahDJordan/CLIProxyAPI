@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -36,7 +37,7 @@ func waitForActivity(t *testing.T, tracker *fleetdrain.Tracker, ok func(fleetdra
 	}
 }
 
-func TestDrainTrackerCountsRequestsButNotUpgradesOrActivity(t *testing.T) {
+func TestDrainTrackerCountsRequestsButNotActivity(t *testing.T) {
 	s := newTestServer(t)
 	release := make(chan struct{})
 	entered := make(chan *fleetdrain.Tracker, 3)
@@ -65,14 +66,14 @@ func TestDrainTrackerCountsRequestsButNotUpgradesOrActivity(t *testing.T) {
 	}
 
 	got := s.drain.Snapshot()
-	if got.Requests != 1 || got.Quiet {
-		t.Fatalf("one plain request should be counted, upgrades not: %+v", got)
+	if got.Requests != 2 || got.Quiet {
+		t.Fatalf("both requests should be counted; an Upgrade header alone exempts nothing: %+v", got)
 	}
 	// The activity route is not counted, so a poller never sees itself.
 	recorder := httptest.NewRecorder()
 	activity := httptest.NewRequest(http.MethodGet, fleetActivityPath, nil)
 	s.engine.ServeHTTP(recorder, activity)
-	if got := s.drain.Snapshot(); got.Requests != 1 {
+	if got := s.drain.Snapshot(); got.Requests != 2 {
 		t.Fatalf("activity route changed the count: %+v", got)
 	}
 
@@ -109,7 +110,7 @@ func TestFleetActivityRouteRequiresManagementKey(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("with the management key: status %d: %s", response.Code, response.Body.String())
 	}
-	if body := response.Body.String(); body != `{"requests":0,"websockets":0,"websocket_turns":0,"draining":false,"quiet":true}` {
+	if body := response.Body.String(); body != `{"requests":0,"websockets":0,"websocket_turns":0,"steering_websockets":0,"draining":false,"quiet":true}` {
 		t.Fatalf("activity body = %s", body)
 	}
 }
@@ -131,6 +132,12 @@ func startTestServer(t *testing.T) (s *Server, addr string, release func()) {
 		case <-c.Request.Context().Done():
 		}
 		c.String(http.StatusOK, "finished")
+	})
+	s.engine.GET("/fleet-test/quick", func(c *gin.Context) { c.String(http.StatusOK, "quick") })
+	s.engine.GET("/fleet-test/stream", func(c *gin.Context) {
+		c.Header("Content-Type", "text/event-stream")
+		_, _ = c.Writer.WriteString("data: one\n\n")
+		c.Writer.Flush()
 	})
 	go func() { _ = s.Start() }()
 	deadline := time.Now().Add(5 * time.Second)
@@ -321,5 +328,122 @@ func TestDrainTrackerIsOutermostWithoutArchive(t *testing.T) {
 	s := newTestServer(t)
 	if name := handlerName(s.engine.Handlers[0]); !strings.Contains(name, "installDrainTracker") {
 		t.Fatalf("first middleware is %s", name)
+	}
+}
+
+// gatedConn holds back the chunked-encoding terminator, which net/http writes
+// after the handler has returned, until the test opens the gate.
+type gatedConn struct {
+	net.Conn
+	reached chan<- struct{}
+	gate    <-chan struct{}
+}
+
+func (c *gatedConn) Write(b []byte) (int, error) {
+	if bytes.HasSuffix(b, []byte("0\r\n\r\n")) {
+		c.reached <- struct{}{}
+		<-c.gate
+	}
+	return c.Conn.Write(b)
+}
+
+type gatedListener struct {
+	net.Listener
+	reached chan<- struct{}
+	gate    <-chan struct{}
+}
+
+func (l *gatedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &gatedConn{Conn: conn, reached: l.reached, gate: l.gate}, nil
+}
+
+func TestDrainFleetWaitsForTheFinalResponseWrite(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	fleetListenerForTest = func(l net.Listener) net.Listener {
+		return &gatedListener{Listener: l, reached: reached, gate: gate}
+	}
+	t.Cleanup(func() { fleetListenerForTest = nil })
+	s, addr, _ := startTestServer(t)
+	fleetListenerForTest = nil
+
+	type result struct {
+		body string
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := (&http.Client{Transport: &http.Transport{DisableKeepAlives: true}}).Get("http://" + addr + "/fleet-test/stream")
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		got <- result{body: string(body), err: err}
+	}()
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response never reached its final write")
+	}
+	if a := s.drain.Snapshot(); a.Requests != 0 {
+		t.Fatalf("the handler should have returned: %+v", a)
+	}
+	drained := make(chan struct{})
+	go func() {
+		s.DrainFleet(context.Background())
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		t.Fatal("drain finished before the response was fully written")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain did not finish after the final write")
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-got; r.err != nil || r.body != "data: one\n\n" {
+		t.Fatalf("response = %q, %v; want the complete body", r.body, r.err)
+	}
+}
+
+func TestDrainFleetServesConnectionsAcceptedBeforeIt(t *testing.T) {
+	s, addr, _ := startTestServer(t)
+	// Accepted but still being sniffed: no byte has arrived when the drain starts.
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	time.Sleep(50 * time.Millisecond)
+	drained := make(chan struct{})
+	go func() {
+		s.DrainFleet(context.Background())
+		close(drained)
+	}()
+	waitForActivity(t, s.drain, func(a fleetdrain.Activity) bool { return a.Draining })
+	if _, err := conn.Write([]byte("GET /fleet-test/quick HTTP/1.1\r\nHost: fleet-test\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	response, err := io.ReadAll(conn)
+	if err != nil || !bytes.HasPrefix(response, []byte("HTTP/1.1 200")) || !bytes.HasSuffix(response, []byte("quick")) {
+		t.Fatalf("response = %q, %v; want 200 quick", response, err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain did not finish")
 	}
 }

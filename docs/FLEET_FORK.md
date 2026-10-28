@@ -94,28 +94,33 @@ streaming and every open Codex WebSocket. `internal/fleetdrain`, `internal/api/d
 `sdk/cliproxy/drain_fleet.go` and `openai_responses_websocket_drain_fleet.go` change that:
 
 - A tracker per API server counts HTTP requests in flight (outermost middleware, inside the
-  archive observer; WebSocket upgrades and the activity route are not counted), open
-  Responses WebSockets and WebSocket turns (one per iteration of the handler's read loop).
-  `GET /v0/management/fleet/activity` (management key) reports
-  `{requests, websockets, websocket_turns, draining, quiet}`; `quiet` means no request or
-  turn is in flight. An installer restarts in such a moment.
-- On SIGTERM, before anything else stops, the server closes its listeners, disables
-  keep-alives, closes idle Responses WebSockets with 1012 (service restart) and busy ones
-  after their current turn, and waits up to 75 s for the rest; shutdown then proceeds as
-  upstream (30 s), within systemd's `TimeoutStopSec=120`. Codex checks its cached socket
-  before each turn and reconnects when it is closed. The realtime/live WebSockets are not
-  tracked; the fleet gate refuses those routes.
+  archive observer; only the activity route is exempt), open Responses WebSockets (the
+  request stops counting once it is upgraded) and their turns. The socket's reader admits
+  each frame the moment it is read, before parsing, so a frame on its way to the handler is
+  never mistaken for an idle socket. `GET /v0/management/fleet/activity` (management key)
+  reports `{requests, websockets, websocket_turns, steering_websockets, draining, quiet}`;
+  `quiet` means no request, turn or steering WebSocket is in flight. An installer restarts
+  in such a moment.
+- On SIGTERM, before anything else stops (`DrainFleet`, 75 s, then upstream's 30 s shutdown,
+  within systemd's `TimeoutStopSec=120`): the base listener closes; connections already
+  accepted are still sniffed, routed and taken by the HTTP server; `http.Server.Shutdown`
+  then waits for every HTTP connection to finish its response, including the writes net/http
+  makes after the handler returns (HTTP/2 gets GOAWAY); idle Responses WebSockets close
+  with 1012 (service restart) and busy ones after their current turn, and frames read after
+  that are dropped (the client sees the close and resends). Codex checks its cached socket
+  before each turn and reconnects when it is closed.
+- Limits: with `codex.response-steering` on (off at homelab; the archive also refuses it),
+  the duplex executor keeps a session in one handler turn and reports no per-response
+  state, so each steering WebSocket counts as busy for its whole life and is closed only
+  when a drain times out; a warning is logged at start. Realtime/live WebSockets count as
+  requests while open; the fleet gate refuses those routes.
 - Under systemd socket activation (`LISTEN_PID`/`LISTEN_FDS`, one TCP socket) the server
   serves on the inherited socket, which outlives the process, so connections arriving
   during a drain or restart wait in the kernel queue for the next process instead of being
   refused. The socket's address wins over the configured one (logged when they differ).
 
-Core hooks: the `drain` field, its install line and the listener call in
-`internal/api/server.go`, one route in `server_management.go`, one line in
-`sdk/cliproxy/service_lifecycle.go` (drain before `Shutdown`), and three small blocks in
-`openai_responses_websocket.go` (count the socket, count each turn, close when draining).
-
-Run `go test ./internal/fleet/ ./internal/client/codex/models ./internal/runtime/executor`
-then `go test ./...`. On v8.0.45, upstream's own
-`TestDevinApplyPatchRejectionCarriesLogDiagnostic`, `TestModelsMultiAgentClientConfigAndReload`
-and three `TestCodexClientModelsResponse*` tests fail on the unmodified tag too. Tests use synthetic credentials and local upstreams only.
+Core hooks: in `internal/api/server.go` the drain fields, their install line, the listener
+call, accept-loop accounting and the drain branch in `Start`; routing accounting in
+`protocol_multiplexer.go`; one route in `server_management.go`; one line in
+`sdk/cliproxy/service_lifecycle.go` (drain before `Shutdown`); in the Responses WebSocket
+handler and reader, the socket count, admission and the drain close.

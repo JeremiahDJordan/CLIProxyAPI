@@ -46,7 +46,11 @@ type Server struct {
 	// server is the underlying HTTP server.
 	server *http.Server
 
-	drain *fleetdrain.Tracker // fleet: work in flight (drain_fleet.go)
+	// fleet: work in flight and its drain (drain_fleet.go)
+	drain            *fleetdrain.Tracker
+	fleetDraining    atomic.Bool
+	fleetAcceptLoops sync.WaitGroup
+	fleetRouting     sync.WaitGroup
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	listenerMu      sync.Mutex
@@ -172,7 +176,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
 
-	s.installDrainTracker(engine)         // fleet: work in flight (drain_fleet.go)
+	s.installDrainTracker(engine, cfg)    // fleet: work in flight (drain_fleet.go)
 	s.installArchiveObserver(engine, cfg) // fleet: request archive (archive_fleet.go), outermost middleware
 
 	// Add middleware
@@ -311,6 +315,9 @@ func (s *Server) Start() error {
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
+	if fleetListenerForTest != nil {
+		listener = fleetListenerForTest(listener)
+	}
 
 	cfg := s.getConfig()
 	useTLS := cfg != nil && cfg.TLS.Enable
@@ -357,7 +364,9 @@ func (s *Server) Start() error {
 	go func() {
 		httpErrCh <- s.server.Serve(httpListener)
 	}()
+	s.fleetAcceptLoops.Add(1)
 	go func() {
+		defer s.fleetAcceptLoops.Done()
 		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
 	}()
 
@@ -388,6 +397,11 @@ func (s *Server) Start() error {
 		}
 		return nil
 	case errAccept := <-acceptErrCh:
+		if s.fleetDraining.Load() {
+			// fleet: DrainFleet closed the base listener and shuts the HTTP server down
+			// once queued connections are served (drain_fleet.go).
+			return normalizeHTTPServeError(<-httpErrCh)
+		}
 		s.listenerMu.Lock()
 		muxHTTP := s.muxHTTPListener
 		muxBase := s.muxBaseListener

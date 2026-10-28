@@ -14,33 +14,39 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/fleetdrain"
 	log "github.com/sirupsen/logrus"
 )
 
 const fleetActivityPath = "/v0/management/fleet/activity"
 
-// installDrainTracker counts every request except WebSocket upgrades (the
-// Responses WebSocket handler counts its own connections and turns) and the
-// activity route, and carries the tracker in the request context.
-func (s *Server) installDrainTracker(engine *gin.Engine) {
+// installDrainTracker counts every request except the activity route and carries
+// the tracker in the request context. The Responses WebSocket handler ends the
+// request's count once it has upgraded and counts the connection itself.
+func (s *Server) installDrainTracker(engine *gin.Engine, cfg *config.Config) {
 	if s == nil || engine == nil {
 		return
+	}
+	if cfg != nil && (cfg.Codex.ResponseSteering || cfg.CodexResponseSteering) {
+		log.Warn("fleet drain: codex.response-steering is on; steering WebSockets count as busy for their whole life and are closed only when a drain times out")
 	}
 	s.drain = fleetdrain.New()
 	tracker := s.drain
 	middleware := func(c *gin.Context) {
-		c.Request = c.Request.WithContext(fleetdrain.WithTracker(c.Request.Context(), tracker))
-		if c.Request.URL.Path == fleetActivityPath ||
-			strings.EqualFold(strings.TrimSpace(c.Request.Header.Get("Upgrade")), "websocket") {
+		ctx := fleetdrain.WithTracker(c.Request.Context(), tracker)
+		if c.Request.URL.Path == fleetActivityPath {
+			c.Request = c.Request.WithContext(ctx)
 			c.Next()
 			return
 		}
-		defer tracker.BeginRequest()()
+		end := tracker.BeginRequest()
+		defer end()
+		c.Request = c.Request.WithContext(fleetdrain.WithRequest(ctx, end))
 		c.Next()
 	}
 	if len(engine.Handlers) == 0 {
@@ -55,44 +61,90 @@ func (s *Server) getFleetActivity(c *gin.Context) {
 	c.JSON(http.StatusOK, s.drain.Snapshot())
 }
 
-// DrainFleet stops accepting connections and waits, until ctx ends, for requests
-// and WebSocket turns in flight to finish. Idle Responses WebSockets close at once
-// with 1012 (service restart) and busy ones after their current turn; clients
-// reconnect on their next request. Stop closes whatever remains.
+// DrainFleet stops accepting connections and lets the work in flight finish,
+// until ctx ends; Stop closes whatever remains. In order:
+//   - the base listener closes, so new connections stay in the kernel queue
+//     (under socket activation, for the next process);
+//   - connections already accepted are still routed and handed to the HTTP
+//     server, which takes all queued ones before its listener closes;
+//   - http.Server.Shutdown waits for every HTTP connection to finish its response,
+//     including the final writes after the handler returns (HTTP/2 gets GOAWAY);
+//   - idle Responses WebSockets close at once with 1012 (service restart) and busy
+//     ones after their current turn; clients reconnect on their next request.
 func (s *Server) DrainFleet(ctx context.Context) {
 	if s == nil || s.drain == nil {
 		return
 	}
 	s.listenerMu.Lock()
-	muxHTTP := s.muxHTTPListener
 	muxBase := s.muxBaseListener
-	s.muxHTTPListener = nil
-	s.muxBaseListener = nil
+	muxHTTP := s.muxHTTPListener
+	if muxBase != nil {
+		s.fleetDraining.Store(true) // Start must leave the HTTP listener to us
+		s.muxBaseListener = nil
+	}
 	s.listenerMu.Unlock()
-	if muxHTTP == nil && muxBase == nil {
+	if muxBase == nil {
 		return // never started, or already stopped
 	}
-	if muxHTTP != nil {
-		_ = muxHTTP.Close()
-	}
-	if muxBase != nil {
-		_ = muxBase.Close()
-	}
+	started := time.Now()
+	before := s.drain.Snapshot()
+	s.drain.StartDrain()
 	if s.server != nil {
 		// Close idle keep-alive connections now and the rest after their response.
 		s.server.SetKeepAlivesEnabled(false)
 	}
-	s.drain.StartDrain()
-	before := s.drain.Snapshot()
-	started := time.Now()
-	if errWait := s.drain.Wait(ctx); errWait != nil {
+	_ = muxBase.Close()
+
+	step := "routing accepted connections"
+	errWait := waitFleetGroup(ctx, &s.fleetAcceptLoops)
+	if errWait == nil {
+		errWait = waitFleetGroup(ctx, &s.fleetRouting)
+	}
+	if errWait == nil && muxHTTP != nil {
+		step = "handing queued connections to the HTTP server"
+		errWait = waitFleetCondition(ctx, func() bool { return len(muxHTTP.connCh) == 0 })
+	}
+	if errWait == nil && s.server != nil {
+		step = "finishing HTTP responses"
+		errWait = s.server.Shutdown(ctx)
+	}
+	if errWait == nil {
+		step = "finishing websocket turns"
+		errWait = s.drain.Wait(ctx)
+	}
+	if errWait != nil {
 		left := s.drain.Snapshot()
-		log.Warnf("fleet drain: stopped waiting after %s (%v); closing %d requests, %d websocket turns, %d websockets",
-			time.Since(started).Round(time.Millisecond), errWait, left.Requests, left.WebSocketTurns, left.WebSockets)
+		log.Warnf("fleet drain: stopped waiting after %s while %s (%v); closing %d requests, %d websocket turns, %d websockets",
+			time.Since(started).Round(time.Millisecond), step, errWait, left.Requests, left.WebSocketTurns, left.WebSockets)
 		return
 	}
 	log.Infof("fleet drain: finished in %s (%d requests, %d websocket turns, %d websockets were open)",
 		time.Since(started).Round(time.Millisecond), before.Requests, before.WebSocketTurns, before.WebSockets)
+}
+
+func waitFleetGroup(ctx context.Context, group *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitFleetCondition(ctx context.Context, ok func() bool) error {
+	for !ok() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 // fleetListen returns the listening socket systemd passed (socket activation,
@@ -125,3 +177,6 @@ func fleetListen(addr string) (net.Listener, error) {
 	log.Infof("socket activation: serving on the inherited socket %s", listener.Addr())
 	return listener, nil
 }
+
+// fleetListenerForTest wraps the server's listener in tests.
+var fleetListenerForTest func(net.Listener) net.Listener

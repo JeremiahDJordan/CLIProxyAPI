@@ -354,8 +354,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	writer := newResponsesWebsocketWriter(conn)
-	// fleet: counted until the connection is closed below (drain_fleet.go)
+	// fleet: from here the connection, not the request, is counted (drain_fleet.go)
 	drainTracker := fleetdrain.FromContext(c.Request.Context())
+	fleetdrain.EndRequest(c.Request.Context())
 	defer drainTracker.BeginWebSocket()()
 	passthroughSessionID := uuid.NewString()
 	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
@@ -373,10 +374,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 	}
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
+	// fleet: duplex streams do not report turns, so a steering session counts as busy.
+	admission := newResponsesWebsocketAdmission(drainTracker)
+	if codexResponseSteering {
+		admission = newResponsesWebsocketAdmission(nil)
+		defer drainTracker.BeginSteering()()
+	}
+	defer admission.release() // after the cleanup below has stopped the reader
 	localInterrupt := newResponsesLocalInterrupt()
 	// Advanced on every upstream loss: input read under an older epoch predates the loss.
 	var inputEpoch atomic.Uint64
-	input, inputDone := readResponsesWebsocketInput(socketCtx, cancelSocket, conn, func(payload []byte) error {
+	input, inputDone := readResponsesWebsocketInput(withResponsesWebsocketAdmission(socketCtx, admission), cancelSocket, conn, func(payload []byte) error {
 		return h.forwardResponsesWebsocketInterrupt(socketCtx, passthroughSessionID, payload)
 	}, localInterrupt, writer, wsTimelineLog, &inputEpoch)
 	var duplexInput <-chan cliproxyexecutor.WebsocketInput
@@ -522,7 +530,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		drainCh := drainTracker.Draining()
 		if drainTracker.IsDraining() {
 			// Answer a request that was already read; otherwise hand the client to the next process.
-			if len(input) == 0 {
+			if admission.closeIfIdle() {
 				if errClose := writer.closeForDrain(); errClose != nil && !isWebsocketConnectionClosedError(errClose) {
 					log.Debugf("responses websocket: drain close id=%s error=%v", passthroughSessionID, errClose)
 				}
@@ -542,6 +550,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if !ok {
 				errReadMessage = context.Cause(socketCtx)
 			} else {
+				endTurn = admission.take()
 				if message.Err == nil && message.Epoch < inputEpoch.Load() {
 					// Read before an upstream loss: never sent, the client resends.
 					if errWrite := writeResponsesWebsocketPreviousResponseNotFound(writer, wsTimelineLog, message.Payload); errWrite != nil {
@@ -570,7 +579,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
-		endTurn = drainTracker.BeginTurn()
 		// log.Infof(
 		// 	"responses websocket: downstream_in id=%s type=%d event=%s payload=%s",
 		// 	passthroughSessionID,

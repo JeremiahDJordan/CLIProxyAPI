@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -117,12 +118,15 @@ func (s *Server) acceptMuxConnections(listener net.Listener, httpListener *muxLi
 		// reader.Peek(1) were performed inline; an idle TCP connection that
 		// never sent bytes would block Peek indefinitely, preventing all
 		// subsequent connections from being accepted (issue #3267).
+		s.fleetRouting.Add(1) // fleet: DrainFleet waits for routing (drain_fleet.go)
 		go s.routeMuxConnection(conn, httpListener)
 	}
 }
 
 // routeMuxConnection performs per-connection protocol detection and routing.
 func (s *Server) routeMuxConnection(conn net.Conn, httpListener *muxListener) {
+	routed := sync.OnceFunc(s.fleetRouting.Done)
+	defer routed()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			var remoteAddr net.Addr
@@ -179,6 +183,7 @@ func (s *Server) routeMuxConnection(conn net.Conn, httpListener *muxListener) {
 	}
 
 	if isRedisRESPPrefix(prefix[0]) {
+		routed() // a long-lived RESP session is not routing work
 		s.handleRedisConnection(conn, reader)
 		return
 	}

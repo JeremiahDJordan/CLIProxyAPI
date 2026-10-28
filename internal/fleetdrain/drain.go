@@ -13,17 +13,21 @@ import (
 
 // Activity is a snapshot of the work in flight.
 type Activity struct {
-	// Requests counts HTTP requests being served, excluding WebSocket upgrades
-	// and the activity route itself.
+	// Requests counts HTTP requests being served, excluding the activity route
+	// itself; a Responses WebSocket stops counting here once it is upgraded.
 	Requests int `json:"requests"`
 	// WebSockets counts open Responses WebSocket connections.
 	WebSockets int `json:"websockets"`
-	// WebSocketTurns counts Responses WebSocket requests being answered.
+	// WebSocketTurns counts Responses WebSocket requests read and not yet answered.
 	WebSocketTurns int `json:"websocket_turns"`
+	// SteeringWebSockets counts Responses WebSockets opened while Codex response
+	// steering is on. Their duplex streams do not report turns, so they are
+	// treated as busy for their whole life.
+	SteeringWebSockets int `json:"steering_websockets"`
 	// Draining reports that the server has stopped accepting work.
 	Draining bool `json:"draining"`
-	// Quiet means no request or WebSocket turn is in flight; idle WebSockets
-	// may remain open, and clients reconnect them on their next turn.
+	// Quiet means no request, WebSocket turn or steering WebSocket is in flight;
+	// idle WebSockets may remain open, and clients reconnect them on their next turn.
 	Quiet bool `json:"quiet"`
 }
 
@@ -33,6 +37,7 @@ type Tracker struct {
 	requests int
 	sockets  int
 	turns    int
+	steering int
 	draining bool
 	drain    chan struct{}
 	// changed is closed and replaced whenever work finishes, waking Wait.
@@ -45,6 +50,24 @@ func New() *Tracker {
 }
 
 type contextKey struct{}
+
+type requestKey struct{}
+
+// WithRequest returns ctx carrying end, which stops counting its request.
+func WithRequest(ctx context.Context, end func()) context.Context {
+	return context.WithValue(ctx, requestKey{}, end)
+}
+
+// EndRequest stops counting the request in ctx. The Responses WebSocket handler
+// calls it once the connection is upgraded and counted as a WebSocket instead.
+func EndRequest(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if end, ok := ctx.Value(requestKey{}).(func()); ok && end != nil {
+		end()
+	}
+}
 
 // WithTracker returns ctx carrying t.
 func WithTracker(ctx context.Context, t *Tracker) context.Context {
@@ -100,6 +123,14 @@ func (t *Tracker) begin(counter *int) func() {
 	}
 }
 
+// BeginSteering counts one steering-mode Responses WebSocket until the returned function is called.
+func (t *Tracker) BeginSteering() func() {
+	if t == nil {
+		return func() {}
+	}
+	return t.begin(&t.steering)
+}
+
 // Draining returns a channel closed once draining starts; nil for a nil Tracker.
 func (t *Tracker) Draining() <-chan struct{} {
 	if t == nil {
@@ -140,11 +171,12 @@ func (t *Tracker) Snapshot() Activity {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return Activity{
-		Requests:       t.requests,
-		WebSockets:     t.sockets,
-		WebSocketTurns: t.turns,
-		Draining:       t.draining,
-		Quiet:          t.requests == 0 && t.turns == 0,
+		Requests:           t.requests,
+		WebSockets:         t.sockets,
+		WebSocketTurns:     t.turns,
+		SteeringWebSockets: t.steering,
+		Draining:           t.draining,
+		Quiet:              t.requests == 0 && t.turns == 0 && t.steering == 0,
 	}
 }
 
