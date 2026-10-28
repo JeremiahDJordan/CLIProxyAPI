@@ -19,8 +19,10 @@
    `claude-vscode`). Requests targeting `codex` must be Responses/WebSocket requests
    from an official Codex client (`helps.IsOfficialCodexClient`:
    `multiagentv2.IsCodexClientUserAgent` **and** an `Originator` of `codex_cli_rs`,
-   `codex-tui`, `Codex Desktop` or `codex_exec`, case-insensitive, optionally followed by
-   `/version`; Codex cloak-mode `auto` uses the same check). Translated requests (for
+   `codex-tui`, `Codex Desktop`, `codex_exec` or `T3 Code`, case-insensitive, optionally
+   followed by `/version`; Codex cloak-mode `auto` uses the same check). T3 Code (and
+   Z6) run the official Codex app-server under the `T3 Code` originator, which OpenAI
+   recognizes, so their requests pass the gate and reach Codex unchanged. Translated requests (for
    example Chat Completions to a Claude model), keys used outside their providers and
    callers without a fleet key get a JSON `403` naming the reason.
 3. **Quota tracking** (`usage.handle`, `websocket.response_event`). Per credential it

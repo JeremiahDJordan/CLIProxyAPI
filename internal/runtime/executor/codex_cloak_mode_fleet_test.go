@@ -20,6 +20,9 @@ func TestCodexCloakModeFleet(t *testing.T) {
 	copiedUA.Set("Originator", "pi")
 	other := http.Header{}
 	other.Set("User-Agent", "curl/8.7.1")
+	t3 := http.Header{}
+	t3.Set("User-Agent", "T3 Code/0.164.0 (Mac OS 27.0.1; arm64) xterm-256color (T3 Code; 0.1.2)")
+	t3.Set("Originator", "T3 Code")
 	desktop := http.Header{}
 	desktop.Set("User-Agent", official.Get("User-Agent"))
 	desktop.Set("Originator", "Codex Desktop/27.1")
@@ -33,6 +36,7 @@ func TestCodexCloakModeFleet(t *testing.T) {
 		{"default auto keeps official client", "codex: {}\n", official, official.Get("User-Agent"), "codex_cli_rs"},
 		{"default auto cloaks other client", "codex: {}\n", other, codexUserAgent, codexOriginator},
 		{"auto keeps a versioned originator the gate admits", "codex: {}\n", desktop, official.Get("User-Agent"), "Codex Desktop/27.1"},
+		{"auto keeps T3 Code's identity", "codex: {}\n", t3, t3.Get("User-Agent"), "T3 Code"},
 		{"auto cloaks copied user agent with wrong originator", "codex: {cloak-mode: auto}\n", copiedUA, codexUserAgent, codexOriginator},
 		{"always overwrites official client", "codex: {cloak-mode: always}\n", official, codexUserAgent, codexOriginator},
 		{"v8 upstream path is honored", "upstream: {codex: {cloak-mode: always}}\n", official, codexUserAgent, codexOriginator},

@@ -207,7 +207,9 @@ func headerValueCaseInsensitive(headers http.Header, name string) string {
 // IsCodexClientUserAgent reports whether a request uses an official Codex client identity.
 func IsCodexClientUserAgent(userAgent string) bool {
 	userAgent = strings.TrimSpace(userAgent)
-	return strings.HasPrefix(userAgent, "Codex Desktop/") ||
+	// Fleet fork: T3 Code runs the official Codex app-server under its own originator.
+	return strings.HasPrefix(userAgent, "T3 Code/") ||
+		strings.HasPrefix(userAgent, "Codex Desktop/") ||
 		strings.HasPrefix(userAgent, "codex-tui/") ||
 		userAgent == "codex_cli_rs" ||
 		strings.HasPrefix(userAgent, "codex_cli_rs/") ||

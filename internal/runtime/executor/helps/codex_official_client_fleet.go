@@ -8,8 +8,9 @@ import (
 )
 
 // codexOfficialOriginators lists the Originator values sent by official Codex clients
-// (compared case-insensitively, optionally followed by "/version").
-var codexOfficialOriginators = []string{"codex_cli_rs", "codex-tui", "codex desktop", "codex_exec"}
+// (compared case-insensitively, optionally followed by "/version"). "T3 Code" runs the
+// official Codex app-server under its own originator, which OpenAI recognizes.
+var codexOfficialOriginators = []string{"codex_cli_rs", "codex-tui", "codex desktop", "codex_exec", "t3 code"}
 
 // IsOfficialCodexClient reports whether a request carries an official Codex client
 // identity in both User-Agent and Originator. The fleet gate admits only these clients

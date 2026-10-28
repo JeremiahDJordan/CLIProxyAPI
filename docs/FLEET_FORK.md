@@ -52,6 +52,16 @@ the gate uses) and applies the built-in identity to every other client, on both 
 and WebSocket paths, instead of upstream's unconditional overwrite. Tests:
 `internal/runtime/executor/codex_cloak_mode_fleet_test.go`.
 
+T3 Code (and Z6) run the official Codex app-server with the originator `T3 Code`
+(User-Agent `T3 Code/<codex version> …`); OpenAI tailors the model catalog to it, for
+example the Sol Ultrafast tier. The fork treats it as an official Codex client
+everywhere upstream distinguishes one, so its identity passes through unchanged:
+`helps.IsOfficialCodexClient` (gate and cloak-mode `auto`),
+`multiagentv2.IsCodexClientUserAgent` (Responses `response.failed` framing and
+multi-agent v2) and `cliproxyauth.IsCodexClientUserAgent` (SIWC credential choice).
+Upstream v8.0.45 would instead rewrite it to its built-in `codex-tui` identity. Tests:
+`*t3*_fleet_test.go` and the T3 Code cases in the gate and cloak-mode tests.
+
 Run `go test ./internal/fleet/ ./internal/client/codex/models ./internal/runtime/executor`
 then `go test ./...`. On v8.0.45, upstream's own
 `TestDevinApplyPatchRejectionCarriesLogDiagnostic`, `TestModelsMultiAgentClientConfigAndReload`

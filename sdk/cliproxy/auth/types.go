@@ -845,7 +845,9 @@ func IsCodexClientUserAgent(userAgent string) bool {
 	if ua == "" {
 		return false
 	}
-	return strings.Contains(ua, "codex-desktop") ||
+	// Fleet fork: T3 Code runs the official Codex app-server under its own originator.
+	return strings.HasPrefix(ua, "t3 code/") ||
+		strings.Contains(ua, "codex-desktop") ||
 		strings.Contains(ua, "codex desktop") ||
 		strings.Contains(ua, "codex-rs") ||
 		strings.Contains(ua, "codex_cli_rs") ||

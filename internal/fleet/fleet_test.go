@@ -182,6 +182,13 @@ func TestGateAcceptsNativeClaudeCodeAndCodex(t *testing.T) {
 	if d := Evaluate(s, Classify(codexRequest()), "codex", scopeFor(s, "codex")); !d.Allow {
 		t.Fatalf("official Codex rejected: %+v", d)
 	}
+	// T3 Code (and Z6) run the official Codex app-server under the "T3 Code" originator.
+	t3 := codexRequest()
+	t3.Headers.Set("User-Agent", "T3 Code/0.164.0 (Mac OS 27.0.1; arm64) xterm-256color (T3 Code; 0.1.2)")
+	t3.Headers.Set("Originator", "T3 Code")
+	if d := Evaluate(s, Classify(t3), "codex", scopeFor(s, "codex")); !d.Allow {
+		t.Fatalf("T3 Code's Codex rejected: %+v", d)
+	}
 }
 
 func TestGateRejectsImpostorsAndTranslation(t *testing.T) {
@@ -204,6 +211,17 @@ func TestGateRejectsImpostorsAndTranslation(t *testing.T) {
 	sdkPy.Headers.Set("User-Agent", "claude-cli/2.1.280 (external, sdk-py)")
 	if d := Evaluate(s, Classify(sdkPy), "claude", claudeScope); d.Allow {
 		t.Errorf("non-native entrypoint allowed: %+v", d)
+	}
+
+	for _, h := range []http.Header{
+		{"User-Agent": {"T3 Code/0.164.0 (Mac OS 27.0.1; arm64)"}, "Originator": {"pi"}},
+		{"User-Agent": {"curl/8.7.1"}, "Originator": {"T3 Code"}},
+	} {
+		impostor := codexRequest()
+		impostor.Headers = h
+		if d := Evaluate(s, Classify(impostor), "codex", codexScope); d.Allow || d.Code != "fleet_codex_client" {
+			t.Errorf("half a T3 Code identity allowed (%v): %+v", h, d)
+		}
 	}
 
 	uaOnly := codexRequest()
