@@ -532,6 +532,7 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
 		}
 
 		closeUnconsumedRequestOnAbort(c)
+		archiveNoteAuthDenial(c, err.Message) // fleet: request archive gate code (archive_fleet.go)
 		statusCode := err.HTTPStatusCode()
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)

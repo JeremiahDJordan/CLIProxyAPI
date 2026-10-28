@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/archive"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -352,6 +353,36 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		c.Header("Location", "https://app.example/cb?code=fake-location-code-0019#access_token=fake-fragment-token-0020")
 		c.String(http.StatusOK, "ok")
 	})
+	// Every executor tap, fed credentials where an executor would put them:
+	// outbound headers and URLs, upstream response headers, error text,
+	// upstream WebSocket handshakes, rejections and errors.
+	classifyForTest(t, http.MethodPost, "/archive-test/upstream-secrets")
+	server.engine.POST("/archive-test/upstream-secrets", func(c *gin.Context) {
+		ctx := context.WithValue(context.Background(), "gin", c)
+		cfg := server.cfg
+		outbound := http.Header{
+			"Authorization":  {"Bearer sk-ant-oat01-fake-upstream-0021"},
+			"X-Api-Key":      {"sk-fake-upstream-key-0022"},
+			"Cookie":         {"cf_clearance=fake-upstream-cookie-0023"},
+			"X-Goog-Api-Key": {"AIzaFAKEupstream0024"},
+			"Content-Type":   {"application/json"},
+		}
+		helps.RecordAPIRequest(ctx, cfg, helps.UpstreamRequestLog{URL: "https://gen.example/v1beta/models/x:generateContent?alt=sse&key=AIzaFAKEurlkey0025", Method: http.MethodPost, Headers: outbound, Body: []byte(`{}`), AuthValue: "sk-fake-auth-value-0036"})
+		helps.RecordAPIResponseMetadata(ctx, cfg, http.StatusOK, http.Header{"Set-Cookie": {"__cf_bm=fake-upstream-setcookie-0026; Path=/"}})
+		helps.AppendAPIResponseChunk(ctx, cfg, []byte(`data: {"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":1}}}`))
+		helps.RecordAPIResponseError(ctx, cfg, errors.New(`Post "https://api.example/v1?key=fake-error-key-0027": Bearer fake-error-bearer-0028 dial failed`))
+		wsHeaders := http.Header{
+			"Sec-Websocket-Protocol": {"realtime, openai-insecure-api-key.sk-fake-upstream-wsproto-0029"},
+			"Authorization":          {"Bearer fake-ws-bearer-0030"},
+		}
+		helps.RecordAPIWebsocketRequest(ctx, cfg, helps.UpstreamRequestLog{URL: "wss://ws.example/v1/realtime?model=gpt-realtime", Headers: wsHeaders, Body: []byte(`{"type":"session.update"}`)})
+		helps.RecordAPIWebsocketHandshake(ctx, cfg, http.StatusSwitchingProtocols, http.Header{"Set-Cookie": {"ws=fake-ws-setcookie-0031"}})
+		helps.RecordAPIWebsocketUpgradeRejection(ctx, cfg, helps.UpstreamRequestLog{URL: "wss://ws.example/v1/responses?api_key=fake-ws-url-key-0032", Headers: wsHeaders}, http.StatusForbidden, http.Header{"X-Upstream-Token": {"fake-ws-token-0033"}}, []byte(`{"error":"forbidden"}`))
+		helps.RecordAPIWebsocketError(ctx, cfg, "dial", errors.New("dial wss://ws.example/?token=fake-ws-error-token-0034: refused"))
+		attempt := archive.WithAttempt(ctx)
+		archive.EndAttempt(attempt, archive.AttemptEnd{Error: "upstream said: invalid Bearer fake-attempt-bearer-0035"})
+		c.String(http.StatusOK, "ok")
+	})
 	secrets := []string{
 		"sk-fake-bearer-0001", "fake-proxy-auth-0002", "sk-ant-fake-xapikey-0003", "AIzaFAKEgoogkey0004",
 		"fake-cookie-0005", "sk-fake-wsproto-0006", "AIzaFAKEquerykey0007", "fake-value-0008",
@@ -359,6 +390,10 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		"fake-oauth-state-0013", "fake-set-cookie-0014", "fake-management-key-0015",
 		"fake-referer-code-0016", "fake-referer-state-0017", "fake-custom-token-0018",
 		"fake-location-code-0019", "fake-fragment-token-0020",
+		"fake-upstream-0021", "fake-upstream-key-0022", "fake-upstream-cookie-0023", "AIzaFAKEupstream0024",
+		"AIzaFAKEurlkey0025", "fake-upstream-setcookie-0026", "fake-error-key-0027", "fake-error-bearer-0028",
+		"fake-upstream-wsproto-0029", "fake-ws-bearer-0030", "fake-ws-setcookie-0031", "fake-ws-url-key-0032",
+		"fake-ws-token-0033", "fake-ws-error-token-0034", "fake-attempt-bearer-0035", "fake-auth-value-0036",
 	}
 	credentialHeaders := http.Header{
 		"Authorization":          {"Bearer sk-fake-bearer-0001"},
@@ -386,6 +421,7 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		{http.MethodGet, "/callback?code=fake-oauth-code-0012&state=fake-oauth-state-0013"},
 		{http.MethodGet, "/no-such-route?password=fake-password-0011&fake-code-0009"},
 		{http.MethodGet, "/archive-test/cookie?key=AIzaFAKEquerykey0007"},
+		{http.MethodPost, "/archive-test/upstream-secrets"},
 	}
 	for _, r := range requests {
 		req := httptest.NewRequest(r.method, r.target, strings.NewReader(`{"model":"x"}`))
@@ -456,6 +492,17 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 	}
 	if got := eventsFor(events, archive.TypeClientBody, "/v0/management/config"); len(got) != 0 {
 		t.Fatalf("metadata-only route captured a body: %v", got)
+	}
+	// The taps ran: their events exist, redacted rather than dropped.
+	outbound := eventsFor(events, archive.TypeUpstreamRequest, "/archive-test/upstream-secrets")
+	if len(outbound) != 1 || outbound[0]["url"] != "https://gen.example/v1beta/models/x:generateContent?alt=sse&key=[redacted]" {
+		t.Fatalf("upstream_request = %v", outbound)
+	}
+	if got := outbound[0]["headers"].(map[string]any)["Authorization"].([]any)[0]; got != archive.Redacted {
+		t.Fatalf("outbound Authorization = %v", got)
+	}
+	if got := len(eventsFor(events, archive.TypeUpstreamWS, "/archive-test/upstream-secrets")); got != 4 {
+		t.Fatalf("%d upstream_ws events", got)
 	}
 }
 
@@ -858,7 +905,7 @@ func TestArchiveBodyTeeReservesItsBuffer(t *testing.T) {
 		snapshot := func() state {
 			tee.mu.Lock()
 			defer tee.mu.Unlock()
-			return state{int64(cap(tee.buf)), tee.reserved}
+			return state{tee.bufferCapLocked(), tee.reserved}
 		}
 		head := make([]byte, 1024)
 		_, _ = io.ReadFull(c.Request.Body, head)
@@ -1473,8 +1520,10 @@ func TestArchiveStopFinalizesAPendingBody(t *testing.T) {
 }
 
 // Stop waits for an emission already in progress (on the tee's lock, never
-// on a read), so a body that hit EOF just before Stop is archived with its
-// held ingress_end and leaves nothing reserved.
+// on a read), so a body that hit EOF just before Stop still gets its
+// client_body and held ingress_end before the shutdown event, and leaves
+// nothing reserved. The body itself is recorded as dropped_body (reason
+// stopped): once Stop has begun, bodies are no longer captured.
 func TestArchiveStopWaitsForAnEmissionInProgress(t *testing.T) {
 	s, spool := newArchiveServer(t, nil)
 	_, reader, readDone := serveStalledBody(t, s, "/archive-test/stop-vs-eof", 64)
@@ -1517,6 +1566,9 @@ func TestArchiveStopWaitsForAnEmissionInProgress(t *testing.T) {
 	if queued != 0 || len(bodies) != 1 || len(ends) != 1 {
 		t.Fatalf("shutdown queue_bytes=%v client_body=%d ingress_end=%d", queued, len(bodies), len(ends))
 	}
+	if bodies[0]["capture"] != archive.CaptureDroppedBody || bodies[0]["drop_reason"] != archive.DropStopped {
+		t.Fatalf("client_body = %v", bodies[0])
+	}
 }
 
 // Installing a tee races Stop's finalization without a data race: the tee's
@@ -1555,6 +1607,9 @@ func TestArchiveNormalTrafficLeavesNoTrackedTees(t *testing.T) {
 	spoolEvents(t, spool)
 	if n := reflect.ValueOf(archive.Current()).Elem().FieldByName("captures").Len(); n != 0 {
 		t.Fatalf("normal traffic left %d tees tracked", n)
+	}
+	if n := reflect.ValueOf(archive.Current()).Elem().FieldByName("observers").Len(); n != 0 {
+		t.Fatalf("normal traffic left %d observers tracked", n)
 	}
 	if q := archiveStopQueueBytes(t, spool); q != 0 {
 		t.Fatalf("shutdown queue_bytes=%v", q)
