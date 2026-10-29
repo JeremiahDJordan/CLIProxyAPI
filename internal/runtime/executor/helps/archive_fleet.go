@@ -89,32 +89,44 @@ func archiveWireRequest(info archive.UpstreamRequest, req *http.Request) archive
 	return info
 }
 
-// archiveRejectedBodyLimit bounds how much of a discarded response's body
-// ArchiveRejectedResponse reads.
-const archiveRejectedBodyLimit = 1 << 20
-
 // ArchiveRejectedResponse records, in the archive only, a response the
-// executor discards before resending (Codex's rejection of a zstd body): its
-// status and headers, and its body, which it reads (at most
-// archiveRejectedBodyLimit bytes) before the executor closes it. A longer
-// body is not recorded and counts as a drop. With capture off, or for a
-// request capture does not record, it reads nothing.
+// executor discards before resending (Codex's rejection of a zstd body):
+// its status and headers at once, and its body through
+// archive.TapDiscardedBody, which reads it on its own goroutine (bounded in
+// size and time) so the resend is never delayed; the executor's close of
+// resp.Body is then a no-op. With capture off, for a request capture does
+// not record, or when the archive does not take the body, it reads nothing
+// and the executor closes the body as before. A panic here is contained
+// and counted against the request.
 func ArchiveRejectedResponse(ctx context.Context, resp *http.Response) {
 	if resp == nil || !archive.Recorded(ctx) {
 		return
 	}
+	defer archive.RecoverTap("upstream.rejected", archive.IngressFromContext(ctx))
 	archive.TapUpstreamResponse(ctx, resp.StatusCode, resp.Header)
-	if resp.Body == nil {
+	if resp.Body == nil || resp.Body == http.NoBody {
 		return
 	}
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, archiveRejectedBodyLimit+1))
-	if len(body) > archiveRejectedBodyLimit {
-		archive.IngressFromContext(ctx).NoteDrop()
-		return
+	if archive.TapDiscardedBody(ctx, resp.Body, archiveTransportCloser(resp.Body)) {
+		resp.Body = http.NoBody
 	}
-	archive.TapUpstreamChunk(ctx, body)
-	if errRead != nil {
-		archive.TapUpstreamError(ctx, errRead)
+}
+
+// archiveTransportCloser returns the close of the transport body under the
+// decoders DecodeResponseBody may have added: it may be called while another
+// goroutine reads (net/http's bodies end the read), a decoder's may not.
+func archiveTransportCloser(body io.ReadCloser) func() error {
+	switch b := body.(type) {
+	case *peekableBody:
+		return b.closer.Close
+	case *compositeReadCloser:
+		// The last closer is the transport body's (or a peekableBody's).
+		if n := len(b.closers); n > 0 && b.closers[n-1] != nil {
+			return b.closers[n-1]
+		}
+		return nil
+	default:
+		return body.Close
 	}
 }
 

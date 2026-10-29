@@ -36,6 +36,12 @@ import (
 // the spool and an inference request's context.
 func startArchiveForExecutor(t *testing.T) (string, *archive.Ingress) {
 	t.Helper()
+	return startArchiveForExecutorWith(t, nil)
+}
+
+// startArchiveForExecutorWith is startArchiveForExecutor with overrides.
+func startArchiveForExecutorWith(t *testing.T, mutate func(*archive.TestOverrides)) (string, *archive.Ingress) {
+	t.Helper()
 	group, err := user.LookupGroupId(strconv.Itoa(os.Getegid()))
 	if err != nil {
 		t.Skipf("cannot name the effective group: %v", err)
@@ -52,10 +58,14 @@ func startArchiveForExecutor(t *testing.T) (string, *archive.Ingress) {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(archive.SetTestOverrides(archive.TestOverrides{
+	o := archive.TestOverrides{
 		StateDir: filepath.Join(t.TempDir(), "state"), SpoolGroup: group.Name, FreeBytes: func() uint64 { return 1 << 50 },
 		FsyncInterval: 20 * time.Millisecond, HeartbeatInterval: time.Hour, SpaceCheckInterval: time.Hour,
-	}))
+	}
+	if mutate != nil {
+		mutate(&o)
+	}
+	t.Cleanup(archive.SetTestOverrides(o))
 	rec := archive.Start(archive.StartParams{Config: config.ArchiveConfig{Enabled: true, SpoolDir: spool}})
 	if rec == nil {
 		t.Fatal("recorder did not start")
@@ -261,11 +271,37 @@ func TestArchiveCodexCompressionRecordsEachSend(t *testing.T) {
 				meta[1]["status"] != float64(http.StatusOK) || meta[1]["sub_attempt"] != float64(1) {
 				t.Fatalf("upstream_response_meta = %v", meta)
 			}
-			chunks := executorArchiveEvents(t, spool, archive.TypeUpstreamEvent)
-			if len(chunks) == 0 || chunks[0]["sub_attempt"] != float64(0) || string(executorArchiveBody(t, chunks[0])) != `{"error":"compression rejected"}` {
-				t.Fatalf("upstream_event = %v", chunks)
+			// Read on the archive's own goroutine: possibly queued after the resend's events.
+			rejected := waitDiscardedEvent(t, spool)
+			if rejected["sub_attempt"] != float64(0) || rejected["chunk_seq"] != float64(1) || string(executorArchiveBody(t, rejected)) != `{"error":"compression rejected"}` {
+				t.Fatalf("discarded upstream_event = %v", rejected)
 			}
 		})
+	}
+}
+
+// waitDiscardedEvent waits for the one upstream_event recording a discarded
+// body, which the archive queues from its own goroutine.
+func waitDiscardedEvent(t *testing.T, spool string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var found []map[string]any
+		for _, ev := range executorArchiveEvents(t, spool, archive.TypeUpstreamEvent) {
+			if ev["discarded"] == true {
+				found = append(found, ev)
+			}
+		}
+		if len(found) > 1 {
+			t.Fatalf("%d discarded bodies recorded: %v", len(found), found)
+		}
+		if len(found) == 1 {
+			return found[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the discarded body was never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

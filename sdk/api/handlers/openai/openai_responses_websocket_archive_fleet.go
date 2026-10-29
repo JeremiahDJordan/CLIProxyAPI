@@ -68,8 +68,9 @@ func newResponsesWebsocketArchive(c *gin.Context, sessionID string, steering boo
 	if !archive.Installed() || c == nil || c.Request == nil {
 		return nil
 	}
-	defer recoverWebsocketArchive("ws.open")
-	conn := archive.IngressFromContext(c.Request.Context())
+	var conn *archive.Ingress
+	defer recoverWebsocketArchiveFor("ws.open", &conn)
+	conn = archive.IngressFromContext(c.Request.Context())
 	if conn == nil || conn.Kind() != archive.KindWSConnection || conn.Class() != archive.RouteInference {
 		return nil
 	}
@@ -96,15 +97,9 @@ func newResponsesWebsocketArchive(c *gin.Context, sessionID string, steering boo
 	}
 }
 
-func recoverWebsocketArchive(where string) {
-	if recovered := recover(); recovered != nil {
-		archive.NoteTapPanic(where, recovered)
-	}
-}
-
-// recoverWebsocketArchiveFor is recoverWebsocketArchive for a step recording
-// on *in: a recovered panic loses what it was recording, so *in counts a
-// drop too.
+// recoverWebsocketArchiveFor contains a panic in a step recording on *in
+// (nil until the step has found it): a recovered panic loses what it was
+// recording, so *in counts a drop too.
 func recoverWebsocketArchiveFor(where string, in **archive.Ingress) {
 	if recovered := recover(); recovered != nil {
 		archive.NoteTapPanic(where, recovered)
@@ -168,6 +163,11 @@ func websocketMessageTypeName(kind int) string {
 // recorded byte for byte).
 const wsTurnFieldMax = 256
 
+// wsTurnMetadataMax bounds the client_metadata x-codex-turn-metadata string
+// a frame's turn ID is read from (a longer one is ignored); it is JSON in a
+// JSON string, so reading it copies it.
+const wsTurnMetadataMax = 8 << 10
+
 // beginTurn allocates a turn for a frame read from the client and records
 // its ingress_start and the frame itself (before tool-call repair or any
 // other rewriting). The frame's fields are read through a view of it, not a
@@ -191,14 +191,15 @@ func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *resp
 	t = &responsesWebsocketTurn{a: a, in: in}
 	data := wsTurnStartData{Kind: archive.KindWSTurn, MessageType: websocketMessageTypeName(kind), WSSessionID: a.sessionID}
 	if gjson.ValidBytes(payload) {
-		// Views of payload until copied below.
-		frame := gjson.Parse(archive.BytesView(payload))
-		data.FrameType = boundedWSTurnField(frame.Get("type").String())
-		data.Model = boundedWSTurnField(frame.Get("model").String())
-		data.PreviousResponseID = boundedWSTurnField(frame.Get("previous_response_id").String())
+		// Views of payload until copied below; JSONText copies nothing
+		// large (gjson would unescape a large string in full).
+		frame := archive.BytesView(payload)
+		data.FrameType = archive.JSONText(frame, wsTurnFieldMax, "type")
+		data.Model = archive.JSONText(frame, wsTurnFieldMax, "model")
+		data.PreviousResponseID = archive.JSONText(frame, wsTurnFieldMax, "previous_response_id")
 		// The turn ID comes from the frame's client_metadata; the upgrade
 		// header is set once per connection and is only a fallback.
-		data.CodexTurnID = boundedWSTurnField(archiveCodexTurnIDFromMetadata(frame.Get(`client_metadata.x-codex-turn-metadata`).String()))
+		data.CodexTurnID = archiveCodexTurnIDFromMetadata(archive.JSONText(frame, wsTurnMetadataMax, "client_metadata", "x-codex-turn-metadata"))
 		if data.CodexTurnID != "" {
 			data.CodexTurnIDSource = "frame"
 		}
@@ -251,7 +252,8 @@ func (t *responsesWebsocketTurn) noteError(outcome string, errMsg *interfaces.Er
 	if t == nil {
 		return
 	}
-	defer recoverWebsocketArchive("ws.note")
+	in := t.in
+	defer recoverWebsocketArchiveFor("ws.note", &in)
 	status := http.StatusInternalServerError
 	if errMsg != nil && errMsg.StatusCode > 0 {
 		status = errMsg.StatusCode
@@ -272,7 +274,8 @@ func (t *responsesWebsocketTurn) noteClientKey(c *gin.Context) {
 	if t == nil || c == nil {
 		return
 	}
-	defer recoverWebsocketArchive("ws.note")
+	in := t.in
+	defer recoverWebsocketArchiveFor("ws.note", &in)
 	if value, ok := c.Get("accessMetadata"); ok {
 		if meta, okMeta := value.(map[string]string); okMeta {
 			t.in.SetClientKey(meta["fleet_key"])
@@ -455,5 +458,5 @@ func archiveCodexTurnIDFromMetadata(metadata string) string {
 	if metadata == "" || !gjson.Valid(metadata) {
 		return ""
 	}
-	return gjson.Get(metadata, "turn_id").String()
+	return archive.JSONText(metadata, wsTurnFieldMax, "turn_id")
 }

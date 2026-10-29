@@ -80,18 +80,21 @@ func (s *Server) stopArchiveRecorder(ctx context.Context) {
 	}
 }
 
-func recoverArchiveTap(where string) {
-	if recovered := recover(); recovered != nil {
-		archive.NoteTapPanic(where, recovered)
-	}
-}
-
-// recoverArchiveTapFor is recoverArchiveTap for a tap recording on in: a
+// recoverArchiveTapFor contains a panic in a tap recording on in: a
 // recovered panic loses what it was recording, so in counts a drop too.
 func recoverArchiveTapFor(where string, in *archive.Ingress) {
 	if recovered := recover(); recovered != nil {
 		archive.NoteTapPanic(where, recovered)
 		in.NoteDrop()
+	}
+}
+
+// recoverArchiveTapAt is recoverArchiveTapFor for a tap that finds its
+// ingress as it runs: *in counts the drop once it is set.
+func recoverArchiveTapAt(where string, in **archive.Ingress) {
+	if recovered := recover(); recovered != nil {
+		archive.NoteTapPanic(where, recovered)
+		(*in).NoteDrop()
 	}
 }
 
@@ -108,8 +111,8 @@ func (s *Server) archiveObserverMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		z6 := takeArchiveZ6Tags(c.Request)
-		obs := s.beginArchiveObservation(rec, c, z6)
+		z6, z6Lost := takeArchiveZ6Tags(c.Request)
+		obs := s.beginArchiveObservation(rec, c, z6, z6Lost)
 		if obs == nil {
 			c.Next()
 			return
@@ -161,13 +164,18 @@ type archiveObservation struct {
 }
 
 // takeArchiveZ6Tags removes every X-Z6-* header from the request and returns
-// their values (the first of each).
-func takeArchiveZ6Tags(req *http.Request) map[string]string {
-	defer recoverArchiveTap("observer.z6")
+// their values (the first of each). lost reports a recovered panic: the
+// request's ingress, not allocated yet, counts it as a drop.
+func takeArchiveZ6Tags(req *http.Request) (tags map[string]string, lost bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			archive.NoteTapPanic("observer.z6", recovered)
+			lost = true
+		}
+	}()
 	if req == nil {
-		return nil
+		return nil, false
 	}
-	var tags map[string]string
 	for name, values := range req.Header {
 		if len(name) < len(archiveZ6HeaderPrefix) || !strings.EqualFold(name[:len(archiveZ6HeaderPrefix)], archiveZ6HeaderPrefix) {
 			continue
@@ -180,7 +188,7 @@ func takeArchiveZ6Tags(req *http.Request) map[string]string {
 		}
 		delete(req.Header, name)
 	}
-	return tags
+	return tags, false
 }
 
 func isArchiveAbortHandler(recovered any) bool {
@@ -188,8 +196,9 @@ func isArchiveAbortHandler(recovered any) bool {
 	return ok && errors.Is(err, http.ErrAbortHandler)
 }
 
-func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context, z6 map[string]string) (obs *archiveObservation) {
-	defer recoverArchiveTap("observer.start")
+func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context, z6 map[string]string, z6Lost bool) (obs *archiveObservation) {
+	var in *archive.Ingress
+	defer recoverArchiveTapAt("observer.start", &in)
 	archiveFault("observer.start")
 	req := c.Request
 	if req == nil || req.URL == nil {
@@ -204,11 +213,13 @@ func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context, 
 	route := c.FullPath()
 	class, allow, _ := s.classifyArchiveRoute(req.Method, route)
 	upgrade := strings.EqualFold(strings.TrimSpace(req.Header.Get("Upgrade")), "websocket")
-	var in *archive.Ingress
 	if upgrade {
 		in = rec.BeginConnection(class, start)
 	} else {
 		in = rec.BeginIngress(class, start)
+	}
+	if z6Lost {
+		in.NoteDrop()
 	}
 	inference := class == archive.RouteInference
 	o := &archiveObservation{
@@ -221,7 +232,7 @@ func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context, 
 		clientIP: c.ClientIP(),
 		rawQuery: req.URL.RawQuery,
 		upgrade:  upgrade,
-		resp:     &archiveResponseState{inference: inference},
+		resp:     &archiveResponseState{inference: inference, in: in},
 	}
 	o.writer = &archiveResponseWriter{ResponseWriter: c.Writer, state: o.resp}
 	c.Writer = o.writer
@@ -265,7 +276,7 @@ func (s *Server) beginArchiveObservation(rec *archive.Recorder, c *gin.Context, 
 // observer's deferred function, also while a panic or Goexit unwinds. When
 // Stop finalized the observation first, it only ends the tee.
 func (o *archiveObservation) finish(c *gin.Context, recovered any, aborted bool) {
-	defer recoverArchiveTap("observer.finish")
+	defer recoverArchiveTapFor("observer.finish", o.in)
 	if o.tee != nil {
 		// Also when the rest of finish panics, so the tee never strands its
 		// reservation. Ending the tee twice is harmless.
@@ -363,7 +374,7 @@ func (o *archiveObservation) emitIngressEndLocked(end time.Time, summary archive
 		return
 	}
 	o.tee.endThen(ended, func() {
-		defer recoverArchiveTap("observer.finish")
+		defer recoverArchiveTapFor("observer.finish", o.in)
 		o.in.EmitReserved(ev, reserved)
 	})
 }
@@ -384,7 +395,7 @@ func (o *archiveObservation) untrackLocked() {
 // does afterwards is not recorded, so it counts as a drop: an ingress_end
 // with ended shutdown always has capture_drops.
 func (o *archiveObservation) FinalizeAtStop() {
-	defer recoverArchiveTap("observer.stop")
+	defer recoverArchiveTapFor("observer.stop", o.in)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	defer o.untrackLocked()
@@ -432,15 +443,17 @@ func (o *archiveObservation) FinalizeAtStop() {
 // archiveNoteAuthDenial records the gate code of a request the access
 // middleware refused with a fleet code (fleet_route_denied: ...).
 func archiveNoteAuthDenial(c *gin.Context, message string) {
-	defer recoverArchiveTap("observer.auth")
+	var in *archive.Ingress
+	defer recoverArchiveTapAt("observer.auth", &in)
 	if !archive.Installed() || c == nil || c.Request == nil {
 		return
 	}
+	in = archive.IngressFromContext(c.Request.Context())
 	code, _, found := strings.Cut(message, ":")
 	if !found || !archiveGateCode.MatchString(code) {
 		return
 	}
-	archive.IngressFromContext(c.Request.Context()).NoteGate(code)
+	in.NoteGate(code)
 }
 
 var archiveGateCode = regexp.MustCompile(`^fleet_[a-z_]{1,48}$`)
@@ -636,9 +649,12 @@ type archiveMetadataOnlyData struct {
 }
 
 // archiveResponseState is what the writer wrapper observes. Handlers may
-// write from their own goroutines, so it is updated atomically.
+// write from their own goroutines, so it is updated atomically. A panic
+// recovered while observing loses part of the response summary, so in (the
+// request's ingress) counts it as a drop.
 type archiveResponseState struct {
 	inference bool
+	in        *archive.Ingress
 	bytes     atomic.Int64
 	firstByte atomic.Int64
 	hijacked  atomic.Bool
@@ -653,7 +669,7 @@ type archiveHeaderSnapshot struct {
 
 // noteCommit captures the response headers as they are about to be sent.
 func (st *archiveResponseState) noteCommit(w gin.ResponseWriter) {
-	defer recoverArchiveTap("writer.commit")
+	defer recoverArchiveTapFor("writer.commit", st.ingress())
 	if st == nil || st.headers.Load() != nil || w.Written() {
 		return
 	}
@@ -684,7 +700,7 @@ func (st *archiveResponseState) snapshot(h http.Header) *archiveHeaderSnapshot {
 }
 
 func (st *archiveResponseState) noteWrite(n int) {
-	defer recoverArchiveTap("writer.write")
+	defer recoverArchiveTapFor("writer.write", st.ingress())
 	if st == nil || n <= 0 {
 		return
 	}
@@ -696,10 +712,18 @@ func (st *archiveResponseState) noteWrite(n int) {
 }
 
 func (st *archiveResponseState) noteHijack() {
-	defer recoverArchiveTap("writer.hijack")
+	defer recoverArchiveTapFor("writer.hijack", st.ingress())
 	if st != nil {
+		archiveFault("writer.hijack")
 		st.hijacked.Store(true)
 	}
+}
+
+func (st *archiveResponseState) ingress() *archive.Ingress {
+	if st == nil {
+		return nil
+	}
+	return st.in
 }
 
 // archiveResponseWriter counts the bytes actually written below response
@@ -825,6 +849,7 @@ type archiveBodyTee struct {
 	sawEOF     bool
 	readErr    string
 	reading    int
+	lost       bool // a recovered panic lost part of the capture
 	endPending string
 	// afterEnd runs once client_body has been emitted (ingress_end).
 	afterEnd  func()
@@ -976,7 +1001,10 @@ func (t *archiveBodyTee) runAfterEndLocked() {
 }
 
 // recoverLocked is the deferred guard of every tee step: after a tap panic
-// it returns the reservation and stops capturing, so nothing is stranded.
+// it returns the reservation and stops capturing, so nothing is stranded,
+// and the loss counts against the request: client_body records the body as
+// dropped (never unread, even if the panic lost the only read's count), or,
+// when the panic lost client_body itself, the request counts the drop.
 func (t *archiveBodyTee) recoverLocked(where string) {
 	recovered := recover()
 	if recovered == nil {
@@ -987,7 +1015,10 @@ func (t *archiveBodyTee) recoverLocked(where string) {
 		// Returns the reservation; only a capturing tee holds one.
 		t.dropLocked(archive.DropTapPanic)
 	}
-	if t.done && !t.handedOff {
+	switch {
+	case !t.done:
+		t.lost = true
+	case !t.handedOff:
 		// The panic came while emitting: the event is lost.
 		t.handedOff = true
 		t.in.NoteDrop()
@@ -1081,7 +1112,7 @@ func (t *archiveBodyTee) emitLocked(ended string) {
 		data.DeliveredBytes = t.limit
 		data.Truncated = true
 	}
-	if t.consumed == 0 && !t.sawEOF && t.readErr == "" && ended != archiveEndedShutdown {
+	if t.consumed == 0 && !t.sawEOF && t.readErr == "" && !t.lost && ended != archiveEndedShutdown {
 		// Never read by the handler, so not read by the recorder either.
 		t.releaseLocked()
 		t.handedOff = true
@@ -1131,12 +1162,13 @@ func archiveContentMiddleware(c *gin.Context) {
 }
 
 func newArchiveContentWriter(c *gin.Context) (w *archiveContentWriter) {
-	defer recoverArchiveTap("content.start")
+	var in *archive.Ingress
+	defer recoverArchiveTapAt("content.start", &in)
 	value, ok := c.Get(archiveIngressContextKey)
 	if !ok {
 		return nil
 	}
-	in, _ := value.(*archive.Ingress)
+	in, _ = value.(*archive.Ingress)
 	// A WebSocket's frames are recorded by its handler.
 	if in == nil || in.Class() != archive.RouteInference || in.Kind() != archive.KindHTTP {
 		return nil

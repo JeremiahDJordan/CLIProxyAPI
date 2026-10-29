@@ -533,3 +533,38 @@ func TestArchiveWebsocketSteeringTurnTrafficIsNotOnTheConnection(t *testing.T) {
 		t.Fatal("the steering connection did not count its unrecorded turns")
 	}
 }
+
+// Round-4 finding 3: the turn's fields are read without unescaping large
+// strings (gjson unescapes every string it returns at full size). With the
+// queue full, a frame whose model, previous_response_id, turn metadata and
+// a member name are 8 MiB escaped strings allocates nothing of their size,
+// and a short escaped field is still read.
+func TestArchiveTurnFrameEscapedFieldsAreBounded(t *testing.T) {
+	startArchiveForWebsocket(t, func(o *archive.TestOverrides) { o.QueueBytes = 1024; o.FsyncInterval = time.Hour })
+	rec := archive.Current()
+	conn := rec.BeginConnection(archive.RouteInference, time.Now())
+	a := &responsesWebsocketArchive{rec: rec, conn: conn, open: map[*responsesWebsocketTurn]struct{}{}}
+	escape := func(n int, hex string) string {
+		// Built from 0x5c, so this source holds no escape.
+		return strings.Repeat(string([]byte{0x5c, 'u', '0', '0', hex[0], hex[1]}), n/6)
+	}
+	escaped := escape(8<<20, "61")
+	payload := []byte(`{"` + escaped + `":1,"type":"response.cre` + escape(6, "61") + `te","model":"` + escaped + `","previous_response_id":"` + escaped +
+		`","client_metadata":{"x-codex-turn-metadata":"` + escaped + `"}}`)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	turn := a.beginTurn(websocket.TextMessage, payload)
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= 1<<20 {
+		t.Fatalf("a refused frame with 8 MiB escaped fields allocated %d bytes", allocated)
+	}
+	if turn == nil {
+		t.Fatal("no turn")
+	}
+	turn.end(archiveTurnEnded)
+	if got := archive.JSONText(archive.BytesView(payload), wsTurnFieldMax, "type"); got != "response.create" {
+		t.Fatalf("frame type = %q", got)
+	}
+	runtime.KeepAlive(payload)
+}
