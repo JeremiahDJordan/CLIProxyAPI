@@ -3,6 +3,8 @@ package archive
 import (
 	"cmp"
 	"context"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,6 +32,8 @@ type Attempt struct {
 	gateCode string
 	ids      identities
 	last     requestCredential // of the latest outbound request
+	// discarded bodies still being read, finalized when the attempt ends.
+	discarded []*discardedBody
 }
 
 // requestCredential names the provider and credential of an outbound request.
@@ -98,8 +102,10 @@ func WithAttempt(ctx context.Context) (out context.Context) {
 	if !Installed() || ctx == nil {
 		return ctx
 	}
-	defer recoverTap("attempt.open", nil)
-	in := IngressFromContext(ctx)
+	// A lost attempt leaves its traffic on the request's implicit attempt.
+	var in *Ingress
+	defer recoverTap("attempt.open", &in)
+	in = IngressFromContext(ctx)
 	if in == nil || in.rec == nil || in.class != RouteInference {
 		return ctx
 	}
@@ -346,7 +352,13 @@ func (a *Attempt) end(end AttemptEnd, now time.Time) {
 		identities:  a.ids.clone(),
 	}
 	seq := a.seq
+	discarded := a.discarded
+	a.discarded = nil
 	a.mu.Unlock()
+	// Before attempt_end, and so before ingress_end counts the drops.
+	for _, d := range discarded {
+		d.finalize(DropTruncated, discardedStoppedAttemptEnd)
+	}
 
 	a.in.mu.Lock()
 	for i, open := range a.in.open {
@@ -376,23 +388,28 @@ func (ids *identities) empty() bool {
 	return len(ids.ResponseIDs) == 0 && ids.PreviousResponseID == "" && len(ids.OutputItemIDs) == 0
 }
 
+// addResponse and addItem collect identities found in one upstream event,
+// as views of it; merge copies those an attempt or request keeps.
 func (ids *identities) addResponse(id string) {
-	ids.ResponseIDs = appendUnique(ids.ResponseIDs, id, maxResponseIDs)
+	ids.ResponseIDs = appendUnique(ids.ResponseIDs, id, maxResponseIDs, false)
 }
 
 func (ids *identities) addItem(id string) {
-	ids.OutputItemIDs = appendUnique(ids.OutputItemIDs, id, maxOutputItemIDs)
+	ids.OutputItemIDs = appendUnique(ids.OutputItemIDs, id, maxOutputItemIDs, false)
 }
 
+// merge adds o's identities, copying each one it keeps, so a kept identity
+// never refers to the event it was read from; one over the limits, or
+// already kept, is never copied.
 func (ids *identities) merge(o identities) {
 	for _, id := range o.ResponseIDs {
-		ids.addResponse(id)
+		ids.ResponseIDs = appendUnique(ids.ResponseIDs, id, maxResponseIDs, true)
 	}
 	if ids.PreviousResponseID == "" && len(o.PreviousResponseID) <= maxOwnedLen {
-		ids.PreviousResponseID = o.PreviousResponseID
+		ids.PreviousResponseID = strings.Clone(o.PreviousResponseID)
 	}
 	for _, id := range o.OutputItemIDs {
-		ids.addItem(id)
+		ids.OutputItemIDs = appendUnique(ids.OutputItemIDs, id, maxOutputItemIDs, true)
 	}
 }
 
@@ -408,14 +425,14 @@ func (ids identities) sizeHint() int64 {
 	return stringsSize(ids.ResponseIDs...) + stringsSize(ids.PreviousResponseID) + stringsSize(ids.OutputItemIDs...) + 64
 }
 
-func appendUnique(list []string, id string, limit int) []string {
-	if id == "" || len(id) > maxOwnedLen || len(list) >= limit {
+// appendUnique appends id when it is new and list has room, copying it
+// first when keep is set.
+func appendUnique(list []string, id string, limit int, keep bool) []string {
+	if id == "" || len(id) > maxOwnedLen || len(list) >= limit || slices.Contains(list, id) {
 		return list
 	}
-	for _, have := range list {
-		if have == id {
-			return list
-		}
+	if keep {
+		id = strings.Clone(id)
 	}
 	return append(list, id)
 }

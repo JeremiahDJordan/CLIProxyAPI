@@ -437,10 +437,12 @@ func isJSONObject(raw []byte) bool {
 
 // BytesView returns b as a string without copying it, for gjson.Parse and
 // gjson.Get, which then copy nothing either: their results are substrings
-// of b (gjson.ParseBytes and GetBytes copy). b must not change while the
-// view is in use, and nothing that outlives the caller may refer to the
-// view or a result read from it: copy what is kept (OwnedString), after the
-// event that keeps it is reserved where it can be large.
+// of b (gjson.ParseBytes and GetBytes copy), except strings, which gjson
+// unescapes into a copy as large as the string: read a view with JSONText
+// where a string can be large. b must not change while the view is in use,
+// and nothing that outlives the caller may refer to the view or a result
+// read from it: copy what is kept (OwnedString), after the event that keeps
+// it is reserved where it can be large.
 func BytesView(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
@@ -459,9 +461,10 @@ func OwnedString(s string) string {
 	return strings.Clone(s)
 }
 
-// owned is OwnedString of a result's string value.
-func owned(r gjson.Result) string {
-	return OwnedString(r.String())
+// idAt is the identity-sized string at the object path keys in obj, a view
+// (JSONText); noteIDs copies the identities it keeps.
+func idAt(obj string, keys ...string) string {
+	return JSONText(obj, maxOwnedLen, keys...)
 }
 
 // notePrevious records previous_response_id from an outbound body.
@@ -469,18 +472,20 @@ func (a *Attempt) notePrevious(body []byte) {
 	if !bytes.Contains(body, []byte(`"previous_response_id"`)) {
 		return
 	}
-	if prev := gjson.Get(BytesView(body), "previous_response_id"); prev.Type == gjson.String {
-		a.noteIDs(identities{PreviousResponseID: owned(prev)})
+	if prev := idAt(BytesView(body), "previous_response_id"); prev != "" {
+		a.noteIDs(identities{PreviousResponseID: prev})
 	}
 }
 
 // inspect reads raw usage and identities from an upstream event or body:
 // Anthropic message_start/message_delta/content_block_start, Responses
 // response.* and output items, and non-streamed JSON bodies. It parses only
-// chunks that can carry them, through a view of the chunk (BytesView), so a
-// large event is never copied outside the queue's reservations: identities,
-// the model and the event type are copied out bounded (owned), and the usage
-// object only once its event is reserved (emitUsage).
+// chunks that can carry them, through raw views of the chunk (BytesView,
+// jsonGet), so a large event is never copied outside the queue's
+// reservations: identities are collected as views and copied only when the
+// attempt keeps them (noteIDs, after its limits and duplicate checks), the
+// model and the event type are copied bounded, and the usage object only
+// once its event is reserved (emitUsage).
 func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 	data := bytes.TrimSpace(chunk)
 	if rest, ok := bytes.CutPrefix(data, []byte("data:")); ok {
@@ -496,73 +501,73 @@ func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 	if !gjson.ValidBytes(data) {
 		return
 	}
-	root := gjson.Parse(BytesView(data))
-	var found identities
-	var usage, model gjson.Result
-	event := root.Get("type").String() // a view: copied below when kept
+	root := BytesView(data)
+	var found identities // views of root
+	var usage, model string
+	event := idAt(root, "type")
 	switch event {
 	case "message_start":
-		message := root.Get("message")
-		found.addResponse(owned(message.Get("id")))
-		usage, model = message.Get("usage"), message.Get("model")
+		message := jsonGet(root, "message")
+		found.addResponse(idAt(message, "id"))
+		usage, model = jsonGet(message, "usage"), jsonGet(message, "model")
 	case "message_delta":
-		usage = root.Get("usage")
+		usage = jsonGet(root, "usage")
 	case "content_block_start":
-		found.addItem(owned(root.Get("content_block.id")))
+		found.addItem(idAt(root, "content_block", "id"))
 	case "response.created", "response.in_progress", "response.completed", "response.done",
 		"response.failed", "response.incomplete":
-		response := root.Get("response")
-		found.addResponse(owned(response.Get("id")))
-		found.PreviousResponseID = owned(response.Get("previous_response_id"))
-		usage, model = response.Get("usage"), response.Get("model")
+		response := jsonGet(root, "response")
+		found.addResponse(idAt(response, "id"))
+		found.PreviousResponseID = idAt(response, "previous_response_id")
+		usage, model = jsonGet(response, "usage"), jsonGet(response, "model")
 	case "response.output_item.added", "response.output_item.done":
-		item := root.Get("item")
-		found.addItem(owned(item.Get("id")))
-		found.addItem(owned(item.Get("call_id")))
+		item := jsonGet(root, "item")
+		found.addItem(idAt(item, "id"))
+		found.addItem(idAt(item, "call_id"))
 	case "message":
 		// A non-streamed Anthropic Messages body.
-		found.addResponse(owned(root.Get("id")))
-		usage, model = root.Get("usage"), root.Get("model")
-		root.Get("content").ForEach(func(_, block gjson.Result) bool {
-			found.addItem(owned(block.Get("id")))
+		found.addResponse(idAt(root, "id"))
+		usage, model = jsonGet(root, "usage"), jsonGet(root, "model")
+		jsonEach(jsonGet(root, "content"), func(block string) bool {
+			found.addItem(idAt(block, "id"))
 			return true
 		})
 		event = "body"
 	default:
 		switch {
-		case root.Get("object").String() == "response":
+		case idAt(root, "object") == "response":
 			// A non-streamed Responses body.
-			found.addResponse(owned(root.Get("id")))
-			found.PreviousResponseID = owned(root.Get("previous_response_id"))
-			usage, model = root.Get("usage"), root.Get("model")
-			root.Get("output").ForEach(func(_, item gjson.Result) bool {
-				found.addItem(owned(item.Get("id")))
-				found.addItem(owned(item.Get("call_id")))
+			found.addResponse(idAt(root, "id"))
+			found.PreviousResponseID = idAt(root, "previous_response_id")
+			usage, model = jsonGet(root, "usage"), jsonGet(root, "model")
+			jsonEach(jsonGet(root, "output"), func(item string) bool {
+				found.addItem(idAt(item, "id"))
+				found.addItem(idAt(item, "call_id"))
 				return true
 			})
 			event = "body"
-		case root.Get("usageMetadata").IsObject():
+		case jsonIsObject(jsonGet(root, "usageMetadata")):
 			// Gemini.
-			found.addResponse(owned(root.Get("responseId")))
-			usage, model = root.Get("usageMetadata"), root.Get("modelVersion")
+			found.addResponse(idAt(root, "responseId"))
+			usage, model = jsonGet(root, "usageMetadata"), jsonGet(root, "modelVersion")
 			if event == "" {
 				event = "usageMetadata"
 			}
-		case root.Get("usage").IsObject():
+		case jsonIsObject(jsonGet(root, "usage")):
 			// Chat Completions and other bodies or chunks with top-level usage.
-			found.addResponse(owned(root.Get("id")))
-			usage, model = root.Get("usage"), root.Get("model")
+			found.addResponse(idAt(root, "id"))
+			usage, model = jsonGet(root, "usage"), jsonGet(root, "model")
 			if event == "" {
 				event = "body"
 			}
 		}
 	}
 	a.noteIDs(found)
-	if !usage.IsObject() {
+	if !jsonIsObject(usage) {
 		return
 	}
 	emitUsage(a.in, &Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub},
-		usageData{Source: "upstream", Event: OwnedString(event), Model: owned(model)}, usage.Raw)
+		usageData{Source: "upstream", Event: OwnedString(event), Model: OwnedString(jsonText(model, maxOwnedLen))}, usage)
 }
 
 // emitUsage queues a usage event carrying a redacted copy (RedactJSON) of
@@ -618,15 +623,7 @@ func emitBody[B []byte | string](in *Ingress, ev *Event, body B) {
 func emitBodyFill(in *Ingress, ev *Event, size int64, encoding string, fill func(dst []byte) bool) {
 	rec := in.rec
 	if !rec.CaptureBodies() {
-		if rec.acceptsEvents() {
-			reason := rec.BodyDropReason()
-			rec.CountDrop(reason, DropCount{Bodies: 1, Bytes: max(size, 0)})
-			in.NoteDrop()
-			ev.Capture = CaptureDroppedBody
-			ev.BodyDropped = reason
-		}
-		// When events are refused too, Emit drops and counts the event.
-		in.Emit(ev)
+		in.emitBodyOff(ev, size)
 		return
 	}
 	if size < 0 {
