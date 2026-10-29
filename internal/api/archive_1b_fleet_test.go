@@ -479,3 +479,34 @@ func TestArchiveContentTapDoesNotCopyRefusedWrites(t *testing.T) {
 		t.Fatalf("request drops = %d", in.Drops())
 	}
 }
+
+// Round-3 finding 4: a panic recovered while recording a response write
+// loses that downstream_event, so the request counts a drop and its
+// ingress_end reports it; the response itself is unaffected.
+func TestArchiveContentTapPanicCountsAgainstItsRequest(t *testing.T) {
+	server, spool := newArchiveServer(t, nil)
+	classifyForTest(t, http.MethodGet, "/archive-test/content-panic")
+	server.engine.GET("/archive-test/content-panic", func(c *gin.Context) {
+		c.String(http.StatusOK, "answer")
+	})
+	archiveTapFault = func(where string) {
+		if where == "content.write" {
+			panic("injected tap panic in " + where)
+		}
+	}
+	t.Cleanup(func() { archiveTapFault = nil })
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/archive-test/content-panic", nil))
+	archiveTapFault = nil
+	if rec.Code != http.StatusOK || rec.Body.String() != "answer" {
+		t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
+	}
+	events := spoolEvents(t, spool)
+	ends := eventsFor(events, archive.TypeIngressEnd, "/archive-test/content-panic")
+	if len(ends) != 1 || ends[0]["capture_drops"] != float64(1) {
+		t.Fatalf("ingress_end = %v", ends)
+	}
+	if got := eventsFor(events, archive.TypeDownstreamEvent, "/archive-test/content-panic"); len(got) != 0 {
+		t.Fatalf("downstream_event = %v", got)
+	}
+}

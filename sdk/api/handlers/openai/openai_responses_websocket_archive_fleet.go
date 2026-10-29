@@ -44,11 +44,14 @@ const (
 )
 
 // responsesWebsocketArchive records one connection's turns and frames. It is
-// nil when capture is off, when the upgrade request was not recorded as an
-// inference connection, or when response steering is on for the connection.
+// nil when capture is off or when the upgrade request was not recorded as an
+// inference connection. With response steering on for the connection it
+// records nothing (steering): it only detaches each turn's execution from
+// the connection's ingress, so no turn traffic is recorded on the connection.
 type responsesWebsocketArchive struct {
 	rec          *archive.Recorder
 	conn         *archive.Ingress
+	steering     bool
 	sessionID    string // the handler's session id, as logged
 	headerTurnID string // x-codex-turn-metadata of the upgrade request: a fallback only
 
@@ -73,19 +76,22 @@ func newResponsesWebsocketArchive(c *gin.Context, sessionID string, steering boo
 	if steering {
 		// The steering guard: the duplex executor reads later frames itself
 		// and its events are not tagged per turn yet, so this connection's
-		// turns are not recorded (counted as a gap). Capture refuses to start
-		// with steering on; this covers it being turned on by a reload.
+		// turns are not recorded (counted as a gap, and against the
+		// connection, whose ingress_end must not look complete). Capture
+		// refuses to start with steering on; this covers it being turned on
+		// by a reload.
 		conn.Recorder().CountDrop(archive.DropSteeringTurns, archive.DropCount{Events: 1})
+		conn.NoteDrop()
 		if steeringCaptureWarned.CompareAndSwap(false, true) {
 			log.Warn("request archive: codex.response-steering is on; WebSocket turns of steering connections are not recorded")
 		}
-		return nil
+		return &responsesWebsocketArchive{conn: conn, steering: true}
 	}
 	return &responsesWebsocketArchive{
 		rec:          conn.Recorder(),
 		conn:         conn,
 		sessionID:    sessionID,
-		headerTurnID: archiveCodexTurnIDFromMetadata(c.Request.Header.Get("X-Codex-Turn-Metadata")),
+		headerTurnID: boundedWSTurnField(archiveCodexTurnIDFromMetadata(c.Request.Header.Get("X-Codex-Turn-Metadata"))),
 		open:         map[*responsesWebsocketTurn]struct{}{},
 	}
 }
@@ -93,6 +99,18 @@ func newResponsesWebsocketArchive(c *gin.Context, sessionID string, steering boo
 func recoverWebsocketArchive(where string) {
 	if recovered := recover(); recovered != nil {
 		archive.NoteTapPanic(where, recovered)
+	}
+}
+
+// recoverWebsocketArchiveFor is recoverWebsocketArchive for a step recording
+// on *in: a recovered panic loses what it was recording, so *in counts a
+// drop too.
+func recoverWebsocketArchiveFor(where string, in **archive.Ingress) {
+	if recovered := recover(); recovered != nil {
+		archive.NoteTapPanic(where, recovered)
+		if in != nil {
+			(*in).NoteDrop()
+		}
 	}
 }
 
@@ -145,14 +163,22 @@ func websocketMessageTypeName(kind int) string {
 	return "text"
 }
 
+// Longest frame_type, model, previous_response_id and codex_turn_id a
+// turn's ingress_start keeps; longer values are dropped (the frame itself is
+// recorded byte for byte).
+const wsTurnFieldMax = 256
+
 // beginTurn allocates a turn for a frame read from the client and records
 // its ingress_start and the frame itself (before tool-call repair or any
-// other rewriting).
+// other rewriting). The frame's fields are read through a view of it, not a
+// copy, and copied only once the ingress_start is reserved, so a frame the
+// queue refuses costs nothing of its size.
 func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *responsesWebsocketTurn) {
-	if a == nil {
+	if a == nil || a.steering {
 		return nil
 	}
-	defer recoverWebsocketArchive("ws.turn")
+	var in *archive.Ingress
+	defer recoverWebsocketArchiveFor("ws.turn", &in)
 	if !a.rec.CaptureEvents() {
 		// Low space, a failed writer or Stop: the turn is not recorded,
 		// which counts against its connection too.
@@ -161,17 +187,18 @@ func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *resp
 		return nil
 	}
 	now := time.Now()
-	in := a.rec.BeginTurn(a.conn, now)
+	in = a.rec.BeginTurn(a.conn, now)
 	t = &responsesWebsocketTurn{a: a, in: in}
 	data := wsTurnStartData{Kind: archive.KindWSTurn, MessageType: websocketMessageTypeName(kind), WSSessionID: a.sessionID}
 	if gjson.ValidBytes(payload) {
-		frame := gjson.ParseBytes(payload)
-		data.FrameType = frame.Get("type").String()
-		data.Model = frame.Get("model").String()
-		data.PreviousResponseID = frame.Get("previous_response_id").String()
+		// Views of payload until copied below.
+		frame := gjson.Parse(archive.BytesView(payload))
+		data.FrameType = boundedWSTurnField(frame.Get("type").String())
+		data.Model = boundedWSTurnField(frame.Get("model").String())
+		data.PreviousResponseID = boundedWSTurnField(frame.Get("previous_response_id").String())
 		// The turn ID comes from the frame's client_metadata; the upgrade
 		// header is set once per connection and is only a fallback.
-		data.CodexTurnID = archiveCodexTurnIDFromMetadata(frame.Get(`client_metadata.x-codex-turn-metadata`).String())
+		data.CodexTurnID = boundedWSTurnField(archiveCodexTurnIDFromMetadata(frame.Get(`client_metadata.x-codex-turn-metadata`).String()))
 		if data.CodexTurnID != "" {
 			data.CodexTurnIDSource = "frame"
 		}
@@ -179,8 +206,15 @@ func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *resp
 	if data.CodexTurnID == "" && a.headerTurnID != "" {
 		data.CodexTurnID, data.CodexTurnIDSource = a.headerTurnID, "header"
 	}
-	in.Emit(&archive.Event{Type: archive.TypeIngressStart, Time: now, Capture: archive.CaptureFull, Data: data,
-		SizeHint: int64(len(data.FrameType)+len(data.Model)+len(data.PreviousResponseID)+len(data.CodexTurnID)+len(data.WSSessionID)) + 64})
+	ev := &archive.Event{Type: archive.TypeIngressStart, Time: now, Capture: archive.CaptureFull,
+		SizeHint: int64(len(data.FrameType)+len(data.Model)+len(data.PreviousResponseID)+len(data.CodexTurnID)+len(data.WSSessionID)) + 64}
+	in.EmitCopying(ev, func(ev *archive.Event) {
+		data.FrameType = strings.Clone(data.FrameType)
+		data.Model = strings.Clone(data.Model)
+		data.PreviousResponseID = strings.Clone(data.PreviousResponseID)
+		data.CodexTurnID = strings.Clone(data.CodexTurnID)
+		ev.Data = data
+	})
 	archive.EmitClientFrame(in, now, wsFrameData{Direction: "in", MessageType: data.MessageType}, 16, payload)
 	a.mu.Lock()
 	a.open[t] = struct{}{}
@@ -189,6 +223,14 @@ func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *resp
 	t.tracked = a.rec.TrackObserver(t)
 	t.mu.Unlock()
 	return t
+}
+
+// boundedWSTurnField drops a value longer than wsTurnFieldMax.
+func boundedWSTurnField(value string) string {
+	if len(value) > wsTurnFieldMax {
+		return ""
+	}
+	return value
 }
 
 // note records the turn's outcome; the last one noted wins.
@@ -239,8 +281,9 @@ func (t *responsesWebsocketTurn) noteClientKey(c *gin.Context) {
 }
 
 // turnContext attaches turn to its execution context. A turn that is not
-// recorded (nil) is detached from its connection, whose ingress the context
-// also carries, so its traffic is not recorded there.
+// recorded (nil, and every turn of a steering connection) is detached from
+// its connection, whose ingress the context also carries, so its traffic is
+// not recorded there.
 func (a *responsesWebsocketArchive) turnContext(t *responsesWebsocketTurn, ctx context.Context) context.Context {
 	if a == nil {
 		return ctx
@@ -258,7 +301,8 @@ func (t *responsesWebsocketTurn) end(ended string) {
 	if t == nil {
 		return
 	}
-	defer recoverWebsocketArchive("ws.turn.end")
+	in := t.in
+	defer recoverWebsocketArchiveFor("ws.turn.end", &in)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.ended {
@@ -318,7 +362,7 @@ func (a *responsesWebsocketArchive) take(t *responsesWebsocketTurn, endAdmission
 // closeTurns ends the turns the handler never took (still queued when the
 // connection closed). The reader has stopped by then.
 func (a *responsesWebsocketArchive) closeTurns() {
-	if a == nil {
+	if a == nil || a.steering {
 		return
 	}
 	a.mu.Lock()
@@ -346,11 +390,12 @@ func (a *responsesWebsocketArchive) downstream(kind int, payload []byte, errWrit
 // downstreamFor records a frame written to the client on turn, or, when turn
 // is nil, as downstream does.
 func (a *responsesWebsocketArchive) downstreamFor(turn *responsesWebsocketTurn, kind int, payload []byte, errWrite error) {
-	if a == nil {
+	if a == nil || a.steering {
 		return
 	}
-	defer recoverWebsocketArchive("ws.downstream")
-	target := a.conn
+	var target *archive.Ingress
+	defer recoverWebsocketArchiveFor("ws.downstream", &target)
+	target = a.conn
 	t := turn
 	if t == nil {
 		t = a.current.Load()

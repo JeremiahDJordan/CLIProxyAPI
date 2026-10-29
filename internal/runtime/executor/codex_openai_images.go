@@ -128,7 +128,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
-	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -235,7 +235,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
-	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -377,7 +377,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
-	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -449,7 +449,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
-	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq, body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -770,24 +770,26 @@ func (e *CodexExecutor) prepareCodexOpenAIImageBody(ctx context.Context, auth *c
 	return normalizeCodexInstructions(out), nil
 }
 
-func recordCodexOpenAIImageRequest(ctx context.Context, cfg *config.Config, provider string, auth *cliproxyauth.Auth, url string, headers http.Header, body []byte) {
+// fleet: takes httpReq (not its headers) so the archive records its body as
+// sent (zstd when compressed).
+func recordCodexOpenAIImageRequest(ctx context.Context, cfg *config.Config, provider string, auth *cliproxyauth.Auth, url string, httpReq *http.Request, body []byte) {
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, cfg, helps.UpstreamRequestLog{
+	helps.RecordAPIRequestOnWire(ctx, cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
-		Headers:   headers,
+		Headers:   httpReq.Header.Clone(),
 		Body:      body,
 		Provider:  provider,
 		AuthID:    authID,
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}, httpReq)
 }
 
 func codexPrepareOpenAIImageRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (codexOpenAIImagePreparedRequest, error) {

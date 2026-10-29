@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,3 +191,103 @@ func TestArchiveDevinOutboundBodyIsNotCaptured(t *testing.T) {
 		}
 	}
 }
+
+// Round-3 finding 3: with upstream request compression on, the archive
+// records each send's own bytes and headers: the zstd body first, then the
+// rejected response (status, headers and body, before it is discarded), then
+// the uncompressed resend as its own sub-attempt of the same attempt, marked
+// resend compression_rejected and carrying the first request's credential.
+func TestArchiveCodexCompressionRecordsEachSend(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			spool, in := startArchiveForExecutor(t)
+			var wires [][]byte
+			var encodings []string
+			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				data, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wires = append(wires, data)
+				encodings = append(encodings, req.Header.Get("Content-Encoding"))
+				if len(wires) == 1 {
+					return &http.Response{StatusCode: http.StatusUnsupportedMediaType, Header: http.Header{"X-Reject": {"zstd"}},
+						Body: io.NopCloser(strings.NewReader(`{"error":"compression rejected"}`))}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(strings.NewReader("data: " + codexCompletedEventBody + "\n\n"))}, nil
+			})
+			ctx := context.WithValue(archive.WithIngress(context.Background(), in), "cliproxy.roundtripper", rt)
+			auth := codexCompressionAuth()
+			auth.ID, auth.Label = "codex-archive-auth", "codex-archive-label"
+			e := NewCodexExecutor(codexCompressionConfig())
+			req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: codexCompressionPayload()}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+			if stream {
+				result, err := e.ExecuteStream(ctx, auth, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for range result.Chunks {
+				}
+			} else if _, err := e.Execute(ctx, auth, req, opts); err != nil {
+				t.Fatal(err)
+			}
+			if len(wires) != 2 || encodings[0] != "zstd" || encodings[1] != "" {
+				t.Fatalf("sent %d requests with encodings %v", len(wires), encodings)
+			}
+			requests := executorArchiveEvents(t, spool, archive.TypeUpstreamRequest)
+			if len(requests) != 2 {
+				t.Fatalf("%d upstream_request events for 2 sends", len(requests))
+			}
+			for i, ev := range requests {
+				if !bytes.Equal(executorArchiveBody(t, ev), wires[i]) || ev["sub_attempt"] != float64(i) || ev["attempt_seq"] != requests[0]["attempt_seq"] {
+					t.Fatalf("request %d: recorded %v; sent %d bytes", i, ev, len(wires[i]))
+				}
+				encoding, _ := ev["headers"].(map[string]any)["Content-Encoding"].([]any)
+				bodyEncoding, _ := ev["body"].(map[string]any)["content_encoding"].(string)
+				if (i == 0) != (len(encoding) == 1 && encoding[0] == "zstd" && bodyEncoding == "zstd") || (i == 1 && bodyEncoding != "") {
+					t.Fatalf("request %d: Content-Encoding %v, body content_encoding %q", i, encoding, bodyEncoding)
+				}
+				if ev["auth_id"] != auth.ID || ev["auth_label"] != auth.Label || ev["provider"] != "codex" {
+					t.Fatalf("request %d: credential %v %v %v", i, ev["auth_id"], ev["auth_label"], ev["provider"])
+				}
+			}
+			if requests[0]["resend"] != nil || requests[1]["resend"] != archive.ResendCompressionRejected {
+				t.Fatalf("resend: %v / %v", requests[0]["resend"], requests[1]["resend"])
+			}
+			meta := executorArchiveEvents(t, spool, archive.TypeUpstreamResponseMeta)
+			if len(meta) != 2 || meta[0]["status"] != float64(http.StatusUnsupportedMediaType) || meta[0]["sub_attempt"] != float64(0) ||
+				meta[1]["status"] != float64(http.StatusOK) || meta[1]["sub_attempt"] != float64(1) {
+				t.Fatalf("upstream_response_meta = %v", meta)
+			}
+			chunks := executorArchiveEvents(t, spool, archive.TypeUpstreamEvent)
+			if len(chunks) == 0 || chunks[0]["sub_attempt"] != float64(0) || string(executorArchiveBody(t, chunks[0])) != `{"error":"compression rejected"}` {
+				t.Fatalf("upstream_event = %v", chunks)
+			}
+		})
+	}
+}
+
+// Round-3 finding 3: with capture off for the request, the rejected body is
+// not read for the archive (the executor closes it unread, as upstream does).
+func TestArchiveRejectedResponseReadsNothingWhenNotRecorded(t *testing.T) {
+	body := &countingBody{Reader: strings.NewReader("rejected")}
+	helps.ArchiveRejectedResponse(context.Background(), &http.Response{StatusCode: http.StatusUnsupportedMediaType, Body: body})
+	if body.read != 0 {
+		t.Fatalf("read %d bytes of a response no archive records", body.read)
+	}
+}
+
+type countingBody struct {
+	io.Reader
+	read int
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	b.read += n
+	return n, err
+}
+
+func (*countingBody) Close() error { return nil }

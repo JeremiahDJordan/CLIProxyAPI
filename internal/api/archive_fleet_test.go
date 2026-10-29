@@ -38,6 +38,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -372,6 +373,9 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		// The chunk is a body and stays as sent; its usage metadata copy is redacted.
 		helps.AppendAPIResponseChunk(ctx, cfg, []byte(`data: {"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":1,"cookie":"fake-usage-cookie-0037","note":"sk-fake-usage-key-0038"}}}`))
 		archive.TapUsage(ctx, archive.UsageSourceReporter, "m", []byte(`{"input_tokens":3,"access_token":"fake-usage-reporter-0039"}`))
+		// Round-3 finding 5: the usage reporter's own record, whose
+		// token_breakdown.quality must survive redaction.
+		helps.NewUsageReporter(ctx, "codex", "m", nil).Publish(ctx, usage.Detail{InputTokens: 3, OutputTokens: 2, TotalTokens: 5})
 		helps.RecordAPIResponseError(ctx, cfg, errors.New(`Post "https://api.example/v1?key=fake-error-key-0027": Bearer fake-error-bearer-0028 dial failed`))
 		wsHeaders := http.Header{
 			"Sec-Websocket-Protocol": {"realtime, openai-insecure-api-key.sk-fake-upstream-wsproto-0029"},
@@ -507,15 +511,20 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 	if got := len(eventsFor(events, archive.TypeUpstreamWS, "/archive-test/upstream-secrets")); got != 4 {
 		t.Fatalf("%d upstream_ws events", got)
 	}
-	usage := eventsFor(events, archive.TypeUsage, "/archive-test/upstream-secrets")
-	if len(usage) != 2 {
-		t.Fatalf("usage events = %v", usage)
+	usageEvents := eventsFor(events, archive.TypeUsage, "/archive-test/upstream-secrets")
+	if len(usageEvents) != 3 {
+		t.Fatalf("usage events = %v", usageEvents)
 	}
-	for _, ev := range usage {
+	for _, ev := range usageEvents {
 		raw, _ := json.Marshal(ev["usage"])
 		if bytes.Contains(raw, []byte("fake-usage-")) || !bytes.Contains(raw, []byte(`"input_tokens"`)) {
 			t.Fatalf("usage metadata = %s", raw)
 		}
+	}
+	breakdown, _ := usageEvents[2]["usage"].(map[string]any)["token_breakdown"].(map[string]any)
+	if quality := breakdown["quality"]; quality != string(usage.TokenAccountingQualityComplete) &&
+		quality != string(usage.TokenAccountingQualityInconsistent) && quality != string(usage.TokenAccountingQualityUnclassified) {
+		t.Fatalf("reporter usage token_breakdown = %v", breakdown)
 	}
 }
 

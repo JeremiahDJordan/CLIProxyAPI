@@ -86,6 +86,15 @@ func recoverArchiveTap(where string) {
 	}
 }
 
+// recoverArchiveTapFor is recoverArchiveTap for a tap recording on in: a
+// recovered panic loses what it was recording, so in counts a drop too.
+func recoverArchiveTapFor(where string, in *archive.Ingress) {
+	if recovered := recover(); recovered != nil {
+		archive.NoteTapPanic(where, recovered)
+		in.NoteDrop()
+	}
+}
+
 func archiveFault(where string) {
 	if archiveTapFault != nil {
 		archiveTapFault(where)
@@ -1181,7 +1190,7 @@ func (w *archiveContentWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // handler wrote, never copied here: the archive copies it once the event is
 // admitted).
 func archiveRecordContent[B []byte | string](w *archiveContentWriter, data B) {
-	defer recoverArchiveTap("content.write")
+	defer recoverArchiveTapFor("content.write", w.in)
 	if len(data) == 0 {
 		return
 	}

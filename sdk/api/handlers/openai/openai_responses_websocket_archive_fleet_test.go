@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -475,5 +476,60 @@ func TestArchiveTurnRefusedDuringStopCountsAgainstItsConnection(t *testing.T) {
 	}
 	if turns != 1 {
 		t.Fatalf("%d turns recorded", turns)
+	}
+}
+
+// Round-3 finding 1: a client frame's fields are read through a view of it
+// and copied only once its ingress_start is reserved, so a large frame the
+// queue refuses allocates nothing of its size.
+func TestArchiveRefusedTurnFrameIsNotCopied(t *testing.T) {
+	startArchiveForWebsocket(t, func(o *archive.TestOverrides) { o.QueueBytes = 1024; o.FsyncInterval = time.Hour })
+	rec := archive.Current()
+	conn := rec.BeginConnection(archive.RouteInference, time.Now())
+	a := &responsesWebsocketArchive{rec: rec, conn: conn, open: map[*responsesWebsocketTurn]struct{}{}}
+	payload := []byte(`{"type":"response.create","model":"archive-model","previous_response_id":"resp_prev",` +
+		`"client_metadata":{"x-codex-turn-metadata":"{\"turn_id\":\"turn-1\"}"},"input":"` + strings.Repeat("x", 16<<20) + `"}`)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	turn := a.beginTurn(websocket.TextMessage, payload)
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= 1<<20 {
+		t.Fatalf("a refused 16 MiB turn frame allocated %d bytes", allocated)
+	}
+	if turn == nil || turn.in.Drops() != 2 {
+		t.Fatalf("turn %v: its refused ingress_start and frame were not counted", turn)
+	}
+	turn.end(archiveTurnEnded)
+	runtime.KeepAlive(payload)
+}
+
+// Round-3 finding 6: with response steering on for a connection (only a
+// reload can turn it on while capture runs), its turns are not recorded and
+// their traffic is not recorded on the connection either; the connection
+// counts the drop, so its ingress_end does not look complete.
+func TestArchiveWebsocketSteeringTurnTrafficIsNotOnTheConnection(t *testing.T) {
+	spool := startArchiveForWebsocket(t, nil)
+	exec := &archiveWSExecutor{started: make(chan struct{}, 1)}
+	conn, connIn, done := serveArchivedWebsocket(t, &sdkconfig.SDKConfig{CodexResponseSteering: true}, exec, nil)
+	frame := `{"type":"response.create","model":"archive-model","input":[{"type":"message","role":"user","content":"hi"}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+		t.Fatal(err)
+	}
+	readWebsocketUntil(t, conn, "response.completed")
+	select {
+	case <-exec.started:
+	default:
+		t.Fatal("the turn never reached the executor")
+	}
+	_ = conn.Close()
+	<-done
+	for _, ev := range archiveWSEvents(t, spool) {
+		if ev["kind"] == archive.KindWSTurn || ev["ingress_id"] == connIn.ID() {
+			t.Fatalf("a steering connection's turn traffic was recorded: %v", ev)
+		}
+	}
+	if connIn.Drops() == 0 {
+		t.Fatal("the steering connection did not count its unrecorded turns")
 	}
 }

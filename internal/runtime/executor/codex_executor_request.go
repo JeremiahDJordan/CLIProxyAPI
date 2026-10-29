@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/archive"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -288,6 +289,7 @@ func doCodexRequest(client *http.Client, req *http.Request, upstreamBody []byte,
 	if !compressed || (resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnsupportedMediaType) {
 		return resp, nil
 	}
+	helps.ArchiveRejectedResponse(req.Context(), resp) // fleet: request archive, before it is discarded
 	if errClose := resp.Body.Close(); errClose != nil {
 		log.Errorf("codex executor: close rejected response body error: %v", errClose)
 	}
@@ -299,6 +301,8 @@ func doCodexRequest(client *http.Client, req *http.Request, upstreamBody []byte,
 	plainReq.Header.Del("Content-Encoding")
 	prepareHeaders(plainReq)
 	alignCodexContentEncoding(plainReq)
+	// fleet: request archive, the resend as its own sub-attempt.
+	helps.ArchiveResentRequest(plainReq, archive.ResendCompressionRejected)
 	resp, errDo = client.Do(plainReq)
 	if errDo != nil {
 		return nil, errDo
