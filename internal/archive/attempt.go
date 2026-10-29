@@ -380,14 +380,17 @@ func (ids *identities) empty() bool {
 	return len(ids.ResponseIDs) == 0 && ids.PreviousResponseID == "" && len(ids.OutputItemIDs) == 0
 }
 
-// addResponse and addItem collect identities found in one upstream event,
-// as views of it; merge copies those an attempt or request keeps.
-func (ids *identities) addResponse(id string) {
-	ids.ResponseIDs = appendUnique(ids.ResponseIDs, id, maxResponseIDs, false)
+// addResponse and addItem collect identities found in one upstream event
+// (idAt): views of it, kept as they are, or, when escaped, views of a
+// scratch buffer the next ID overwrites, copied only once they pass the
+// limit and duplicate checks. merge copies those an attempt or request
+// keeps.
+func (ids *identities) addResponse(id string, escaped bool) {
+	ids.ResponseIDs = appendUnique(ids.ResponseIDs, id, maxResponseIDs, escaped)
 }
 
-func (ids *identities) addItem(id string) {
-	ids.OutputItemIDs = appendUnique(ids.OutputItemIDs, id, maxOutputItemIDs, false)
+func (ids *identities) addItem(id string, escaped bool) {
+	ids.OutputItemIDs = appendUnique(ids.OutputItemIDs, id, maxOutputItemIDs, escaped)
 }
 
 // merge adds o's identities, copying each one it keeps, so a kept identity

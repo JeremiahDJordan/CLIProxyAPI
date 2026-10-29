@@ -88,11 +88,12 @@ func newResponsesWebsocketArchive(c *gin.Context, sessionID string, steering boo
 		}
 		return &responsesWebsocketArchive{conn: conn, steering: true}
 	}
+	var scratch archive.JSONScratch
 	return &responsesWebsocketArchive{
 		rec:          conn.Recorder(),
 		conn:         conn,
 		sessionID:    sessionID,
-		headerTurnID: boundedWSTurnField(archiveCodexTurnIDFromMetadata(c.Request.Header.Get("X-Codex-Turn-Metadata"))),
+		headerTurnID: strings.Clone(boundedWSTurnField(archiveCodexTurnIDFromMetadata(c.Request.Header.Get("X-Codex-Turn-Metadata"), &scratch))),
 		open:         map[*responsesWebsocketTurn]struct{}{},
 	}
 }
@@ -165,7 +166,7 @@ const wsTurnFieldMax = 256
 
 // wsTurnMetadataMax bounds the client_metadata x-codex-turn-metadata string
 // a frame's turn ID is read from (a longer one is ignored); it is JSON in a
-// JSON string, so reading it copies it.
+// JSON string, so it is read unescaped into a scratch buffer.
 const wsTurnMetadataMax = 8 << 10
 
 // beginTurn allocates a turn for a frame read from the client and records
@@ -191,15 +192,18 @@ func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *resp
 	t = &responsesWebsocketTurn{a: a, in: in}
 	data := wsTurnStartData{Kind: archive.KindWSTurn, MessageType: websocketMessageTypeName(kind), WSSessionID: a.sessionID}
 	if gjson.ValidBytes(payload) {
-		// Views of payload until copied below; JSONText copies nothing
-		// large (gjson would unescape a large string in full).
+		// Views of payload, or of a scratch each for escaped values, until
+		// copied below: JSONText copies nothing (gjson would unescape a
+		// large string in full).
+		var typeScratch, modelScratch, prevScratch, metadataScratch, turnScratch archive.JSONScratch
 		frame := archive.BytesView(payload)
-		data.FrameType = archive.JSONText(frame, wsTurnFieldMax, "type")
-		data.Model = archive.JSONText(frame, wsTurnFieldMax, "model")
-		data.PreviousResponseID = archive.JSONText(frame, wsTurnFieldMax, "previous_response_id")
+		data.FrameType = archive.JSONText(frame, wsTurnFieldMax, &typeScratch, "type")
+		data.Model = archive.JSONText(frame, wsTurnFieldMax, &modelScratch, "model")
+		data.PreviousResponseID = archive.JSONText(frame, wsTurnFieldMax, &prevScratch, "previous_response_id")
 		// The turn ID comes from the frame's client_metadata; the upgrade
 		// header is set once per connection and is only a fallback.
-		data.CodexTurnID = archiveCodexTurnIDFromMetadata(archive.JSONText(frame, wsTurnMetadataMax, "client_metadata", "x-codex-turn-metadata"))
+		metadata := archive.JSONText(frame, wsTurnMetadataMax, &metadataScratch, "client_metadata", "x-codex-turn-metadata")
+		data.CodexTurnID = archiveCodexTurnIDFromMetadata(metadata, &turnScratch)
 		if data.CodexTurnID != "" {
 			data.CodexTurnIDSource = "frame"
 		}
@@ -453,10 +457,11 @@ func turnFromInput(message cliproxyexecutor.WebsocketInput) *responsesWebsocketT
 }
 
 // archiveCodexTurnIDFromMetadata reads turn_id from Codex's
-// x-codex-turn-metadata JSON string.
-func archiveCodexTurnIDFromMetadata(metadata string) string {
+// x-codex-turn-metadata JSON string: a view of metadata, or of scratch when
+// it is escaped (archive.JSONText).
+func archiveCodexTurnIDFromMetadata(metadata string, scratch *archive.JSONScratch) string {
 	if metadata == "" || !gjson.Valid(metadata) {
 		return ""
 	}
-	return archive.JSONText(metadata, wsTurnFieldMax, "turn_id")
+	return archive.JSONText(metadata, wsTurnFieldMax, scratch, "turn_id")
 }

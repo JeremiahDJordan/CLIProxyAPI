@@ -563,8 +563,12 @@ func TestArchiveTurnFrameEscapedFieldsAreBounded(t *testing.T) {
 		t.Fatal("no turn")
 	}
 	turn.end(archiveTurnEnded)
-	if got := archive.JSONText(archive.BytesView(payload), wsTurnFieldMax, "type"); got != "response.create" {
+	var scratch archive.JSONScratch
+	if got := archive.JSONText(archive.BytesView(payload), wsTurnFieldMax, &scratch, "type"); got != "response.create" {
 		t.Fatalf("frame type = %q", got)
+	}
+	if got := archiveCodexTurnIDFromMetadata(`{"turn_id":"turn_`+escape(6, "31")+`"}`, &scratch); got != "turn_1" {
+		t.Fatalf("escaped turn_id = %q", got)
 	}
 	runtime.KeepAlive(payload)
 }
