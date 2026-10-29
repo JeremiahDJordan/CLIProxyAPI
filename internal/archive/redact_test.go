@@ -273,3 +273,29 @@ func TestRedactUpstreamURL(t *testing.T) {
 		}
 	}
 }
+
+// Round-2 finding 4: metadata copied from provider JSON (usage objects) is
+// redacted: strings under credential names and key-shaped strings anywhere;
+// counts, other strings, member order and number text are kept.
+func TestRedactJSON(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`{"input_tokens":3,"access_token":"fake-token-1","cookie":"sid=fake-2"}`,
+			`{"input_tokens":3,"access_token":"[redacted]","cookie":"[redacted]"}`},
+		{`{"promptTokenCount":1E5,"promptTokensDetails":[{"modality":"TEXT","tokenCount":2}],"trafficType":"ON_DEMAND"}`,
+			`{"promptTokenCount":1E5,"promptTokensDetails":[{"modality":"TEXT","tokenCount":2}],"trafficType":"ON_DEMAND"}`},
+		{`{"token_breakdown":{"input":1,"note":"fake-3"},"service_tier":"standard","auth":{"user":"u","pass":"fake-4"}}`,
+			`{"token_breakdown":{"input":1,"note":"[redacted]"},"service_tier":"standard","auth":{"user":"[redacted]","pass":"[redacted]"}}`},
+		{`{"note":"sk-ant-fakefakefake5","list":["ok","AIzaFAKEkeyFAKEkey6"],"url":"https://x.example/?key=fake-7","n":null,"b":true}`,
+			`{"note":"[redacted]","list":["ok","[redacted]"],"url":"https://x.example/?key=[redacted]","n":null,"b":true}`},
+		{`{"a\"b":"x","é":"é"}`, `{"a\"b":"x","é":"é"}`},
+		{`not json`, `null`},
+	}
+	for _, c := range cases {
+		if got := string(RedactJSON(c.in)); got != c.want {
+			t.Errorf("RedactJSON(%s)\n got %s\nwant %s", c.in, got, c.want)
+		}
+		if got := string(RedactJSON([]byte(c.in))); got != c.want {
+			t.Errorf("RedactJSON([]byte(%s)) = %s", c.in, got)
+		}
+	}
+}

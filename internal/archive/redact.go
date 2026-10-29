@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 // Redacted replaces every credential value (redaction_version 1). It is a
@@ -356,4 +358,103 @@ func RedactText(s string) string {
 		return parts[1] + parts[2] + Redacted
 	})
 	return textShape.ReplaceAllString(s, Redacted)
+}
+
+// RedactJSON copies a JSON value for metadata (a provider's usage object),
+// with credentials redacted by the rules above; bodies are never redacted.
+// Every string under a member whose name is a credential name
+// (credentialField) becomes Redacted, while numbers, booleans and nulls are
+// kept (a token count is a number). Any other string becomes Redacted when
+// it looks like a key and is otherwise passed through RedactText. Members
+// keep their order and numbers their text. Input that is not JSON is null.
+func RedactJSON[R []byte | string](raw R) []byte {
+	text := string(raw)
+	if !gjson.Valid(text) {
+		return []byte("null")
+	}
+	value := gjson.Parse(text)
+	return redactJSONValue(make([]byte, 0, len(value.Raw)), value, false)
+}
+
+func redactJSONValue(out []byte, value gjson.Result, credential bool) []byte {
+	switch {
+	case value.IsObject(), value.IsArray():
+		object := value.IsObject()
+		open, end := byte('['), byte(']')
+		if object {
+			open, end = '{', '}'
+		}
+		out = append(out, open)
+		first := true
+		value.ForEach(func(key, member gjson.Result) bool {
+			if !first {
+				out = append(out, ',')
+			}
+			first = false
+			memberCredential := credential
+			if object {
+				// key.Raw is not always the member name as written; encode it.
+				name, _ := marshalCompact(key.String())
+				out = append(out, name...)
+				out = append(out, ':')
+				memberCredential = credential || credentialField(key.String())
+			}
+			out = redactJSONValue(out, member, memberCredential)
+			return true
+		})
+		return append(out, end)
+	case value.Type == gjson.String:
+		text := value.String()
+		if credential || looksLikeKey(text) {
+			return append(out, `"`+Redacted+`"`...)
+		}
+		if redacted := RedactText(text); redacted != text {
+			if encoded, err := marshalCompact(redacted); err == nil {
+				return append(out, encoded...)
+			}
+			return append(out, `"`+Redacted+`"`...)
+		}
+		return append(out, value.Raw...)
+	default:
+		return append(out, value.Raw...)
+	}
+}
+
+// credentialField reports a JSON member name that names a credential: a
+// credential header name, or a name containing a credential part, as for
+// headers. A token count is not a credential, so "token" counts only where
+// it is neither part of "tokens" nor followed by "count" (input_tokens,
+// promptTokenCount and prompt_tokens_details are counts; access_token,
+// id_token and token_breakdown are not exempt).
+func credentialField(name string) bool {
+	lower := strings.ToLower(name)
+	if _, ok := credentialHeaders[lower]; ok {
+		return true
+	}
+	for _, part := range credentialNameParts {
+		if part == "token" {
+			if credentialToken(lower) {
+				return true
+			}
+			continue
+		}
+		if strings.Contains(lower, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func credentialToken(lower string) bool {
+	for rest := lower; ; {
+		i := strings.Index(rest, "token")
+		if i < 0 {
+			return false
+		}
+		rest = rest[i+len("token"):]
+		if strings.HasPrefix(rest, "s") || strings.HasPrefix(strings.TrimLeft(rest, "_-"), "count") {
+			continue
+		}
+		return true
+	}
 }

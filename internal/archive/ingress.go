@@ -178,8 +178,14 @@ func (in *Ingress) ReserveEvent(ev *Event) (int64, bool) {
 	if in == nil || in.rec == nil || ev == nil {
 		return 0, false
 	}
+	return in.reserve(ev.reservation(), DropCount{Events: 1})
+}
+
+// reserve claims n queue bytes for an event of this request before its
+// contents are copied. A failure counts d as dropped, against the request
+// too, as emit does.
+func (in *Ingress) reserve(n int64, d DropCount) (int64, bool) {
 	r := in.rec
-	n := ev.reservation()
 	acceptsEvents := r.acceptsEvents()
 	if acceptsEvents && r.q.reserve(n) {
 		return n, true
@@ -188,7 +194,7 @@ func (in *Ingress) ReserveEvent(ev *Event) (int64, bool) {
 	if !acceptsEvents {
 		reason = r.BodyDropReason()
 	}
-	r.ledger.add(reason, DropCount{Events: 1})
+	r.ledger.add(reason, d)
 	in.drops.Add(1)
 	return 0, false
 }
@@ -216,6 +222,13 @@ func WithIngress(ctx context.Context, in *Ingress) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, ingressContextKey{}, in)
+}
+
+// WithoutIngress returns ctx carrying no ingress, also when a parent context
+// (or its gin context) carries one: a WebSocket turn that is not recorded
+// must not have its traffic recorded on its connection.
+func WithoutIngress(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ingressContextKey{}, (*Ingress)(nil))
 }
 
 // IngressFromContext returns the ingress carried by ctx, or else by the gin

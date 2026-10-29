@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -21,6 +22,10 @@ const (
 	DropStopped      = "stopped"
 	DropEncodeError  = "encode_error"
 	DropTapPanic     = "tap_panic"
+	// DropNotCaptured marks an outbound body an executor's tap cannot
+	// record as sent (body_dropped only: it counts against its request,
+	// never as a gap).
+	DropNotCaptured = "not_captured"
 	// Start refusals are counted as gaps of unknown size.
 	DropStartRefusedSteering = "start_refused_steering"
 	DropStartRefusedSpool    = "start_refused_spool"
@@ -45,21 +50,39 @@ func (d DropCount) add(o DropCount) DropCount {
 	return DropCount{Events: d.Events + o.Events, Bodies: d.Bodies + o.Bodies, Bytes: d.Bytes + o.Bytes}
 }
 
-// stateFile is the persisted form of drops not yet reported as a gap event.
+// SuspectRange names events of one boot, written to one segment, whose
+// fsync failed: each was written with a single write, but a later fsync
+// that succeeds does not prove the failed one's data reached the disk. The
+// gap reporting a range is fsynced, so the range is recorded even when the
+// segment then closes normally. Assembly treats a request with an event in a
+// suspect range as capture-incomplete.
+type SuspectRange struct {
+	BootID string `json:"boot_id"`
+	// Segment is the segment's name without .open.jsonl or .closed.jsonl.
+	Segment  string `json:"segment"`
+	FirstSeq uint64 `json:"first_seq"`
+	LastSeq  uint64 `json:"last_seq"`
+}
+
+// stateFile is the persisted form of drops and suspect ranges not yet
+// reported as a gap event.
 type stateFile struct {
 	V       int                  `json:"v"`
 	BootID  string               `json:"boot_id,omitempty"`
 	Since   string               `json:"since,omitempty"`
 	Updated string               `json:"updated"`
 	Drops   map[string]DropCount `json:"drops"`
+	Suspect []SuspectRange       `json:"suspect,omitempty"`
 }
 
-// dropLedger counts drops. Pending drops become a gap event once capture is
-// healthy again; until then they are persisted so they survive a restart.
+// dropLedger counts drops and suspect ranges. Pending ones become a gap
+// event once capture is healthy again; until then they are persisted so
+// they survive a restart.
 type dropLedger struct {
 	mu      sync.Mutex
 	dir     string
 	pending map[string]DropCount
+	suspect []SuspectRange
 	since   time.Time
 	priorID string
 	carried bool
@@ -88,6 +111,20 @@ func (l *dropLedger) add(reason string, d DropCount) {
 	l.dirty = true
 }
 
+// addSuspect records a suspect range until a durable gap reports it.
+func (l *dropLedger) addSuspect(r SuspectRange) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	if len(l.pending) == 0 && len(l.suspect) == 0 {
+		l.since = time.Now()
+	}
+	l.suspect = append(l.suspect, r)
+	l.dirty = true
+}
+
 // close makes later adds no-ops; drops counted before it are persisted by
 // the persist that follows.
 func (l *dropLedger) close() {
@@ -96,19 +133,37 @@ func (l *dropLedger) close() {
 	l.mu.Unlock()
 }
 
-// pendingSnapshot returns the drops not yet reported, and whether some
-// were carried over from an earlier boot or a refused start.
-func (l *dropLedger) pendingSnapshot() (map[string]DropCount, time.Time, string, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return maps.Clone(l.pending), l.since, l.priorID, l.carried
+// pendingGap is what the next gap event reports.
+type pendingGap struct {
+	drops   map[string]DropCount
+	suspect []SuspectRange
+	since   time.Time
+	priorID string
+	// carried says some were carried over from an earlier boot or a refused start.
+	carried bool
 }
 
-// settle subtracts drops that a written gap event reported.
-func (l *dropLedger) settle(reported map[string]DropCount) {
+func (p pendingGap) empty() bool {
+	return len(p.drops) == 0 && len(p.suspect) == 0
+}
+
+// pendingSnapshot returns the drops and suspect ranges not yet reported.
+func (l *dropLedger) pendingSnapshot() pendingGap {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for reason, d := range reported {
+	return pendingGap{drops: maps.Clone(l.pending), suspect: slices.Clone(l.suspect), since: l.since, priorID: l.priorID, carried: l.carried}
+}
+
+// settle removes what a written gap event reported. Suspect ranges are only
+// appended, so the reported ones are the oldest.
+func (l *dropLedger) settle(reported pendingGap) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.suspect = slices.Delete(l.suspect, 0, min(len(reported.suspect), len(l.suspect)))
+	if len(l.suspect) == 0 {
+		l.suspect = nil
+	}
+	for reason, d := range reported.drops {
 		left := l.pending[reason]
 		left = DropCount{Events: left.Events - d.Events, Bodies: left.Bodies - d.Bodies, Bytes: left.Bytes - d.Bytes}
 		if left == (DropCount{}) {
@@ -117,7 +172,7 @@ func (l *dropLedger) settle(reported map[string]DropCount) {
 			l.pending[reason] = left
 		}
 	}
-	if len(l.pending) == 0 {
+	if len(l.pending) == 0 && len(l.suspect) == 0 {
 		l.since = time.Time{}
 	}
 	l.priorID = ""
@@ -131,10 +186,11 @@ func (l *dropLedger) totals() map[string]DropCount {
 	return maps.Clone(l.total)
 }
 
-// load merges drops persisted by earlier boots or refused starts.
+// load merges drops and suspect ranges persisted by earlier boots or
+// refused starts.
 func (l *dropLedger) load() error {
 	st, err := readState(l.dir)
-	if err != nil || len(st.Drops) == 0 {
+	if err != nil || (len(st.Drops) == 0 && len(st.Suspect) == 0) {
 		return err
 	}
 	l.mu.Lock()
@@ -142,6 +198,7 @@ func (l *dropLedger) load() error {
 	for reason, d := range st.Drops {
 		l.pending[reason] = l.pending[reason].add(d)
 	}
+	l.suspect = append(l.suspect, st.Suspect...)
 	if since, errParse := time.Parse(time.RFC3339Nano, st.Since); errParse == nil {
 		l.since = since
 	} else if l.since.IsZero() {
@@ -152,14 +209,15 @@ func (l *dropLedger) load() error {
 	return nil
 }
 
-// persist writes the pending drops when they changed since the last write.
+// persist writes the pending drops and suspect ranges when they changed
+// since the last write.
 func (l *dropLedger) persist(bootID string) error {
 	l.mu.Lock()
 	if !l.dirty {
 		l.mu.Unlock()
 		return nil
 	}
-	st := stateFile{V: 1, BootID: bootID, Updated: FormatTime(time.Now()), Drops: maps.Clone(l.pending)}
+	st := stateFile{V: 1, BootID: bootID, Updated: FormatTime(time.Now()), Drops: maps.Clone(l.pending), Suspect: slices.Clone(l.suspect)}
 	if !l.since.IsZero() {
 		st.Since = l.since.UTC().Format(time.RFC3339Nano)
 	}
@@ -229,7 +287,7 @@ func recordRefusal(dir, reason string) error {
 	if st.Drops == nil {
 		st.Drops = map[string]DropCount{}
 	}
-	if len(st.Drops) == 0 {
+	if len(st.Drops) == 0 && len(st.Suspect) == 0 {
 		st.Since = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	st.V = 1

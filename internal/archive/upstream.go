@@ -16,20 +16,25 @@ import (
 // Executor taps (design section 3, "Outbound request and upstream response"
 // and "Upstream WebSocket"). The executor helpers call them before their own
 // request-log checks, so capture never depends on request logging. Each
-// starts with one nil check on Current(); they capture only for inference
-// requests and never wait on the disk.
+// starts with one nil check (Installed); they capture only for inference
+// requests, record through the request's own ingress and never wait on the
+// disk.
 
 // UpstreamRequest is an outbound request as the executor sends it, after
 // translation, cloaking and signing.
 type UpstreamRequest struct {
-	URL       string
-	Method    string
-	Headers   http.Header
-	Body      []byte
-	Provider  string
-	AuthID    string
-	AuthLabel string
-	AuthType  string
+	URL     string
+	Method  string
+	Headers http.Header
+	Body    []byte
+	// BodyNotCaptured records the body as not captured (DropNotCaptured)
+	// instead of recording Body: the executor does not have the bytes it sent
+	// at the tap, or they carry a credential.
+	BodyNotCaptured bool
+	Provider        string
+	AuthID          string
+	AuthLabel       string
+	AuthType        string
 }
 
 func recoverTap(where string) {
@@ -38,14 +43,15 @@ func recoverTap(where string) {
 	}
 }
 
-// tapTarget finds the inference request and attempt a tap belongs to.
+// tapTarget finds the inference request and attempt a tap belongs to. It
+// does not consult Current: a request in flight while Stop runs is recorded
+// through its own ingress.
 func tapTarget(ctx context.Context) (*Ingress, *Attempt) {
-	rec := Current()
-	if rec == nil || ctx == nil {
+	if ctx == nil {
 		return nil, nil
 	}
 	in := IngressFromContext(ctx)
-	if in == nil || in.rec != rec || in.class != RouteInference {
+	if in == nil || in.rec == nil || in.class != RouteInference {
 		return nil, nil
 	}
 	a := AttemptFromContext(ctx)
@@ -85,7 +91,7 @@ func newUpstreamRequestData(transport string, req UpstreamRequest) upstreamReque
 
 // TapUpstreamRequest records an outbound HTTP request as a new sub-attempt.
 func TapUpstreamRequest(ctx context.Context, req UpstreamRequest) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.request")
@@ -97,7 +103,12 @@ func TapUpstreamRequest(ctx context.Context, req UpstreamRequest) {
 	seq, sub := a.nextRequest(now, AttemptInfo{AuthID: req.AuthID, Provider: req.Provider})
 	a.notePrevious(req.Body)
 	data := newUpstreamRequestData("http", req)
-	in.emitBody(&Event{Type: TypeUpstreamRequest, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}, req.Body, true)
+	ev := &Event{Type: TypeUpstreamRequest, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}
+	if req.BodyNotCaptured {
+		in.emitNotCaptured(ev)
+		return
+	}
+	emitBody(in, ev, req.Body)
 }
 
 type upstreamResponseMetaData struct {
@@ -107,7 +118,7 @@ type upstreamResponseMetaData struct {
 
 // TapUpstreamResponse records the upstream status and headers.
 func TapUpstreamResponse(ctx context.Context, status int, headers http.Header) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.response")
@@ -131,7 +142,7 @@ type upstreamEventData struct {
 // Chunks are numbered per sub-attempt from 1; empty chunks (blank SSE lines)
 // are numbered but not written.
 func TapUpstreamChunk(ctx context.Context, chunk []byte) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.event")
@@ -144,7 +155,7 @@ func TapUpstreamChunk(ctx context.Context, chunk []byte) {
 	if len(chunk) == 0 {
 		return
 	}
-	in.emitBody(&Event{Type: TypeUpstreamEvent, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: upstreamEventData{ChunkSeq: n}}, chunk, true)
+	emitBody(in, &Event{Type: TypeUpstreamEvent, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: upstreamEventData{ChunkSeq: n}}, chunk)
 	a.inspect(chunk, now, seq, sub)
 }
 
@@ -156,7 +167,7 @@ type upstreamErrorData struct {
 // TapUpstreamError records an error with no HTTP response (a transport
 // error, or a failure reading the body). Its text is redacted.
 func TapUpstreamError(ctx context.Context, err error) {
-	if Current() == nil || err == nil {
+	if !Installed() || err == nil {
 		return
 	}
 	defer recoverTap("upstream.error")
@@ -221,7 +232,7 @@ func (d upstreamWSData) sizeHint() int64 {
 // TapUpstreamWSRequest records a frame sent on an upstream WebSocket (with
 // the connection's URL and handshake headers) as a new sub-attempt.
 func TapUpstreamWSRequest(ctx context.Context, req UpstreamRequest) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.ws.request")
@@ -236,12 +247,17 @@ func TapUpstreamWSRequest(ctx context.Context, req UpstreamRequest) {
 		WSEvent: WSEventRequest, URL: RedactUpstreamURL(req.URL), Headers: RedactHeaders(req.Headers),
 		Provider: req.Provider, AuthID: req.AuthID, AuthLabel: req.AuthLabel, AuthType: req.AuthType,
 	}
-	in.emitBody(&Event{Type: TypeUpstreamWS, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}, req.Body, true)
+	ev := &Event{Type: TypeUpstreamWS, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}
+	if req.BodyNotCaptured {
+		in.emitNotCaptured(ev)
+		return
+	}
+	emitBody(in, ev, req.Body)
 }
 
 // TapUpstreamWSHandshake records the upstream handshake's status and headers.
 func TapUpstreamWSHandshake(ctx context.Context, status int, headers http.Header) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.ws.handshake")
@@ -258,7 +274,7 @@ func TapUpstreamWSHandshake(ctx context.Context, status int, headers http.Header
 
 // TapUpstreamWSRejection records a refused upgrade with its response body.
 func TapUpstreamWSRejection(ctx context.Context, req UpstreamRequest, status int, headers http.Header, body []byte) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.ws.rejection")
@@ -274,13 +290,13 @@ func TapUpstreamWSRejection(ctx context.Context, req UpstreamRequest, status int
 		Status: status, ResponseHeaders: RedactHeaders(headers),
 		Provider: req.Provider, AuthID: req.AuthID, AuthLabel: req.AuthLabel, AuthType: req.AuthType,
 	}
-	in.emitBody(&Event{Type: TypeUpstreamWS, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}, body, true)
+	emitBody(in, &Event{Type: TypeUpstreamWS, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}, body)
 }
 
 // TapUpstreamWSError records an upstream WebSocket error at a stage (dial,
 // send, read, ...). Its text is redacted.
 func TapUpstreamWSError(ctx context.Context, stage string, err error) {
-	if Current() == nil || err == nil {
+	if !Installed() || err == nil {
 		return
 	}
 	defer recoverTap("upstream.ws.error")
@@ -298,7 +314,7 @@ func TapUpstreamWSError(ctx context.Context, stage string, err error) {
 // before the executor restores it. trimmed says the caller removed
 // surrounding whitespace first (Codex frames).
 func TapUpstreamWSFrame(ctx context.Context, payload []byte, trimmed bool) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("upstream.ws.frame")
@@ -309,7 +325,7 @@ func TapUpstreamWSFrame(ctx context.Context, payload []byte, trimmed bool) {
 	now := time.Now()
 	seq, sub, n := a.nextFrame(now)
 	data := upstreamWSData{WSEvent: WSEventResponse, FrameSeq: n, Trimmed: trimmed}
-	in.emitBody(&Event{Type: TypeUpstreamWS, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}, payload, true)
+	emitBody(in, &Event{Type: TypeUpstreamWS, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}, payload)
 	a.inspect(payload, now, seq, sub)
 }
 
@@ -326,9 +342,9 @@ type usageData struct {
 
 // TapUsage records usage for the attempt in ctx from another source than an
 // upstream event (the usage reporter's token breakdown). raw must be a JSON
-// object; anything else is ignored.
+// object; anything else is ignored. Its copy is redacted (RedactJSON).
 func TapUsage(ctx context.Context, source, model string, raw []byte) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("usage")
@@ -338,8 +354,7 @@ func TapUsage(ctx context.Context, source, model string, raw []byte) {
 	}
 	now := time.Now()
 	seq, sub := a.current(now)
-	data := usageData{Source: source, Model: model, Usage: bytes.Clone(raw)}
-	in.Emit(&Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub, Capture: CaptureFull, Data: data, SizeHint: int64(len(raw)) + stringsSize(source, model)})
+	emitUsage(in, &Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub}, usageData{Source: source, Model: model}, raw)
 }
 
 // notePrevious records previous_response_id from an outbound body.
@@ -437,19 +452,41 @@ func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 	if !usage.IsObject() {
 		return
 	}
-	raw := []byte(usage.Raw)
-	payload := usageData{Source: "upstream", Event: event, Model: model, Usage: raw}
-	a.in.Emit(&Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub, Capture: CaptureFull, Data: payload,
-		SizeHint: int64(len(raw)) + stringsSize(payload.Source, payload.Event, payload.Model)})
+	emitUsage(a.in, &Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub},
+		usageData{Source: "upstream", Event: event, Model: model}, usage.Raw)
+}
+
+// emitUsage queues a usage event carrying a redacted copy (RedactJSON) of
+// the usage object raw. Like emitBody it reserves before it copies; the
+// copy's growth from redaction, if any, is reserved when it is queued.
+func emitUsage[R []byte | string](in *Ingress, ev *Event, data usageData, raw R) {
+	ev.Capture = CaptureFull
+	ev.SizeHint = int64(len(raw)) + stringsSize(data.Source, data.Event, data.Model)
+	reserved, ok := in.reserve(ev.reservation(), DropCount{Events: 1})
+	if !ok {
+		return
+	}
+	defer func() {
+		// Returned if the copy panics; queued events own their reservation.
+		in.rec.q.release(reserved)
+	}()
+	_ = fault("tap.copy") // tests panic here
+	data.Usage = RedactJSON(raw)
+	ev.SizeHint = int64(len(data.Usage)) + stringsSize(data.Source, data.Event, data.Model)
+	ev.Data = data
+	n := reserved
+	reserved = 0
+	in.EmitReserved(ev, n)
 }
 
 // EmitDownstream records one write of a response body to the client (what
-// the client receives, before compression) as a downstream_event.
-func EmitDownstream(in *Ingress, now time.Time, data any, body []byte) {
+// the client receives, before compression) as a downstream_event. body is
+// the written []byte or string; it is copied only once the event is admitted.
+func EmitDownstream[B []byte | string](in *Ingress, now time.Time, data any, body B) {
 	if in == nil {
 		return
 	}
-	in.emitBody(&Event{Type: TypeDownstreamEvent, Time: now, Data: data, SizeHint: 32}, body, true)
+	emitBody(in, &Event{Type: TypeDownstreamEvent, Time: now, Data: data, SizeHint: 32}, body)
 }
 
 // EmitClientFrame records a WebSocket frame between the client and the proxy
@@ -458,18 +495,16 @@ func EmitClientFrame(in *Ingress, now time.Time, data any, sizeHint int64, paylo
 	if in == nil {
 		return
 	}
-	in.emitBody(&Event{Type: TypeClientWSFrame, Time: now, Data: data, SizeHint: sizeHint}, payload, true)
+	emitBody(in, &Event{Type: TypeClientWSFrame, Time: now, Data: data, SizeHint: sizeHint}, payload)
 }
 
-// emitBody queues ev carrying a copy of body. While bodies are not captured
-// (low space, or the recorder is stopping), the event is still queued,
-// without its body, as dropped_body, and the drop counts against the request.
-func (in *Ingress) emitBody(ev *Event, body []byte, hasBody bool) {
-	if !hasBody {
-		ev.Capture = CaptureFull
-		in.Emit(ev)
-		return
-	}
+// emitBody queues ev carrying a copy of body. The event's whole size, body
+// included, is reserved before anything is copied, so a body the queue
+// refuses is dropped (and counted) without being allocated; the reservation
+// is returned if the copy panics. While bodies are not captured (low space,
+// or the recorder is stopping), the event is still queued, without its
+// body, as dropped_body, and the drop counts against the request.
+func emitBody[B []byte | string](in *Ingress, ev *Event, body B) {
 	rec := in.rec
 	if !rec.CaptureBodies() {
 		if rec.acceptsEvents() {
@@ -483,12 +518,35 @@ func (in *Ingress) emitBody(ev *Event, body []byte, hasBody bool) {
 		in.Emit(ev)
 		return
 	}
-	data := bytes.Clone(body)
-	if data == nil {
-		data = []byte{}
+	// The copy's capacity is exactly len(body), so this is the event's
+	// reservation (Event.reservation) once the body is attached.
+	reserved, ok := in.reserve(int64(eventOverhead)+ev.SizeHint+int64(len(body)),
+		DropCount{Events: 1, Bodies: 1, Bytes: int64(len(body))})
+	if !ok {
+		return
 	}
+	defer func() {
+		// Returned if the copy panics; queued events own their reservation.
+		rec.q.release(reserved)
+	}()
+	_ = fault("tap.copy") // tests panic here
+	data := make([]byte, len(body))
+	copy(data, body)
 	ev.Capture = CaptureFull
 	ev.Body = &BodyData{Bytes: data}
+	n := reserved
+	reserved = 0
+	in.EmitReserved(ev, n)
+}
+
+// emitNotCaptured queues a body-carrying event whose body the tap does not
+// have (or must not keep) as dropped_body with DropNotCaptured, and counts
+// the drop against the request only: it is a known limit of an executor,
+// not a capture failure, so it is not a gap.
+func (in *Ingress) emitNotCaptured(ev *Event) {
+	ev.Capture = CaptureDroppedBody
+	ev.BodyDropped = DropNotCaptured
+	in.NoteDrop()
 	in.Emit(ev)
 }
 

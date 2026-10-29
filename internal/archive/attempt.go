@@ -83,14 +83,17 @@ type attemptContextKey struct{}
 // WithAttempt returns ctx carrying a new attempt of the request in ctx. It
 // inherits the description of the attempt ctx already carries, so a resend
 // after a credential refresh keeps its credential and model. With capture
-// off, or without an inference request in ctx, it returns ctx.
-func WithAttempt(ctx context.Context) context.Context {
-	if Current() == nil || ctx == nil {
+// off, without an inference request in ctx, or after a recovered tap panic,
+// it returns ctx itself, so the caller keeps its cancellation, deadline and
+// values.
+func WithAttempt(ctx context.Context) (out context.Context) {
+	out = ctx
+	if !Installed() || ctx == nil {
 		return ctx
 	}
 	defer recoverTap("attempt.open")
 	in := IngressFromContext(ctx)
-	if in == nil || in.class != RouteInference {
+	if in == nil || in.rec == nil || in.class != RouteInference {
 		return ctx
 	}
 	a := &Attempt{in: in}
@@ -113,7 +116,7 @@ func AttemptFromContext(ctx context.Context) *Attempt {
 
 // DescribeAttempt records what the conductor chose for the attempt in ctx.
 func DescribeAttempt(ctx context.Context, info AttemptInfo) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("attempt.describe")
@@ -133,7 +136,7 @@ const (
 // NoteGate records the fleet gate's decision for the attempt in ctx, and a
 // denial's code for its request too.
 func NoteGate(ctx context.Context, decision, code string) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("attempt.gate")
@@ -154,7 +157,7 @@ func NoteGate(ctx context.Context, decision, code string) {
 // EndAttempt records the outcome of the attempt in ctx. Only the first end
 // counts; an attempt never used before begins here.
 func EndAttempt(ctx context.Context, end AttemptEnd) {
-	if Current() == nil {
+	if !Installed() {
 		return
 	}
 	defer recoverTap("attempt.end")

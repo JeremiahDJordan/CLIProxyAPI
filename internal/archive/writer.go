@@ -61,6 +61,9 @@ type segment struct {
 	path   string
 	opened time.Time
 	size   int64
+	// unsyncedFrom is the seq of the first event written since the last
+	// successful fsync (zero when there is none), lastSeq the last event's.
+	unsyncedFrom, lastSeq uint64
 	// Close progress, so a retry resumes where the failed close stopped.
 	synced, fileClosed, renamed bool
 }
@@ -99,8 +102,17 @@ type gapData struct {
 	Reason      string               `json:"reason"`
 	Since       string               `json:"since,omitempty"`
 	Drops       map[string]DropCount `json:"drops,omitempty"`
+	Suspect     []SuspectRange       `json:"suspect,omitempty"`
 	PriorBootID string               `json:"prior_boot_id,omitempty"`
 	Error       string               `json:"error,omitempty"`
+}
+
+func newGapData(reason string, pending pendingGap) gapData {
+	gap := gapData{Reason: reason, Drops: pending.drops, Suspect: pending.suspect, PriorBootID: pending.priorID}
+	if !pending.since.IsZero() {
+		gap.Since = FormatTime(pending.since)
+	}
+	return gap
 }
 
 type statsData struct {
@@ -288,24 +300,22 @@ func (w *writer) checkSpace(now time.Time) error {
 	return nil
 }
 
-// flushGap reports pending drops once capture is healthy. While space is low
-// they stay pending and persisted, and become a gap when space returns.
+// flushGap reports pending drops and suspect ranges once capture is
+// healthy. While space is low they stay pending and persisted, and become a
+// gap when space returns.
 func (w *writer) flushGap(now time.Time) error {
 	if w.r.spaceMode.Load() != spaceOK {
 		return nil
 	}
-	pending, since, prior, carried := w.r.ledger.pendingSnapshot()
-	if len(pending) == 0 {
+	pending := w.r.ledger.pendingSnapshot()
+	if pending.empty() {
 		return nil
 	}
-	gap := gapData{Reason: "dropped", Drops: pending, PriorBootID: prior}
-	if carried {
-		gap.Reason = "carried_over"
+	reason := "dropped"
+	if pending.carried {
+		reason = "carried_over"
 	}
-	if !since.IsZero() {
-		gap.Since = FormatTime(since)
-	}
-	if err := w.writeEvent(&Event{Type: TypeGap, Time: now, Data: gap}); err != nil {
+	if err := w.writeEvent(&Event{Type: TypeGap, Time: now, Data: newGapData(reason, pending)}); err != nil {
 		return err
 	}
 	// Clear the counters only once the gap reporting them is durable.
@@ -349,7 +359,8 @@ func (w *writer) stats(reason string) statsData {
 	}
 }
 
-// writeEvent writes one event: its blob first (if any), then its line.
+// writeEvent writes one event: its blob first (if any), then its line. Once
+// the line is written its seq is used, even when the event then fails.
 func (w *writer) writeEvent(ev *Event) error {
 	env := &envelope{
 		V:            EnvelopeVersion,
@@ -390,27 +401,28 @@ func (w *writer) writeEvent(ev *Event) error {
 			return err
 		}
 	}
-	errLine := w.writeLine(line)
+	errLine := w.writeLine(line, env.Seq)
+	if errLine == nil {
+		w.seq++
+		w.eventsWritten.Add(1)
+	}
 	if reused != nil {
 		// The shipper deletes a blob once it has archived an earlier segment
 		// that references it, so a reused blob can vanish before this event
 		// is written. Write it again then: the event's blob is in the spool
-		// once its event is.
+		// once its event is. When that fails the written event's blob may be
+		// missing, so the event is suspect.
 		errKeep := w.keepReusedBlob(reused, env.Body.SHA256, blob)
-		if errLine == nil {
+		if errLine == nil && errKeep != nil {
+			w.r.ledger.addSuspect(SuspectRange{BootID: w.r.bootID, Segment: w.seg.name, FirstSeq: env.Seq, LastSeq: env.Seq})
 			errLine = errKeep
 		}
 	}
-	if errLine != nil {
-		return errLine
-	}
-	w.seq++
-	w.eventsWritten.Add(1)
-	return nil
+	return errLine
 }
 
-// writeLine appends one complete line with a single write.
-func (w *writer) writeLine(line []byte) error {
+// writeLine appends the line of event seq with a single write.
+func (w *writer) writeLine(line []byte, seq uint64) error {
 	if w.seg != nil && w.seg.size > 0 && w.seg.size+int64(len(line)) > w.opts.SegmentMaxBytes {
 		if err := w.closeSegment(); err != nil {
 			return err
@@ -433,6 +445,10 @@ func (w *writer) writeLine(line []byte) error {
 		return fmt.Errorf("write segment %s: %w", w.seg.path, err)
 	}
 	trace("segment.write", w.seg.path)
+	if w.seg.unsyncedFrom == 0 {
+		w.seg.unsyncedFrom = seq
+	}
+	w.seg.lastSeq = seq
 	w.seg.size += int64(n)
 	w.bytesWritten.Add(uint64(n))
 	w.dirty = true
@@ -513,13 +529,16 @@ func (w *writer) closeSegment() error {
 func (w *writer) finishSegment(seg *segment) error {
 	if !seg.fileClosed {
 		if !seg.synced {
-			if err := fault("segment.close"); err != nil {
-				return fmt.Errorf("sync segment %s: %w", seg.path, err)
+			err := fault("segment.close")
+			if err == nil {
+				err = seg.f.Sync()
 			}
-			if err := seg.f.Sync(); err != nil {
+			if err != nil {
+				w.noteSyncFailure(seg)
 				return fmt.Errorf("sync segment %s: %w", seg.path, err)
 			}
 			seg.synced = true
+			seg.unsyncedFrom = 0
 			trace("segment.sync", seg.path)
 		}
 		// The descriptor is released even when Close reports an error.
@@ -564,15 +583,31 @@ func (w *writer) sync() error {
 	if w.seg == nil || !w.dirty {
 		return nil
 	}
-	if err := fault("segment.sync"); err != nil {
-		return err
+	err := fault("segment.sync")
+	if err == nil {
+		err = w.seg.f.Sync()
 	}
-	if err := w.seg.f.Sync(); err != nil {
+	if err != nil {
+		w.noteSyncFailure(w.seg)
 		return fmt.Errorf("sync segment %s: %w", w.seg.path, err)
 	}
 	trace("segment.sync", w.seg.path)
+	w.seg.unsyncedFrom = 0
 	w.dirty = false
 	return nil
+}
+
+// noteSyncFailure records the events written to seg since its last
+// successful fsync as a suspect range, once: the failed fsync may have lost
+// them although a later one succeeds (the close is still retried, so they
+// are on disk when the data was kept). The range is persisted with the drop
+// counters and reported by the next gap.
+func (w *writer) noteSyncFailure(seg *segment) {
+	if seg == nil || seg.unsyncedFrom == 0 {
+		return
+	}
+	w.r.ledger.addSuspect(SuspectRange{BootID: w.r.bootID, Segment: seg.name, FirstSeq: seg.unsyncedFrom, LastSeq: seg.lastSeq})
+	seg.unsyncedFrom = 0
 }
 
 // writeBlob persists a blob durably before any event references it. When a
@@ -768,13 +803,10 @@ func (w *writer) reopen() error {
 	if err := w.finishUnclosed(); err != nil {
 		return err
 	}
-	pending, since, prior, _ := w.r.ledger.pendingSnapshot()
-	gap := gapData{Reason: DropWriterError, Drops: pending, PriorBootID: prior}
+	pending := w.r.ledger.pendingSnapshot()
+	gap := newGapData(DropWriterError, pending)
 	if w.failure != nil {
 		gap.Error = w.failure.Error()
-	}
-	if !since.IsZero() {
-		gap.Since = FormatTime(since)
 	}
 	err := w.writeEvent(&Event{Type: TypeGap, Time: time.Now(), Data: gap})
 	if err == nil {

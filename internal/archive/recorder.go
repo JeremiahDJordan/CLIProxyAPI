@@ -3,11 +3,11 @@
 // repository). It is part of the fleet fork.
 //
 // Disabled means not installed: with archive.enabled false nothing is started,
-// no file is opened and every tap is a single nil check on Current(). Taps
-// never wait on the disk. They copy what they need, reserve its size on a
-// byte-bounded queue and enqueue; a failed reservation drops and counts. One
-// writer goroutine drains the queue in order and alone writes segments and
-// blobs.
+// no file is opened and every tap is a single nil check (Installed). Taps
+// never wait on the disk. They reserve the size of what they record on a
+// byte-bounded queue, copy it only once the reservation succeeds, and
+// enqueue; a failed reservation drops and counts. One writer goroutine drains
+// the queue in order and alone writes segments and blobs.
 package archive
 
 import (
@@ -54,7 +54,14 @@ const (
 )
 
 var (
+	// current is the recorder new requests are observed by; Stop clears it
+	// first, so no new request is observed once Stop begins.
 	current atomic.Pointer[Recorder]
+	// installed is the recorder a successful Start installed. Stop keeps it,
+	// so the taps of requests still in flight while Stop finalizes reach
+	// their own ingress, whose recorder records them or, once its queue is
+	// closed, drops and counts them against the request.
+	installed atomic.Pointer[Recorder]
 
 	lifecycleMu    sync.Mutex
 	startAttempted bool
@@ -69,9 +76,18 @@ var (
 	lastPanicLog atomic.Int64
 )
 
-// Current returns the running recorder, or nil when capture is off.
+// Current returns the running recorder, or nil when capture is off or Stop
+// has begun. New requests are observed only while it is set.
 func Current() *Recorder {
 	return current.Load()
+}
+
+// Installed reports whether capture was started in this process; it stays
+// true after Stop. Taps gate on it (one nil check while capture is off) and
+// record through the ingress in their context, never through Current, so a
+// request in flight while Stop runs is recorded or its drops are counted.
+func Installed() bool {
+	return installed.Load() != nil
 }
 
 // StartParams carries the process-start configuration.
@@ -125,6 +141,7 @@ func Start(p StartParams) *Recorder {
 			log.WithError(res.err).Warn("request archive: capture is off")
 			return nil
 		}
+		installed.Store(res.rec)
 		current.Store(res.rec)
 		log.WithFields(log.Fields{"boot_id": res.rec.bootID, "spool": res.rec.opts.SpoolDir}).Info("request archive: capture started")
 		return res.rec
@@ -622,7 +639,7 @@ func NewID() string {
 // minute. The request it happened in continues unaffected.
 func NoteTapPanic(where string, recovered any) {
 	tapPanics.Add(1)
-	if rec := Current(); rec != nil {
+	if rec := installed.Load(); rec != nil {
 		rec.ledger.add(DropTapPanic, DropCount{Events: 1})
 	}
 	now := time.Now().Unix()

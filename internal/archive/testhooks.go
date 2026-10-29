@@ -46,7 +46,8 @@ type TestOverrides struct {
 var (
 	overrides atomic.Pointer[TestOverrides]
 	traceHook atomic.Pointer[func(op, path string)]
-	// faultHook lets package tests fail or panic a writer operation.
+	// faultHook lets package tests fail or panic a writer operation, or
+	// panic a tap's copy.
 	faultHook atomic.Pointer[func(op string) error]
 	// writerBackoff is the first retry delay after a writer failure.
 	writerBackoff = time.Second
@@ -79,6 +80,7 @@ func resetForTest() {
 	_ = Stop(ctx)
 	lifecycleMu.Lock()
 	startAttempted = false
+	installed.Store(nil)
 	lifecycleMu.Unlock()
 	locksMu.Lock()
 	for _, f := range heldLocks {
