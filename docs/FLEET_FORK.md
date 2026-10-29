@@ -81,11 +81,14 @@ v8 status route, the shipper's assembly and ClickHouse come later.
   `previous_response_id`) is read through a view of its bytes (`archive.BytesView`), never
   copied whole: fields are located by their raw tokens (`archive.JSONText`; a member name is
   matched as written, so one spelled with escapes does not match), and an escaped string is
-  unescaped only when its raw token is short enough to hold at most 256 bytes. Identities,
-  models and frame fields are strings kept as copies of their own of at most 256 bytes (longer
-  values are dropped); an identity is copied only when the attempt or request keeps it, after
-  its limits and duplicate checks. A usage object or a turn's fields are copied only once their
-  event is reserved. A panic recovered in a tap that had found its request counts a drop
+  unescaped only when its raw token is short enough to hold at most 256 bytes (8 KiB for the
+  turn metadata string a WebSocket turn ID is read from), into a scratch buffer the tap reuses
+  (`archive.JSONScratch`), so reading any number of escaped strings allocates nothing per
+  string. Identities, models and frame fields are strings kept as copies of their own of at
+  most 256 bytes (longer values are dropped); an identity, escaped or not, is copied only when
+  the event's, the attempt's or the request's identities keep it, after their limits and
+  duplicate checks. A usage object or a turn's fields are copied only once their event is
+  reserved. A panic recovered in a tap that had found its request counts a drop
   against that request; so does one recovered in the observer, its writer wrapper, the client
   body tee, the content tap or the WebSocket hooks, which lose part of what `ingress_end`,
   `client_body` or a turn reports.
@@ -123,14 +126,11 @@ v8 status route, the shipper's assembly and ClickHouse come later.
   `upstream.codex.upstream-request-compression` compresses it. When the upstream rejects a zstd
   body (400 or 415), `doCodexRequest` records the rejected response before discarding it, and
   the uncompressed resend as a new `sub_attempt` of the same attempt with `resend:
-  compression_rejected`. Recording never delays the resend: the status and headers are recorded
-  at once, and the body is handed to `archive.TapDiscardedBody`, which reads it on its own
-  goroutine (reserving queue bytes before each buffer, at most 1 MiB, for at most 1 s, never
-  past its attempt's end or Stop), closes it, and records it as an `upstream_event` of the
-  rejected `sub_attempt` marked `discarded`, which may follow the resend's events in the spool
-  (its `ts` is when the response arrived). A body not read to its end is recorded without it,
-  as `truncated`; with capture off for the request, bodies off, or a queue that cannot hold its
-  first bytes, it is not read at all and the executor closes it, as without capture.
+  compression_rejected`. The archive never reads the rejected body: it records the status and
+  headers, and the body as the rejected `sub_attempt`'s next `upstream_event` without it
+  (`body_dropped: not_captured`, `not_captured_reason: rejected_before_resend`), before the
+  resend's events; the executor closes the body unread right after, exactly as without capture,
+  so recording cannot delay or change the resend.
 - Attempts: `newUpstreamAttemptContext` opens an archive attempt per upstream attempt; it is
   described where the after-auth interceptor runs (credential, provider, model, the plugin
   scheduler's `pick_reason`, carried back in the request metadata like the selection ID) and
@@ -183,11 +183,11 @@ may carry `body`: `client_body`, `upstream_request`, `upstream_event`, `upstream
 `client_ws_frame`. A body-carrying event written while bodies are off has
 `capture: dropped_body` and `body_dropped` (`low_space_body`, `low_space_hard`, `stopped`,
 `writer_error`, `queue_full`) instead of `body`; an outbound body the executor's tap cannot
-record as sent has `body_dropped: not_captured` (Devin); a discarded upstream body (Codex's
-rejected response, `discarded: true`) not read to its end has `body_dropped: truncated`, and
-one lost to a panic while it was read `tap_panic`. Every `dropped_body` counts in its
-request's `capture_drops`; `not_captured` is not a gap, `truncated` is (`tap_panic` counts as a
-tap panic). `content_encoding` names the encoding
+record as sent (Devin), or an upstream body the executor discards without the archive reading
+it (Codex's rejected response, with `not_captured_reason`), has `body_dropped: not_captured`;
+a client body lost to a panic in the tee has `tap_panic`. Every `dropped_body` counts in its
+request's `capture_drops`; `not_captured` is not a gap (`tap_panic` counts as a tap panic).
+`content_encoding` names the encoding
 of bytes recorded encoded: a `client_body` as received, a Codex `upstream_request` sent zstd.
 
 A request is capture-incomplete when its `ingress_end` has `capture_drops` above zero, when it
@@ -219,7 +219,7 @@ segment, first_seq, last_seq)`.
 | `attempt_start` | `auth_id`, `provider`, `model`, `requested_model`, `pick_reason`, `session_id` |
 | `upstream_request` | `transport`, `url` (query values allowlisted), `method`, `headers`, `resend` (`compression_rejected`: the executor's own resend of the attempt's request, as a new `sub_attempt`), `provider`, `auth_id`, `auth_label`, `auth_type`; the outbound body as sent |
 | `upstream_response_meta` | `status`, `headers` |
-| `upstream_event` | `chunk_seq` (per sub-attempt from 1; empty chunks are counted, not written); the chunk exactly as the executor read it (an SSE line, or a whole non-streamed or error body); for a body the executor discarded unread, read by the archive: `discarded: true`, and when it is `truncated`, `stopped` (`limit`: over 1 MiB, the rest unread; `timeout`: still arriving after 1 s; `attempt_end`; `read_error`, with `read_error` its class) and `read_bytes` |
+| `upstream_event` | `chunk_seq` (per sub-attempt from 1; empty chunks are counted, not written); the chunk exactly as the executor read it (an SSE line, or a whole non-streamed or error body); for a body the executor discards without the archive reading it, `not_captured_reason` (`rejected_before_resend`: the body of the response rejecting Codex's zstd request, closed unread before the resend), with no body (`body_dropped: not_captured`) |
 | `upstream_error` | `class` (`canceled`, `timeout`, `eof_unexpected`, `other`), `error` (redacted text) |
 | `upstream_ws` | `ws_event` (`request`, `handshake`, `upgrade_rejection`, `error`, `response`), `url`, `headers`, `status`, `response_headers`, `stage`, `class`, `error`, `frame_seq`, `trimmed` (Codex frames are whitespace-trimmed before the tap), auth fields; the frame or rejection body |
 | `usage` | `source` (`upstream` or `reporter`), `event` (`message_start`, `message_delta`, `response.completed`, `body`, `usageMetadata`, ...), `model`, `usage` (the provider's usage object, or the reporter's token breakdown, redacted as below) |
