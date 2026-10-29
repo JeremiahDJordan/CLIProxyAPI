@@ -205,3 +205,19 @@ func TestRecordSchedulerPickReason(t *testing.T) {
 	}
 	recordSchedulerPickReason(nil, "x")
 }
+
+type archivePanickingContext struct{ context.Context }
+
+func (archivePanickingContext) Value(any) any { panic("context lookup failed") }
+
+// Round-2 finding 5: a tap panic while opening the archive attempt leaves
+// the attempt context derived from the caller's, so a canceled execution
+// stays canceled (it was replaced by context.Background()).
+func TestUpstreamAttemptContextKeepsCancellationAfterATapPanic(t *testing.T) {
+	startArchiveForConductor(t)
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := newUpstreamAttemptContext(archivePanickingContext{parent}); got.Err() != context.Canceled {
+		t.Fatalf("attempt context Err = %v", got.Err())
+	}
+}

@@ -292,6 +292,13 @@ func setWebsocketBody(c *gin.Context, key string, body string) {
 }
 
 func writeResponsesWebsocketPayload(writer *responsesWebsocketWriter, wsTimelineLog websocketTimelineAppender, payload []byte, timestamp time.Time) error {
+	return writeResponsesWebsocketPayloadForTurn(writer, wsTimelineLog, payload, timestamp, nil)
+}
+
+// writeResponsesWebsocketPayloadForTurn is writeResponsesWebsocketPayload
+// recording the frame on archiveTurn, or on the turn being answered when it
+// is nil (fleet: request archive).
+func writeResponsesWebsocketPayloadForTurn(writer *responsesWebsocketWriter, wsTimelineLog websocketTimelineAppender, payload []byte, timestamp time.Time, archiveTurn *responsesWebsocketTurn) error {
 	if wsTimelineLog != nil {
 		wsTimelineLog.Append("response", payload, timestamp)
 	}
@@ -304,7 +311,7 @@ func writeResponsesWebsocketPayload(writer *responsesWebsocketWriter, wsTimeline
 		return websocket.ErrCloseSent
 	}
 	errWrite := writer.conn.WriteMessage(websocket.TextMessage, payload)
-	writer.archive.downstream(websocket.TextMessage, payload, errWrite) // fleet: request archive
+	writer.archive.downstreamFor(archiveTurn, websocket.TextMessage, payload, errWrite) // fleet: request archive
 	return errWrite
 }
 

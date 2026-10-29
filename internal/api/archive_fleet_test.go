@@ -369,7 +369,9 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		}
 		helps.RecordAPIRequest(ctx, cfg, helps.UpstreamRequestLog{URL: "https://gen.example/v1beta/models/x:generateContent?alt=sse&key=AIzaFAKEurlkey0025", Method: http.MethodPost, Headers: outbound, Body: []byte(`{}`), AuthValue: "sk-fake-auth-value-0036"})
 		helps.RecordAPIResponseMetadata(ctx, cfg, http.StatusOK, http.Header{"Set-Cookie": {"__cf_bm=fake-upstream-setcookie-0026; Path=/"}})
-		helps.AppendAPIResponseChunk(ctx, cfg, []byte(`data: {"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":1}}}`))
+		// The chunk is a body and stays as sent; its usage metadata copy is redacted.
+		helps.AppendAPIResponseChunk(ctx, cfg, []byte(`data: {"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":1,"cookie":"fake-usage-cookie-0037","note":"sk-fake-usage-key-0038"}}}`))
+		archive.TapUsage(ctx, archive.UsageSourceReporter, "m", []byte(`{"input_tokens":3,"access_token":"fake-usage-reporter-0039"}`))
 		helps.RecordAPIResponseError(ctx, cfg, errors.New(`Post "https://api.example/v1?key=fake-error-key-0027": Bearer fake-error-bearer-0028 dial failed`))
 		wsHeaders := http.Header{
 			"Sec-Websocket-Protocol": {"realtime, openai-insecure-api-key.sk-fake-upstream-wsproto-0029"},
@@ -394,6 +396,7 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 		"AIzaFAKEurlkey0025", "fake-upstream-setcookie-0026", "fake-error-key-0027", "fake-error-bearer-0028",
 		"fake-upstream-wsproto-0029", "fake-ws-bearer-0030", "fake-ws-setcookie-0031", "fake-ws-url-key-0032",
 		"fake-ws-token-0033", "fake-ws-error-token-0034", "fake-attempt-bearer-0035", "fake-auth-value-0036",
+		"fake-usage-reporter-0039",
 	}
 	credentialHeaders := http.Header{
 		"Authorization":          {"Bearer sk-fake-bearer-0001"},
@@ -503,6 +506,16 @@ func TestArchiveRedactsCredentials(t *testing.T) {
 	}
 	if got := len(eventsFor(events, archive.TypeUpstreamWS, "/archive-test/upstream-secrets")); got != 4 {
 		t.Fatalf("%d upstream_ws events", got)
+	}
+	usage := eventsFor(events, archive.TypeUsage, "/archive-test/upstream-secrets")
+	if len(usage) != 2 {
+		t.Fatalf("usage events = %v", usage)
+	}
+	for _, ev := range usage {
+		raw, _ := json.Marshal(ev["usage"])
+		if bytes.Contains(raw, []byte("fake-usage-")) || !bytes.Contains(raw, []byte(`"input_tokens"`)) {
+			t.Fatalf("usage metadata = %s", raw)
+		}
 	}
 }
 

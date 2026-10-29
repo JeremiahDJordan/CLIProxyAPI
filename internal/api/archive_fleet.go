@@ -371,7 +371,9 @@ func (o *archiveObservation) untrackLocked() {
 // FinalizeAtStop queues the final event of a request still running when
 // Stop's wait ends: a hijacked WebSocket, say, which HTTP shutdown does not
 // wait for. It reads only what the writer wrapper recorded atomically; the
-// request's own finish, if it comes later, queues nothing.
+// request's own finish, if it comes later, queues nothing. What the request
+// does afterwards is not recorded, so it counts as a drop: an ingress_end
+// with ended shutdown always has capture_drops.
 func (o *archiveObservation) FinalizeAtStop() {
 	defer recoverArchiveTap("observer.stop")
 	o.mu.Lock()
@@ -381,6 +383,7 @@ func (o *archiveObservation) FinalizeAtStop() {
 		return
 	}
 	o.finished = true
+	o.in.NoteDrop()
 	end := time.Now()
 	summary := archiveResponseSummary{DurationUS: end.Sub(o.in.Started()).Microseconds(), Abort: "shutdown", AuthDecision: "unknown"}
 	var headers map[string][]string
@@ -421,7 +424,7 @@ func (o *archiveObservation) FinalizeAtStop() {
 // middleware refused with a fleet code (fleet_route_denied: ...).
 func archiveNoteAuthDenial(c *gin.Context, message string) {
 	defer recoverArchiveTap("observer.auth")
-	if archive.Current() == nil || c == nil || c.Request == nil {
+	if !archive.Installed() || c == nil || c.Request == nil {
 		return
 	}
 	code, _, found := strings.Cut(message, ":")
@@ -1152,15 +1155,13 @@ func (w *archiveContentWriter) Unwrap() http.ResponseWriter {
 
 func (w *archiveContentWriter) Write(data []byte) (int, error) {
 	n, errWrite := w.ResponseWriter.Write(data)
-	w.record(data[:max(n, 0)])
+	archiveRecordContent(w, data[:max(n, 0)])
 	return n, errWrite
 }
 
 func (w *archiveContentWriter) WriteString(data string) (int, error) {
 	n, errWrite := w.ResponseWriter.WriteString(data)
-	if n > 0 {
-		w.record([]byte(data[:n]))
-	}
+	archiveRecordContent(w, data[:max(n, 0)])
 	return n, errWrite
 }
 
@@ -1176,7 +1177,10 @@ func (w *archiveContentWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return w.ResponseWriter.Hijack()
 }
 
-func (w *archiveContentWriter) record(data []byte) {
+// archiveRecordContent records a write of data (the []byte or string the
+// handler wrote, never copied here: the archive copies it once the event is
+// admitted).
+func archiveRecordContent[B []byte | string](w *archiveContentWriter, data B) {
 	defer recoverArchiveTap("content.write")
 	if len(data) == 0 {
 		return
@@ -1195,21 +1199,31 @@ func (w *archiveContentWriter) record(data []byte) {
 // non-streamed body's first write, or a streamed event carrying a text,
 // reasoning or tool-argument delta. The shipper can recompute it from the
 // downstream events.
-func archiveContentBearing(contentType string, data []byte) bool {
+func archiveContentBearing[B []byte | string](contentType string, data B) bool {
 	if !strings.Contains(strings.ToLower(contentType), "text/event-stream") {
 		return true
 	}
 	for _, marker := range archiveTokenMarkers {
-		if bytes.Contains(data, marker) {
+		if archiveContains(data, marker) {
 			return true
 		}
 	}
 	return false
 }
 
-var archiveTokenMarkers = [][]byte{
-	[]byte(`"text_delta"`), []byte(`"thinking_delta"`), []byte(`"input_json_delta"`), // Anthropic
-	[]byte(`.delta"`),                                                                                  // Responses: response.output_text.delta, reasoning and argument deltas
-	[]byte(`"delta":{"content":"`), []byte(`"delta":{"reasoning_content":"`), []byte(`"tool_calls":[`), // Chat Completions
-	[]byte(`"parts":[{"text":"`), // Gemini
+func archiveContains[B []byte | string](data B, marker string) bool {
+	switch data := any(data).(type) {
+	case []byte:
+		return bytes.Contains(data, []byte(marker))
+	case string:
+		return strings.Contains(data, marker)
+	}
+	return false
+}
+
+var archiveTokenMarkers = []string{
+	`"text_delta"`, `"thinking_delta"`, `"input_json_delta"`, // Anthropic
+	`.delta"`,                                                                  // Responses: response.output_text.delta, reasoning and argument deltas
+	`"delta":{"content":"`, `"delta":{"reasoning_content":"`, `"tool_calls":[`, // Chat Completions
+	`"parts":[{"text":"`, // Gemini
 }

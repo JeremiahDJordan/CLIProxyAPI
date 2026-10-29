@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/archive"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
@@ -26,10 +27,32 @@ func archiveUpstreamRequest(info UpstreamRequestLog) archive.UpstreamRequest {
 	}
 }
 
+// RecordAPIRequestSent is RecordAPIRequest for an executor whose request-log
+// body (info.Body) is not the bytes it sends, such as one kept only while
+// request logging is on: the archive records sent, request logging keeps
+// info.Body.
+func RecordAPIRequestSent(ctx context.Context, cfg *config.Config, info UpstreamRequestLog, sent []byte) {
+	req := archiveUpstreamRequest(info)
+	req.Body = sent
+	archive.TapUpstreamRequest(ctx, req)
+	recordAPIRequest(ctx, cfg, info)
+}
+
+// RecordAPIRequestBodyNotCaptured is RecordAPIRequest for an executor whose
+// request-log body is only a rendering of what it sends, and whose wire
+// bytes must not be kept (Devin's protobuf carries the credential): the
+// archive records the body as not captured, request logging keeps info.Body.
+func RecordAPIRequestBodyNotCaptured(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	req := archiveUpstreamRequest(info)
+	req.Body, req.BodyNotCaptured = nil, true
+	archive.TapUpstreamRequest(ctx, req)
+	recordAPIRequest(ctx, cfg, info)
+}
+
 // archiveReporterUsage records the usage reporter's token breakdown for the
 // attempt (design section 3, raw usage: the reporter's TokenBreakdown).
 func archiveReporterUsage(ctx context.Context, record usage.Record) {
-	if archive.Current() == nil {
+	if !archive.Installed() {
 		return
 	}
 	raw, err := json.Marshal(struct {

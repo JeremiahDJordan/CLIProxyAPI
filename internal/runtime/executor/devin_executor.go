@@ -251,7 +251,8 @@ func (e *DevinExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	authID, authLabel, authType, authValue := devinAuthLogFields(auth)
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	// fleet: logBody renders the protobuf sent, which carries the credential; the archive records the body as not captured.
+	helps.RecordAPIRequestBodyNotCaptured(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       httpReq.URL.String(),
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
@@ -341,7 +342,8 @@ func (e *DevinExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	authID, authLabel, authType, authValue := devinAuthLogFields(auth)
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	// fleet: logBody renders the protobuf sent, which carries the credential; the archive records the body as not captured.
+	helps.RecordAPIRequestBodyNotCaptured(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       httpReq.URL.String(),
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),

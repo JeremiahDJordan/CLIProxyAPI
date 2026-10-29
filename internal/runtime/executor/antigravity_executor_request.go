@@ -73,6 +73,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	var (
 		bodyReader io.Reader
 		payloadLog []byte
+		sentBody   []byte // fleet: request archive, the body sent
 	)
 	if antigravityRequestNeedsSchemaSanitization(payload) {
 		payloadStr := sanitizeAntigravityRequestSchemasForModel(string(payload), useAntigravitySchema, isClaudeModel)
@@ -89,6 +90,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadStrBytes := applyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
 		payloadStrBytes = helps.FinalizePayload(ctx, payloadStrBytes)
 		bodyReader = bytes.NewReader(payloadStrBytes)
+		sentBody = payloadStrBytes
 		if e.cfg != nil && e.cfg.RequestLog {
 			payloadLog = append([]byte(nil), payloadStrBytes...)
 		}
@@ -104,6 +106,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
 		payload = helps.FinalizePayload(ctx, payload)
 		bodyReader = bytes.NewReader(payload)
+		sentBody = payload
 		if e.cfg != nil && e.cfg.RequestLog {
 			payloadLog = append([]byte(nil), payload...)
 		}
@@ -148,7 +151,8 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	// fleet: the archive records sentBody; payloadLog is kept only for request logging.
+	helps.RecordAPIRequestSent(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       requestURL.String(),
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
@@ -158,7 +162,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}, sentBody)
 
 	return httpReq, nil
 }

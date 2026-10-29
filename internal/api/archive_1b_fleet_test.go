@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -108,7 +109,8 @@ func assertBeforeShutdown(t *testing.T, events []spoolEvent, ev spoolEvent) {
 // Review finding 2: HTTP shutdown ignores hijacked connections, so a
 // WebSocket still open when Stop's wait ends is finalized explicitly: its
 // ingress_end (ended shutdown) precedes the shutdown event, and the
-// handler's own finish later adds nothing.
+// handler's own finish later adds nothing. Round-2 finding 2: what the
+// connection does afterwards is not recorded, so it counts a drop.
 func TestArchiveStopFinalizesAnOpenWebSocket(t *testing.T) {
 	server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.StopObserverWait = 100 * time.Millisecond }, nil)
 	classifyForTest(t, http.MethodGet, "/archive-test/ws-open")
@@ -146,7 +148,8 @@ func TestArchiveStopFinalizesAnOpenWebSocket(t *testing.T) {
 		t.Fatalf("ingress_start = %v", starts)
 	}
 	if len(ends) != 1 || ends[0]["ended"] != "shutdown" || ends[0]["hijacked"] != true ||
-		ends[0]["status"] != float64(http.StatusSwitchingProtocols) || ends[0]["kind"] != archive.KindWSConnection {
+		ends[0]["status"] != float64(http.StatusSwitchingProtocols) || ends[0]["kind"] != archive.KindWSConnection ||
+		ends[0]["capture_drops"] != float64(1) {
 		t.Fatalf("ingress_end = %v", ends)
 	}
 	assertBeforeShutdown(t, events, ends[0])
@@ -375,5 +378,104 @@ func TestArchiveContentTapIsInstalledBelowCompression(t *testing.T) {
 	}
 	if compression < 0 || content != compression+1 {
 		t.Fatalf("compression at %d, content tap at %d", compression, content)
+	}
+}
+
+// Round-2 finding 2: Stop clears Current before it waits for the requests
+// in flight, but their executor taps still record through the request's own
+// ingress (bodies as dropped_body, counted), so the request is recorded as
+// capture-incomplete instead of complete with its upstream exchange missing.
+func TestArchiveTapsDuringStopAreRecordedOrCounted(t *testing.T) {
+	server, spool := newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.StopObserverWait = 5 * time.Second }, nil)
+	const path = "/archive-test/stop-window"
+	classifyForTest(t, http.MethodPost, path)
+	entered := make(chan struct{})
+	server.engine.POST(path, func(c *gin.Context) {
+		ctx := archive.WithAttempt(archiveUpstreamCtx(c))
+		helps.RecordAPIRequest(ctx, server.cfg, helps.UpstreamRequestLog{URL: "https://api.example/v1/messages", Method: http.MethodPost, Body: []byte(`{}`)})
+		close(entered)
+		for archive.Current() != nil { // until Stop has begun
+			time.Sleep(time.Millisecond)
+		}
+		helps.RecordAPIResponseMetadata(ctx, server.cfg, http.StatusOK, http.Header{"Content-Type": {"text/event-stream"}})
+		helps.AppendAPIResponseChunk(ctx, server.cfg, []byte(`data: {"type":"message_delta","usage":{"output_tokens":7}}`))
+		archive.EndAttempt(ctx, archive.AttemptEnd{Success: true})
+		c.Status(http.StatusOK)
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, path, nil))
+	}()
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := archive.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	events := spoolEvents(t, spool)
+	if meta := eventsFor(events, archive.TypeUpstreamResponseMeta, path); len(meta) != 1 || meta[0]["status"] != float64(http.StatusOK) {
+		t.Fatalf("upstream_response_meta = %v", meta)
+	}
+	chunks := eventsFor(events, archive.TypeUpstreamEvent, path)
+	if len(chunks) != 1 || chunks[0]["capture"] != archive.CaptureDroppedBody || chunks[0]["body_dropped"] != archive.DropStopped {
+		t.Fatalf("upstream_event = %v", chunks)
+	}
+	if usage, attempts := eventsFor(events, archive.TypeUsage, path), eventsFor(events, archive.TypeAttemptEnd, path); len(usage) != 1 || len(attempts) != 1 || attempts[0]["ended"] != archive.AttemptEndedResult {
+		t.Fatalf("usage %v, attempt_end %v", usage, attempts)
+	}
+	ends := eventsFor(events, archive.TypeIngressEnd, path)
+	if len(ends) != 1 || ends[0]["ended"] != "request_end" || ends[0]["capture_drops"] != float64(1) {
+		t.Fatalf("ingress_end = %v", ends)
+	}
+	assertBeforeShutdown(t, events, ends[0])
+}
+
+// archiveDiscardWriter keeps nothing, so a test can measure what the
+// content tap itself allocates.
+type archiveDiscardWriter struct{ header http.Header }
+
+func (w *archiveDiscardWriter) Header() http.Header               { return w.header }
+func (w *archiveDiscardWriter) Write(p []byte) (int, error)       { return len(p), nil }
+func (w *archiveDiscardWriter) WriteString(s string) (int, error) { return len(s), nil }
+func (w *archiveDiscardWriter) WriteHeader(int)                   {}
+
+// Round-2 finding 1: the downstream content tap copies a write only once
+// its event is admitted; Write and WriteString refused by a full queue
+// allocate nothing.
+func TestArchiveContentTapDoesNotCopyRefusedWrites(t *testing.T) {
+	newArchiveServerWithOverrides(t, func(o *archive.TestOverrides) { o.QueueBytes = 1 << 20 }, nil)
+	rec := archive.Current()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := archive.FlushForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	in := rec.BeginIngress(archive.RouteInference, time.Now())
+	c, _ := gin.CreateTestContext(&archiveDiscardWriter{header: http.Header{}})
+	c.Set(archiveIngressContextKey, in)
+	w := newArchiveContentWriter(c)
+	if w == nil {
+		t.Fatal("no content writer")
+	}
+	text := strings.Repeat("x", 16<<20)
+	data := []byte(text)
+	if !rec.ReserveBody(1 << 20) {
+		t.Fatal("cannot fill the queue")
+	}
+	defer rec.ReleaseBody(1 << 20)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range 2 {
+		_, _ = w.WriteString(text)
+		_, _ = w.Write(data)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= 1<<20 {
+		t.Fatalf("four refused 16 MiB writes allocated %d bytes", allocated)
+	}
+	if in.Drops() != 4 {
+		t.Fatalf("request drops = %d", in.Drops())
 	}
 }

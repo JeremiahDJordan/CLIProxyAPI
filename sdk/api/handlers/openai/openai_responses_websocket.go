@@ -641,7 +641,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 		executionParent := context.WithValue(c.Request.Context(), "gin", c)
-		executionParent = archiveTurn.context(executionParent) // fleet: the turn's own archive ingress
+		executionParent = writer.archive.turnContext(archiveTurn, executionParent) // fleet: the turn's own archive ingress
 		executionParent, routeOverridesModelResolution := h.PrepareStreamModelRoute(
 			executionParent,
 			h.HandlerType(),

@@ -37,7 +37,7 @@ func archiveAttemptContext(ctx context.Context) context.Context {
 }
 
 func archiveDescribeAttempt(ctx context.Context, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) {
-	if archive.Current() == nil {
+	if !archive.Installed() {
 		return
 	}
 	info := archive.AttemptInfo{Provider: provider, Model: req.Model, RequestedModel: requestedModel}
@@ -53,7 +53,7 @@ func archiveDescribeAttempt(ctx context.Context, provider string, req cliproxyex
 // code is the error code of its response body (the fleet gate's
 // fleet_* codes), or the status when the body has none.
 func archiveNoteGate(ctx context.Context, terminate bool, status int, body []byte) {
-	if archive.Current() == nil {
+	if !archive.Installed() {
 		return
 	}
 	if !terminate {
@@ -68,7 +68,7 @@ func archiveNoteGate(ctx context.Context, terminate bool, status int, body []byt
 }
 
 func archiveEndAttempt(ctx context.Context, result Result) {
-	if archive.Current() == nil {
+	if !archive.Installed() {
 		return
 	}
 	end := archive.AttemptEnd{AuthID: result.AuthID, Provider: result.Provider, Model: result.Model, Success: result.Success}

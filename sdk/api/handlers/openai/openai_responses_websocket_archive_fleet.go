@@ -62,7 +62,7 @@ type responsesWebsocketArchive struct {
 var steeringCaptureWarned atomic.Bool
 
 func newResponsesWebsocketArchive(c *gin.Context, sessionID string, steering bool) (a *responsesWebsocketArchive) {
-	if archive.Current() == nil || c == nil || c.Request == nil {
+	if !archive.Installed() || c == nil || c.Request == nil {
 		return nil
 	}
 	defer recoverWebsocketArchive("ws.open")
@@ -154,7 +154,10 @@ func (a *responsesWebsocketArchive) beginTurn(kind int, payload []byte) (t *resp
 	}
 	defer recoverWebsocketArchive("ws.turn")
 	if !a.rec.CaptureEvents() {
+		// Low space, a failed writer or Stop: the turn is not recorded,
+		// which counts against its connection too.
 		a.rec.CountDrop(a.rec.BodyDropReason(), archive.DropCount{Events: 1})
+		a.conn.NoteDrop()
 		return nil
 	}
 	now := time.Now()
@@ -235,15 +238,22 @@ func (t *responsesWebsocketTurn) noteClientKey(c *gin.Context) {
 	}
 }
 
-// context attaches the turn to its execution context.
-func (t *responsesWebsocketTurn) context(ctx context.Context) context.Context {
-	if t == nil {
+// turnContext attaches turn to its execution context. A turn that is not
+// recorded (nil) is detached from its connection, whose ingress the context
+// also carries, so its traffic is not recorded there.
+func (a *responsesWebsocketArchive) turnContext(t *responsesWebsocketTurn, ctx context.Context) context.Context {
+	if a == nil {
 		return ctx
+	}
+	if t == nil {
+		return archive.WithoutIngress(ctx)
 	}
 	return archive.WithIngress(ctx, t.in)
 }
 
 // end queues the turn's ingress_end, once, after closing its open attempts.
+// A turn ended by Stop (ended shutdown) counts a drop: what it does
+// afterwards is not recorded.
 func (t *responsesWebsocketTurn) end(ended string) {
 	if t == nil {
 		return
@@ -259,6 +269,7 @@ func (t *responsesWebsocketTurn) end(ended string) {
 	attempts := archive.AttemptEndedRequestEnd
 	if ended == archiveTurnEndedShutdown {
 		attempts = archive.AttemptEndedShutdown
+		t.in.NoteDrop()
 	}
 	t.in.CloseAttempts(attempts)
 	data := wsTurnEndData{
@@ -329,12 +340,21 @@ func (a *responsesWebsocketArchive) closeTurns() {
 // downstream records a frame written to the client, after restoration, on
 // the turn being answered (or the connection between turns).
 func (a *responsesWebsocketArchive) downstream(kind int, payload []byte, errWrite error) {
+	a.downstreamFor(nil, kind, payload, errWrite)
+}
+
+// downstreamFor records a frame written to the client on turn, or, when turn
+// is nil, as downstream does.
+func (a *responsesWebsocketArchive) downstreamFor(turn *responsesWebsocketTurn, kind int, payload []byte, errWrite error) {
 	if a == nil {
 		return
 	}
 	defer recoverWebsocketArchive("ws.downstream")
 	target := a.conn
-	t := a.current.Load()
+	t := turn
+	if t == nil {
+		t = a.current.Load()
+	}
 	if t != nil {
 		target = t.in
 		t.mu.Lock()
@@ -355,7 +375,7 @@ func (a *responsesWebsocketArchive) interruptContext(ctx context.Context) contex
 	if a == nil {
 		return ctx
 	}
-	return a.interrupt.Load().context(ctx)
+	return a.turnContext(a.interrupt.Load(), ctx)
 }
 
 // forwardingInterrupt marks t as the interrupt being forwarded until done.
@@ -365,6 +385,17 @@ func (a *responsesWebsocketArchive) forwardingInterrupt(t *responsesWebsocketTur
 	}
 	a.interrupt.Store(t)
 	return func() { a.interrupt.CompareAndSwap(t, nil) }
+}
+
+// writeResponsesWebsocketErrorForTurn writes an error frame answering turn
+// (a frame the reader answers itself, such as a rejected interrupt) and
+// records it on that turn rather than on the turn being answered.
+func writeResponsesWebsocketErrorForTurn(writer *responsesWebsocketWriter, errMsg *interfaces.ErrorMessage, turn *responsesWebsocketTurn) ([]byte, error) {
+	payload, errBuild := buildResponsesWebsocketErrorPayload(errMsg)
+	if errBuild != nil {
+		return nil, errBuild
+	}
+	return payload, writeResponsesWebsocketPayloadForTurn(writer, nil, payload, time.Now(), turn)
 }
 
 // turnFromInput returns the turn a queued frame carries.

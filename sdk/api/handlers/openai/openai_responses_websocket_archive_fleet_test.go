@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -345,7 +346,8 @@ func TestArchiveWebsocketSteeringGuard(t *testing.T) {
 }
 
 // A turn still being answered when Stop's wait ends is finalized: its
-// ingress_end (ended shutdown) precedes the shutdown event.
+// ingress_end (ended shutdown) precedes the shutdown event. Round-2 finding
+// 2: what the turn does afterwards is not recorded, so it counts a drop.
 func TestArchiveStopFinalizesAnOpenWebsocketTurn(t *testing.T) {
 	spool := startArchiveForWebsocket(t, func(o *archive.TestOverrides) { o.StopObserverWait = 100 * time.Millisecond })
 	exec := &archiveWSExecutor{started: make(chan struct{}, 1), release: make(chan struct{})}
@@ -378,7 +380,100 @@ func TestArchiveStopFinalizesAnOpenWebsocketTurn(t *testing.T) {
 			shutdown = ev
 		}
 	}
-	if end == nil || end["ended"] != archiveTurnEndedShutdown || shutdown == nil || end["seq"].(float64) > shutdown["seq"].(float64) {
+	if end == nil || end["ended"] != archiveTurnEndedShutdown || shutdown == nil || end["seq"].(float64) > shutdown["seq"].(float64) ||
+		end["capture_drops"] != float64(1) {
 		t.Fatalf("turn ingress_end %v, shutdown %v", end, shutdown)
+	}
+}
+
+// Round-2 finding 6: the reader answers a rejected response.interrupt
+// itself; its error frame is recorded on the interrupt's own turn, before
+// that turn's ingress_end, not on the connection or another turn.
+func TestArchiveRejectedInterruptAnswersItsOwnTurn(t *testing.T) {
+	spool := startArchiveForWebsocket(t, nil)
+	conn, connIn, done := serveArchivedWebsocket(t, &sdkconfig.SDKConfig{}, &archiveWSExecutor{started: make(chan struct{}, 1)}, nil)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"resp_ws_1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	readWebsocketUntil(t, conn, "error")
+	_ = conn.Close()
+	<-done
+	var turn string
+	var out, end archiveWSEvent
+	for _, ev := range archiveWSEvents(t, spool) {
+		switch {
+		case ev["type"] == archive.TypeIngressStart && ev["kind"] == archive.KindWSTurn:
+			turn = ev["ingress_id"].(string)
+		case ev["type"] == archive.TypeClientWSFrame && ev["direction"] == "out":
+			if ev["ingress_id"] == connIn.ID() || out != nil {
+				t.Fatalf("frame out recorded on %v (turn %s)", ev["ingress_id"], turn)
+			}
+			out = ev
+		case ev["type"] == archive.TypeIngressEnd && ev["kind"] == archive.KindWSTurn:
+			end = ev
+		}
+	}
+	if out == nil || out["ingress_id"] != turn || !strings.Contains(string(archiveWSBody(t, out)), `"type":"error"`) {
+		t.Fatalf("error frame = %v", out)
+	}
+	if end == nil || end["outcome"] != wsTurnInterruptPrefix+"rejected" || end["frames_out"] != float64(1) ||
+		end["bytes_out"] != float64(len(archiveWSBody(t, out))) || out["seq"].(float64) > end["seq"].(float64) {
+		t.Fatalf("interrupt turn ingress_end = %v, frame seq %v", end, out["seq"])
+	}
+}
+
+// Round-2 finding 2: a frame that arrives while Stop waits for the turns in
+// flight is not recorded as a turn. That counts against its connection, and
+// the refused turn's upstream traffic is not recorded on the connection.
+func TestArchiveTurnRefusedDuringStopCountsAgainstItsConnection(t *testing.T) {
+	spool := startArchiveForWebsocket(t, func(o *archive.TestOverrides) { o.StopObserverWait = 5 * time.Second })
+	exec := &archiveWSExecutor{started: make(chan struct{}, 2), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(exec.release) })
+	defer release()
+	conn, connIn, done := serveArchivedWebsocket(t, &sdkconfig.SDKConfig{}, exec, nil)
+	frame := []byte(`{"type":"response.create","model":"archive-model","input":[]}`)
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+		t.Fatal(err)
+	}
+	<-exec.started
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- archive.Stop(ctx)
+	}()
+	for archive.Current() != nil {
+		time.Sleep(time.Millisecond)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for connIn.Drops() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	// The first turn still holds the handler: nothing answers the refused one yet.
+	if got := connIn.Drops(); got != 1 {
+		t.Fatalf("connection drops after the refused frame = %d", got)
+	}
+	release()
+	readWebsocketUntil(t, conn, "response.completed")
+	readWebsocketUntil(t, conn, "response.completed")
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	<-done
+	turns := 0
+	for _, ev := range archiveWSEvents(t, spool) {
+		if ev["type"] == archive.TypeIngressStart && ev["kind"] == archive.KindWSTurn {
+			turns++
+		}
+		if ev["ingress_id"] == connIn.ID() && ev["type"] == archive.TypeUpstreamRequest {
+			t.Fatalf("the refused turn's upstream request was recorded on the connection: %v", ev)
+		}
+	}
+	if turns != 1 {
+		t.Fatalf("%d turns recorded", turns)
 	}
 }

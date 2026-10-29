@@ -134,13 +134,15 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 				default:
 					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
 					turn.note(wsTurnInterruptPrefix+"rejected", http.StatusBadRequest)
-					turn.end(archiveTurnEnded)
 					// The sanitized outcome replaces raw error logging here: errors
 					// from transport dependencies may contain credentials or URLs.
-					_, errWrite := writeResponsesWebsocketError(writer, nil, &interfaces.ErrorMessage{
+					// fleet: the error frame answers the interrupt's own archive turn,
+					// which ends once it is written.
+					_, errWrite := writeResponsesWebsocketErrorForTurn(writer, &interfaces.ErrorMessage{
 						StatusCode: http.StatusBadRequest,
 						Error:      errInterrupt,
-					})
+					}, turn)
+					turn.end(archiveTurnEnded)
 					admission.unadmit()
 					if errWrite != nil {
 						cancel(errWrite)
