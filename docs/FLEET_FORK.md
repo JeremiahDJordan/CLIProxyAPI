@@ -76,7 +76,12 @@ v8 status route, the shipper's assembly and ClickHouse come later.
   once per process, when the first server is built; that first configuration wins, also when
   it is disabled. Disabled installs nothing and opens no file; every tap is one nil check
   (`archive.Installed`). Taps reserve an event's whole size, body included, before they copy
-  anything, so a body the queue refuses is counted and never allocated.
+  anything, so a body the queue refuses is counted and never allocated. JSON a tap inspects
+  (upstream events and bodies, usage objects, client WebSocket frames) is read through a view
+  of its bytes (`archive.BytesView`), never copied whole: identities, models and frame fields
+  are kept as copies of their own of at most 256 bytes (longer values are dropped), and a
+  usage object or a turn's fields are copied only once their event is reserved. A panic
+  recovered in a tap that had found its request counts a drop against that request.
 - Start runs its disk work (statfs, the boot lock, the boot event) on its own goroutine and
   gives up after 5 s: capture stays off for the process, and a start that finishes later is
   stopped at once and reports a `start_timeout` gap. Start refuses (logged and counted as a
@@ -106,6 +111,12 @@ v8 status route, the shipper's assembly and ClickHouse come later.
   body only while request logging is on, so it calls `RecordAPIRequestSent` with the bytes it
   sends; Devin's request-log body is a JSON rendering of a protobuf that carries the
   credential, so it calls `RecordAPIRequestBodyNotCaptured` (`body_dropped: not_captured`).
+  Codex HTTP requests (responses, compact, images) call `RecordAPIRequestOnWire`, which records
+  the request's own body as sent: zstd, with `body.content_encoding`, when
+  `upstream.codex.upstream-request-compression` compresses it. When the upstream rejects a zstd
+  body (400 or 415), `doCodexRequest` records the rejected response (status, headers and up to
+  1 MiB of body; a longer body counts a drop) before discarding it, and the uncompressed resend
+  as a new `sub_attempt` of the same attempt with `resend: compression_rejected`.
 - Attempts: `newUpstreamAttemptContext` opens an archive attempt per upstream attempt; it is
   described where the after-auth interceptor runs (credential, provider, model, the plugin
   scheduler's `pick_reason`, carried back in the request metadata like the selection ID) and
@@ -119,14 +130,18 @@ v8 status route, the shipper's assembly and ClickHouse come later.
   turn's execution context, so its upstream traffic is recorded on it (a turn that is not
   recorded is detached from its connection). The error frame answering a rejected interrupt is
   recorded on the interrupt's own turn. With steering on for a
-  connection (possible only through a reload) its turns are not recorded and a
-  `steering_turns` gap is counted.
+  connection (possible only through a reload) its turns are not recorded, their execution is
+  detached from the connection (no turn traffic is recorded on it), the connection counts a
+  drop (its `ingress_end` has `capture_drops`) and a `steering_turns` gap is counted.
 
 Core hooks: in `internal/api/server.go` the install line, the content tap line after response
 compression and the stop line; one line in `accessAuthMiddleware` (gate code of a fleet
 denial); the `Archive` field in `internal/config/config.go` and its v8 path in `config_v8.go`;
 the taps in `helps/logging_helpers.go` and `usage_helpers.go`, and the request taps of
-`antigravity_executor_request.go` (one call) and `devin_executor.go` (two calls); in
+`antigravity_executor_request.go` (one call), `devin_executor.go` (two calls),
+`codex_executor_execute.go` (two), `codex_executor_stream.go` (one),
+`recordCodexOpenAIImageRequest` (which takes the request instead of its headers) and
+`doCodexRequest` (two lines, the rejected response and the resend); in
 `sdk/cliproxy/auth` one line
 each in `newUpstreamAttemptContext`, `applyRequestAfterAuthInterceptor` (two),
 `pickViaPluginScheduler`, `MarkResult`, `reportHomeResult` and
@@ -155,31 +170,37 @@ may carry `body`: `client_body`, `upstream_request`, `upstream_event`, `upstream
 `capture: dropped_body` and `body_dropped` (`low_space_body`, `low_space_hard`, `stopped`,
 `writer_error`, `queue_full`) instead of `body`; an outbound body the executor's tap cannot
 record as sent has `body_dropped: not_captured` (Devin). Every `dropped_body` counts in its
-request's `capture_drops`; `not_captured` is not a gap.
+request's `capture_drops`; `not_captured` is not a gap. `content_encoding` names the encoding
+of bytes recorded encoded: a `client_body` as received, a Codex `upstream_request` sent zstd.
 
 A request is capture-incomplete when its `ingress_end` has `capture_drops` above zero, when it
 has no `ingress_end`, or when any of its events lies in a suspect range (below). `ended:
 shutdown` (Stop finalized the request or turn while it was still running) always has
-`capture_drops` of at least 1: what it did afterwards is not recorded.
+`capture_drops` of at least 1: what it did afterwards is not recorded. A tap panic recovered
+while recording for a request, and a steering connection's unrecorded turns, count there too.
 
 Suspect ranges: when an fsync of a segment fails, the events written to it since its last
 successful fsync may be missing or damaged on disk even though a later fsync (the close is
 retried) succeeds. The writer records them as a range `{boot_id, segment, first_seq,
 last_seq}` (`segment` without `.open.jsonl`/`.closed.jsonl`), persisted with the drop
-counters and reported in the `suspect` list of the next gap (`writer_error` at recovery, or
-`carried_over` by the next boot); the gap itself is fsynced before the range is cleared. An
-event written whose reused blob could not be written again is a range of one. Assembly must
-treat every request with an event in a suspect range as capture-incomplete.
+counters (in the state directory, off the spool's pool) before the writer retries the
+segment's close, which can hang, and reported in the `suspect` list of the next gap
+(`writer_error` at recovery, or `carried_over` by the next boot); the gap itself is fsynced
+before the range is cleared. An event written whose reused blob could not be written again is
+a range of one. Assembly must treat every request with an event in a suspect range as
+capture-incomplete. A range can be reported twice (when persisting the cleared counters after
+its gap fails, the next boot reports it again), so assembly dedupes ranges on `(boot_id,
+segment, first_seq, last_seq)`.
 
 | `type` | Per-type fields |
 | --- | --- |
 | `boot` | `recorder_version`, `redaction_version`, `envelope_version`, build, `boot_started_at`, `pid`, `hostname`, `free_bytes`, `capture_state`, `response_steering`, `config` |
 | `shutdown`, `heartbeat` | recorder counters: `queue_bytes`, `queue_limit`, `events_written`, `bytes_written`, `segments_closed`, `blobs_written`, `blobs_reused`, `blobs_rewritten`, `writer_errors`, `tap_panics`, `free_bytes`, `capture_state`, `drops`; `reason` on shutdown |
 | `gap` | `reason`, `since`, `drops` (reason → events, bodies, bytes), `suspect` (suspect ranges), `prior_boot_id`, `error` |
-| `ingress_start` | `kind` (`http`, `ws_connection`), `method`, `path`, `route`, `route_class`, `query`, `client_ip`, `proto`, `host`, `content_length`, `transfer_encoding`, `headers`, `sessions` (`session_id`, `claude_session_id`, `claude_agent_id`, `codex_session_id`, `codex_turn_id`), `z6` (`z6_environment_id`, `z6_thread_id`, `z6_other`); for a WebSocket turn: `kind: ws_turn`, `message_type`, `frame_type`, `model`, `previous_response_id`, `codex_turn_id` and `codex_turn_id_source` (`frame` from `client_metadata.x-codex-turn-metadata`, or `header`), `ws_session_id` |
+| `ingress_start` | `kind` (`http`, `ws_connection`), `method`, `path`, `route`, `route_class`, `query`, `client_ip`, `proto`, `host`, `content_length`, `transfer_encoding`, `headers`, `sessions` (`session_id`, `claude_session_id`, `claude_agent_id`, `codex_session_id`, `codex_turn_id`), `z6` (`z6_environment_id`, `z6_thread_id`, `z6_other`); for a WebSocket turn: `kind: ws_turn`, `message_type`, `frame_type`, `model`, `previous_response_id`, `codex_turn_id` and `codex_turn_id_source` (`frame` from `client_metadata.x-codex-turn-metadata`, or `header`), `ws_session_id` (frame fields over 256 bytes are left out) |
 | `client_body` | `wire_bytes`, `delivered_bytes`, `truncated`, `eof`, `ended`, `content_length`, `content_encoding`, `drop_reason`, `read_error` |
 | `attempt_start` | `auth_id`, `provider`, `model`, `requested_model`, `pick_reason`, `session_id` |
-| `upstream_request` | `transport`, `url` (query values allowlisted), `method`, `headers`, `provider`, `auth_id`, `auth_label`, `auth_type`; the outbound body |
+| `upstream_request` | `transport`, `url` (query values allowlisted), `method`, `headers`, `resend` (`compression_rejected`: the executor's own resend of the attempt's request, as a new `sub_attempt`), `provider`, `auth_id`, `auth_label`, `auth_type`; the outbound body as sent |
 | `upstream_response_meta` | `status`, `headers` |
 | `upstream_event` | `chunk_seq` (per sub-attempt from 1; empty chunks are counted, not written); the chunk exactly as the executor read it (an SSE line, or a whole non-streamed or error body) |
 | `upstream_error` | `class` (`canceled`, `timeout`, `eof_unexpected`, `other`), `error` (redacted text) |
@@ -194,10 +215,12 @@ treat every request with an event in a suspect range as capture-incomplete.
 Redaction (version 1) covers every header, URL and error text the taps record, inbound and
 outbound: credential headers and name parts, `Sec-WebSocket-Protocol` key entries, URL-valued
 headers, query values outside the route or upstream allowlist, and in free text URLs,
-authorization schemes, values of credential-like names and key-shaped words. JSON copied into
+authorization schemes, values of credential-like names and key-shaped words. Credential name
+parts are `key`, `token`, `secret`, `password`, `auth`, `cookie`, `session`, `signature` and
+`credential` (session ID headers and `Access-Control-Allow-Credentials` are kept). JSON copied into
 metadata (`usage`) is redacted by `RedactJSON`: every string under a member with a credential
-name (as for headers, except token counts such as `input_tokens` or `promptTokenCount`)
-becomes `[redacted]`, numbers, booleans and nulls are kept, and any other string is redacted
+name (as for headers, except token counts such as `input_tokens` or `promptTokenCount` and the
+usage reporter's `token_breakdown`, whose `quality` is kept) becomes `[redacted]`, numbers, booleans and nulls are kept, and any other string is redacted
 when it looks like a key or passed through the free-text rules. Bodies are kept as sent.
 `TestArchiveRedactsCredentials` feeds fake credentials through every tap.
 
