@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/tidwall/gjson"
 )
@@ -31,16 +33,54 @@ type UpstreamRequest struct {
 	// instead of recording Body: the executor does not have the bytes it sent
 	// at the tap, or they carry a credential.
 	BodyNotCaptured bool
-	Provider        string
-	AuthID          string
-	AuthLabel       string
-	AuthType        string
+	// GetBody, when set, supplies the body recorded instead of Body (which
+	// is still read for previous_response_id): an http.Request's own, for
+	// bytes only the request holds (Codex's zstd encoding of Body). Its
+	// ContentLength bytes are reserved before they are read; a body that
+	// cannot be read in full is recorded as not captured.
+	GetBody       func() (io.ReadCloser, error)
+	ContentLength int64
+	// Resend names why the executor sent the attempt's request again itself
+	// (ResendCompressionRejected); it is recorded as the new sub-attempt's
+	// resend, and empty provider and credential fields repeat those of the
+	// attempt's previous request.
+	Resend    string
+	Provider  string
+	AuthID    string
+	AuthLabel string
+	AuthType  string
 }
 
-func recoverTap(where string) {
+// Resend reasons (upstream_request's resend).
+const (
+	// ResendCompressionRejected is Codex's uncompressed resend after the
+	// upstream rejected a zstd request body (HTTP 400 or 415).
+	ResendCompressionRejected = "compression_rejected"
+)
+
+// recoverTap contains a panic in a tap; it must be deferred directly, since
+// recover works only there. When the tap had found its request (*in is
+// set), the request counts a drop too: what the tap was recording is lost,
+// so its ingress_end must not look complete. The tap's own deferred cleanup,
+// which returns its reservation, runs first.
+func recoverTap(where string, in **Ingress) {
 	if rv := recover(); rv != nil {
 		NoteTapPanic(where, rv)
+		if in != nil {
+			(*in).NoteDrop()
+		}
 	}
+}
+
+// Recorded reports whether taps given ctx record anything: capture was
+// started and ctx carries an inference request. Executors check it before
+// work done only for the archive (reading a response they discard).
+func Recorded(ctx context.Context) bool {
+	if !Installed() {
+		return false
+	}
+	in, _ := tapTarget(ctx)
+	return in != nil
 }
 
 // tapTarget finds the inference request and attempt a tap belongs to. It
@@ -66,6 +106,7 @@ type upstreamRequestData struct {
 	URL       string              `json:"url"`
 	Method    string              `json:"method,omitempty"`
 	Headers   map[string][]string `json:"headers,omitempty"`
+	Resend    string              `json:"resend,omitempty"`
 	Provider  string              `json:"provider,omitempty"`
 	AuthID    string              `json:"auth_id,omitempty"`
 	AuthLabel string              `json:"auth_label,omitempty"`
@@ -73,7 +114,7 @@ type upstreamRequestData struct {
 }
 
 func (d upstreamRequestData) sizeHint() int64 {
-	return stringsSize(d.Transport, d.URL, d.Method, d.Provider, d.AuthID, d.AuthLabel, d.AuthType) + headersSize(d.Headers)
+	return stringsSize(d.Transport, d.URL, d.Method, d.Resend, d.Provider, d.AuthID, d.AuthLabel, d.AuthType) + headersSize(d.Headers)
 }
 
 func newUpstreamRequestData(transport string, req UpstreamRequest) upstreamRequestData {
@@ -82,6 +123,7 @@ func newUpstreamRequestData(transport string, req UpstreamRequest) upstreamReque
 		URL:       RedactUpstreamURL(req.URL),
 		Method:    req.Method,
 		Headers:   RedactHeaders(req.Headers),
+		Resend:    req.Resend,
 		Provider:  req.Provider,
 		AuthID:    req.AuthID,
 		AuthLabel: req.AuthLabel,
@@ -94,21 +136,41 @@ func TapUpstreamRequest(ctx context.Context, req UpstreamRequest) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.request")
+	var in *Ingress
+	defer recoverTap("upstream.request", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
 	}
 	now := time.Now()
-	seq, sub := a.nextRequest(now, AttemptInfo{AuthID: req.AuthID, Provider: req.Provider})
+	seq, sub := a.nextRequest(now, &req)
 	a.notePrevious(req.Body)
 	data := newUpstreamRequestData("http", req)
 	ev := &Event{Type: TypeUpstreamRequest, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: data.sizeHint()}
-	if req.BodyNotCaptured {
+	switch {
+	case req.BodyNotCaptured:
 		in.emitNotCaptured(ev)
-		return
+	case req.GetBody != nil:
+		// The bytes as sent, encoded as the request says (body.content_encoding).
+		emitBodyFill(in, ev, req.ContentLength, req.Headers.Get("Content-Encoding"), func(dst []byte) bool { return readBody(req.GetBody, dst) })
+	default:
+		emitBody(in, ev, req.Body)
 	}
-	emitBody(in, ev, req.Body)
+}
+
+// readBody reads exactly len(dst) bytes, the whole body, into dst.
+func readBody(getBody func() (io.ReadCloser, error), dst []byte) bool {
+	body, err := getBody()
+	if err != nil || body == nil {
+		return false
+	}
+	defer func() { _ = body.Close() }()
+	if _, err = io.ReadFull(body, dst); err != nil {
+		return false
+	}
+	var more [1]byte
+	n, _ := body.Read(more[:])
+	return n == 0
 }
 
 type upstreamResponseMetaData struct {
@@ -121,7 +183,8 @@ func TapUpstreamResponse(ctx context.Context, status int, headers http.Header) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.response")
+	var in *Ingress
+	defer recoverTap("upstream.response", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -145,7 +208,8 @@ func TapUpstreamChunk(ctx context.Context, chunk []byte) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.event")
+	var in *Ingress
+	defer recoverTap("upstream.event", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -170,7 +234,8 @@ func TapUpstreamError(ctx context.Context, err error) {
 	if !Installed() || err == nil {
 		return
 	}
-	defer recoverTap("upstream.error")
+	var in *Ingress
+	defer recoverTap("upstream.error", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -235,13 +300,14 @@ func TapUpstreamWSRequest(ctx context.Context, req UpstreamRequest) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.ws.request")
+	var in *Ingress
+	defer recoverTap("upstream.ws.request", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
 	}
 	now := time.Now()
-	seq, sub := a.nextRequest(now, AttemptInfo{AuthID: req.AuthID, Provider: req.Provider})
+	seq, sub := a.nextRequest(now, &req)
 	a.notePrevious(req.Body)
 	data := upstreamWSData{
 		WSEvent: WSEventRequest, URL: RedactUpstreamURL(req.URL), Headers: RedactHeaders(req.Headers),
@@ -260,7 +326,8 @@ func TapUpstreamWSHandshake(ctx context.Context, status int, headers http.Header
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.ws.handshake")
+	var in *Ingress
+	defer recoverTap("upstream.ws.handshake", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -277,7 +344,8 @@ func TapUpstreamWSRejection(ctx context.Context, req UpstreamRequest, status int
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.ws.rejection")
+	var in *Ingress
+	defer recoverTap("upstream.ws.rejection", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -299,7 +367,8 @@ func TapUpstreamWSError(ctx context.Context, stage string, err error) {
 	if !Installed() || err == nil {
 		return
 	}
-	defer recoverTap("upstream.ws.error")
+	var in *Ingress
+	defer recoverTap("upstream.ws.error", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -317,7 +386,8 @@ func TapUpstreamWSFrame(ctx context.Context, payload []byte, trimmed bool) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("upstream.ws.frame")
+	var in *Ingress
+	defer recoverTap("upstream.ws.frame", &in)
 	in, a := tapTarget(ctx)
 	if a == nil {
 		return
@@ -347,9 +417,10 @@ func TapUsage(ctx context.Context, source, model string, raw []byte) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("usage")
+	var in *Ingress
+	defer recoverTap("usage", &in)
 	in, a := tapTarget(ctx)
-	if a == nil || !gjson.ValidBytes(raw) || !gjson.ParseBytes(raw).IsObject() {
+	if a == nil || !isJSONObject(raw) {
 		return
 	}
 	now := time.Now()
@@ -357,20 +428,59 @@ func TapUsage(ctx context.Context, source, model string, raw []byte) {
 	emitUsage(in, &Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub}, usageData{Source: source, Model: model}, raw)
 }
 
+// isJSONObject reports whether raw is one valid JSON object, without copying
+// it (gjson.ParseBytes copies its whole input).
+func isJSONObject(raw []byte) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '{' && gjson.ValidBytes(raw)
+}
+
+// BytesView returns b as a string without copying it, for gjson.Parse and
+// gjson.Get, which then copy nothing either: their results are substrings
+// of b (gjson.ParseBytes and GetBytes copy). b must not change while the
+// view is in use, and nothing that outlives the caller may refer to the
+// view or a result read from it: copy what is kept (OwnedString), after the
+// event that keeps it is reserved where it can be large.
+func BytesView(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// maxOwnedLen bounds identities and other short fields read from upstream
+// or client JSON (IDs, model names, event types). A longer value is not one
+// of them and is dropped without being copied.
+const maxOwnedLen = 256
+
+// OwnedString copies s, a value read from a view (BytesView), so it does not
+// keep the view's input alive; a value longer than maxOwnedLen is dropped.
+func OwnedString(s string) string {
+	if len(s) > maxOwnedLen {
+		return ""
+	}
+	return strings.Clone(s)
+}
+
+// owned is OwnedString of a result's string value.
+func owned(r gjson.Result) string {
+	return OwnedString(r.String())
+}
+
 // notePrevious records previous_response_id from an outbound body.
 func (a *Attempt) notePrevious(body []byte) {
 	if !bytes.Contains(body, []byte(`"previous_response_id"`)) {
 		return
 	}
-	if prev := gjson.GetBytes(body, "previous_response_id"); prev.Type == gjson.String {
-		a.noteIDs(identities{PreviousResponseID: prev.String()})
+	if prev := gjson.Get(BytesView(body), "previous_response_id"); prev.Type == gjson.String {
+		a.noteIDs(identities{PreviousResponseID: owned(prev)})
 	}
 }
 
 // inspect reads raw usage and identities from an upstream event or body:
 // Anthropic message_start/message_delta/content_block_start, Responses
 // response.* and output items, and non-streamed JSON bodies. It parses only
-// chunks that can carry them.
+// chunks that can carry them, through a view of the chunk (BytesView), so a
+// large event is never copied outside the queue's reservations: identities,
+// the model and the event type are copied out bounded (owned), and the usage
+// object only once its event is reserved (emitUsage).
 func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 	data := bytes.TrimSpace(chunk)
 	if rest, ok := bytes.CutPrefix(data, []byte("data:")); ok {
@@ -386,36 +496,35 @@ func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 	if !gjson.ValidBytes(data) {
 		return
 	}
-	root := gjson.ParseBytes(data)
+	root := gjson.Parse(BytesView(data))
 	var found identities
-	var usage gjson.Result
-	var model string
-	event := root.Get("type").String()
+	var usage, model gjson.Result
+	event := root.Get("type").String() // a view: copied below when kept
 	switch event {
 	case "message_start":
 		message := root.Get("message")
-		found.addResponse(message.Get("id").String())
-		usage, model = message.Get("usage"), message.Get("model").String()
+		found.addResponse(owned(message.Get("id")))
+		usage, model = message.Get("usage"), message.Get("model")
 	case "message_delta":
 		usage = root.Get("usage")
 	case "content_block_start":
-		found.addItem(root.Get("content_block.id").String())
+		found.addItem(owned(root.Get("content_block.id")))
 	case "response.created", "response.in_progress", "response.completed", "response.done",
 		"response.failed", "response.incomplete":
 		response := root.Get("response")
-		found.addResponse(response.Get("id").String())
-		found.PreviousResponseID = response.Get("previous_response_id").String()
-		usage, model = response.Get("usage"), response.Get("model").String()
+		found.addResponse(owned(response.Get("id")))
+		found.PreviousResponseID = owned(response.Get("previous_response_id"))
+		usage, model = response.Get("usage"), response.Get("model")
 	case "response.output_item.added", "response.output_item.done":
 		item := root.Get("item")
-		found.addItem(item.Get("id").String())
-		found.addItem(item.Get("call_id").String())
+		found.addItem(owned(item.Get("id")))
+		found.addItem(owned(item.Get("call_id")))
 	case "message":
 		// A non-streamed Anthropic Messages body.
-		found.addResponse(root.Get("id").String())
-		usage, model = root.Get("usage"), root.Get("model").String()
+		found.addResponse(owned(root.Get("id")))
+		usage, model = root.Get("usage"), root.Get("model")
 		root.Get("content").ForEach(func(_, block gjson.Result) bool {
-			found.addItem(block.Get("id").String())
+			found.addItem(owned(block.Get("id")))
 			return true
 		})
 		event = "body"
@@ -423,26 +532,26 @@ func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 		switch {
 		case root.Get("object").String() == "response":
 			// A non-streamed Responses body.
-			found.addResponse(root.Get("id").String())
-			found.PreviousResponseID = root.Get("previous_response_id").String()
-			usage, model = root.Get("usage"), root.Get("model").String()
+			found.addResponse(owned(root.Get("id")))
+			found.PreviousResponseID = owned(root.Get("previous_response_id"))
+			usage, model = root.Get("usage"), root.Get("model")
 			root.Get("output").ForEach(func(_, item gjson.Result) bool {
-				found.addItem(item.Get("id").String())
-				found.addItem(item.Get("call_id").String())
+				found.addItem(owned(item.Get("id")))
+				found.addItem(owned(item.Get("call_id")))
 				return true
 			})
 			event = "body"
 		case root.Get("usageMetadata").IsObject():
 			// Gemini.
-			found.addResponse(root.Get("responseId").String())
-			usage, model = root.Get("usageMetadata"), root.Get("modelVersion").String()
+			found.addResponse(owned(root.Get("responseId")))
+			usage, model = root.Get("usageMetadata"), root.Get("modelVersion")
 			if event == "" {
 				event = "usageMetadata"
 			}
 		case root.Get("usage").IsObject():
 			// Chat Completions and other bodies or chunks with top-level usage.
-			found.addResponse(root.Get("id").String())
-			usage, model = root.Get("usage"), root.Get("model").String()
+			found.addResponse(owned(root.Get("id")))
+			usage, model = root.Get("usage"), root.Get("model")
 			if event == "" {
 				event = "body"
 			}
@@ -453,30 +562,21 @@ func (a *Attempt) inspect(chunk []byte, now time.Time, seq, sub uint16) {
 		return
 	}
 	emitUsage(a.in, &Event{Type: TypeUsage, Time: now, AttemptSeq: seq, SubAttempt: &sub},
-		usageData{Source: "upstream", Event: event, Model: model}, usage.Raw)
+		usageData{Source: "upstream", Event: OwnedString(event), Model: owned(model)}, usage.Raw)
 }
 
 // emitUsage queues a usage event carrying a redacted copy (RedactJSON) of
-// the usage object raw. Like emitBody it reserves before it copies; the
-// copy's growth from redaction, if any, is reserved when it is queued.
+// the usage object raw (a view, from inspect). Like emitBody it reserves
+// before it copies; the copy's growth from redaction, if any, is reserved
+// when it is queued.
 func emitUsage[R []byte | string](in *Ingress, ev *Event, data usageData, raw R) {
 	ev.Capture = CaptureFull
 	ev.SizeHint = int64(len(raw)) + stringsSize(data.Source, data.Event, data.Model)
-	reserved, ok := in.reserve(ev.reservation(), DropCount{Events: 1})
-	if !ok {
-		return
-	}
-	defer func() {
-		// Returned if the copy panics; queued events own their reservation.
-		in.rec.q.release(reserved)
-	}()
-	_ = fault("tap.copy") // tests panic here
-	data.Usage = RedactJSON(raw)
-	ev.SizeHint = int64(len(data.Usage)) + stringsSize(data.Source, data.Event, data.Model)
-	ev.Data = data
-	n := reserved
-	reserved = 0
-	in.EmitReserved(ev, n)
+	in.EmitCopying(ev, func(ev *Event) {
+		data.Usage = RedactJSON(raw)
+		ev.SizeHint = int64(len(data.Usage)) + stringsSize(data.Source, data.Event, data.Model)
+		ev.Data = data
+	})
 }
 
 // EmitDownstream records one write of a response body to the client (what
@@ -505,11 +605,22 @@ func EmitClientFrame(in *Ingress, now time.Time, data any, sizeHint int64, paylo
 // or the recorder is stopping), the event is still queued, without its
 // body, as dropped_body, and the drop counts against the request.
 func emitBody[B []byte | string](in *Ingress, ev *Event, body B) {
+	emitBodyFill(in, ev, int64(len(body)), "", func(dst []byte) bool {
+		copy(dst, body)
+		return true
+	})
+}
+
+// emitBodyFill is emitBody for a body of size bytes, in content encoding
+// encoding (empty for none), that fill copies into the event's buffer once
+// it is reserved. When fill fails the event is queued without its body, as
+// not captured (emitNotCaptured).
+func emitBodyFill(in *Ingress, ev *Event, size int64, encoding string, fill func(dst []byte) bool) {
 	rec := in.rec
 	if !rec.CaptureBodies() {
 		if rec.acceptsEvents() {
 			reason := rec.BodyDropReason()
-			rec.CountDrop(reason, DropCount{Bodies: 1, Bytes: int64(len(body))})
+			rec.CountDrop(reason, DropCount{Bodies: 1, Bytes: max(size, 0)})
 			in.NoteDrop()
 			ev.Capture = CaptureDroppedBody
 			ev.BodyDropped = reason
@@ -518,10 +629,14 @@ func emitBody[B []byte | string](in *Ingress, ev *Event, body B) {
 		in.Emit(ev)
 		return
 	}
-	// The copy's capacity is exactly len(body), so this is the event's
+	if size < 0 {
+		in.emitNotCaptured(ev)
+		return
+	}
+	// The copy's capacity is exactly size, so this is the event's
 	// reservation (Event.reservation) once the body is attached.
-	reserved, ok := in.reserve(int64(eventOverhead)+ev.SizeHint+int64(len(body)),
-		DropCount{Events: 1, Bodies: 1, Bytes: int64(len(body))})
+	reserved, ok := in.reserve(int64(eventOverhead)+ev.SizeHint+size,
+		DropCount{Events: 1, Bodies: 1, Bytes: size})
 	if !ok {
 		return
 	}
@@ -530,10 +645,15 @@ func emitBody[B []byte | string](in *Ingress, ev *Event, body B) {
 		rec.q.release(reserved)
 	}()
 	_ = fault("tap.copy") // tests panic here
-	data := make([]byte, len(body))
-	copy(data, body)
+	data := make([]byte, size)
+	if !fill(data) {
+		rec.q.release(reserved)
+		reserved = 0
+		in.emitNotCaptured(ev)
+		return
+	}
 	ev.Capture = CaptureFull
-	ev.Body = &BodyData{Bytes: data}
+	ev.Body = &BodyData{Bytes: data, ContentEncoding: encoding}
 	n := reserved
 	reserved = 0
 	in.EmitReserved(ev, n)

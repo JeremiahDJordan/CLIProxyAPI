@@ -181,6 +181,30 @@ func (in *Ingress) ReserveEvent(ev *Event) (int64, bool) {
 	return in.reserve(ev.reservation(), DropCount{Events: 1})
 }
 
+// EmitCopying queues ev, reserving its size (ev.SizeHint, estimated from
+// views of the input: BytesView) before copyData copies its fields into it,
+// so an event the queue refuses copies nothing. Growth beyond the
+// reservation is reserved when the event is queued; the reservation is
+// returned if copyData panics.
+func (in *Ingress) EmitCopying(ev *Event, copyData func(*Event)) bool {
+	if in == nil || in.rec == nil || ev == nil {
+		return false
+	}
+	reserved, ok := in.reserve(ev.reservation(), DropCount{Events: 1})
+	if !ok {
+		return false
+	}
+	defer func() {
+		// Returned if the copy panics; queued events own their reservation.
+		in.rec.q.release(reserved)
+	}()
+	_ = fault("tap.copy") // tests panic here
+	copyData(ev)
+	n := reserved
+	reserved = 0
+	return in.EmitReserved(ev, n)
+}
+
 // reserve claims n queue bytes for an event of this request before its
 // contents are copied. A failure counts d as dropped, against the request
 // too, as emit does.

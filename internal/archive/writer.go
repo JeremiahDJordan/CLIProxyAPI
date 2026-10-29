@@ -744,7 +744,10 @@ func (w *writer) shutdown() error {
 }
 
 // handleFailure turns capture off, drops the batch in progress and ends the
-// open segment on its last complete event.
+// open segment on its last complete event. The drop counters and suspect
+// ranges are persisted (to the state directory, which is not on the spool's
+// pool) before ending the segment retries spool operations that can hang or
+// outlive the process, and again afterwards.
 func (w *writer) handleFailure() {
 	w.r.writerOK.Store(false)
 	w.writerErrors.Add(1)
@@ -758,6 +761,7 @@ func (w *writer) handleFailure() {
 		w.dropQueued(item, DropWriterError)
 	}
 	w.inflight = nil
+	w.persistLedger()
 	w.endFailedSegment()
 	w.persistLedger()
 }
@@ -813,7 +817,11 @@ func (w *writer) reopen() error {
 		err = w.sync()
 	}
 	if err != nil {
+		// As in handleFailure: a range the failure made suspect is
+		// persisted before the close is retried.
+		w.persistLedger()
 		w.endFailedSegment()
+		w.persistLedger()
 		return err
 	}
 	w.r.ledger.settle(pending)

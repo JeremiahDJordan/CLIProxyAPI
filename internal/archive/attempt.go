@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"cmp"
 	"context"
 	"sync"
 	"time"
@@ -28,6 +29,12 @@ type Attempt struct {
 	gate     string // gate decision: allow or deny
 	gateCode string
 	ids      identities
+	last     requestCredential // of the latest outbound request
+}
+
+// requestCredential names the provider and credential of an outbound request.
+type requestCredential struct {
+	Provider, AuthID, AuthLabel, AuthType string
 }
 
 // AttemptInfo describes an attempt. Empty fields keep earlier values.
@@ -91,7 +98,7 @@ func WithAttempt(ctx context.Context) (out context.Context) {
 	if !Installed() || ctx == nil {
 		return ctx
 	}
-	defer recoverTap("attempt.open")
+	defer recoverTap("attempt.open", nil)
 	in := IngressFromContext(ctx)
 	if in == nil || in.rec == nil || in.class != RouteInference {
 		return ctx
@@ -119,8 +126,10 @@ func DescribeAttempt(ctx context.Context, info AttemptInfo) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("attempt.describe")
+	var in *Ingress
+	defer recoverTap("attempt.describe", &in)
 	if a := AttemptFromContext(ctx); a != nil {
+		in = a.in
 		a.mu.Lock()
 		a.info.merge(info)
 		a.mu.Unlock()
@@ -139,8 +148,10 @@ func NoteGate(ctx context.Context, decision, code string) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("attempt.gate")
+	var in *Ingress
+	defer recoverTap("attempt.gate", &in)
 	if a := AttemptFromContext(ctx); a != nil {
+		in = a.in
 		a.mu.Lock()
 		a.gate, a.gateCode = decision, code
 		if decision == GateDeny {
@@ -160,8 +171,10 @@ func EndAttempt(ctx context.Context, end AttemptEnd) {
 	if !Installed() {
 		return
 	}
-	defer recoverTap("attempt.end")
+	var in *Ingress
+	defer recoverTap("attempt.end", &in)
 	if a := AttemptFromContext(ctx); a != nil {
+		in = a.in
 		if end.Reason == "" {
 			end.Reason = AttemptEndedResult
 		}
@@ -229,13 +242,21 @@ func (a *Attempt) beginLocked(now time.Time) {
 	a.in.Emit(&Event{Type: TypeAttemptStart, Time: now, AttemptSeq: a.seq, Capture: CaptureFull, Data: data, SizeHint: data.sizeHint()})
 }
 
-// nextRequest starts a sub-attempt for an outbound request.
-func (a *Attempt) nextRequest(now time.Time, info AttemptInfo) (uint16, uint16) {
+// nextRequest starts a sub-attempt for an outbound request. A resend's
+// empty provider and credential fields are filled from the previous request.
+func (a *Attempt) nextRequest(now time.Time, req *UpstreamRequest) (uint16, uint16) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if req.Resend != "" {
+		req.Provider = cmp.Or(req.Provider, a.last.Provider)
+		req.AuthID = cmp.Or(req.AuthID, a.last.AuthID)
+		req.AuthLabel = cmp.Or(req.AuthLabel, a.last.AuthLabel)
+		req.AuthType = cmp.Or(req.AuthType, a.last.AuthType)
+	}
+	a.last = requestCredential{Provider: req.Provider, AuthID: req.AuthID, AuthLabel: req.AuthLabel, AuthType: req.AuthType}
 	// The request names the credential where the conductor did not.
 	chosen := a.info
-	a.info.merge(info)
+	a.info.merge(AttemptInfo{AuthID: req.AuthID, Provider: req.Provider})
 	a.info.merge(chosen)
 	a.beginLocked(now)
 	sub := a.subs
@@ -367,7 +388,7 @@ func (ids *identities) merge(o identities) {
 	for _, id := range o.ResponseIDs {
 		ids.addResponse(id)
 	}
-	if ids.PreviousResponseID == "" {
+	if ids.PreviousResponseID == "" && len(o.PreviousResponseID) <= maxOwnedLen {
 		ids.PreviousResponseID = o.PreviousResponseID
 	}
 	for _, id := range o.OutputItemIDs {
@@ -388,7 +409,7 @@ func (ids identities) sizeHint() int64 {
 }
 
 func appendUnique(list []string, id string, limit int) []string {
-	if id == "" || len(id) > 256 || len(list) >= limit {
+	if id == "" || len(id) > maxOwnedLen || len(list) >= limit {
 		return list
 	}
 	for _, have := range list {

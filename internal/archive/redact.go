@@ -28,18 +28,19 @@ var credentialHeaders = map[string]struct{}{
 
 // credentialNameParts redact any header whose lower-case name contains one
 // of them, so credentials under names nobody listed are covered too.
-var credentialNameParts = []string{"key", "token", "secret", "password", "auth", "cookie", "session", "signature"}
+var credentialNameParts = []string{"key", "token", "secret", "password", "auth", "cookie", "session", "signature", "credential"}
 
 // keptHeaders are not credentials although their names match a part above
 // (or might one day). Session IDs are needed for joins (design section 5).
 var keptHeaders = map[string]struct{}{
-	"anthropic-beta":           {},
-	"x-codex-turn-metadata":    {},
-	"session_id":               {},
-	"session-id":               {},
-	"x-session-id":             {},
-	"x-parent-session-id":      {},
-	"x-claude-code-session-id": {},
+	"access-control-allow-credentials": {},
+	"anthropic-beta":                   {},
+	"x-codex-turn-metadata":            {},
+	"session_id":                       {},
+	"session-id":                       {},
+	"x-session-id":                     {},
+	"x-parent-session-id":              {},
+	"x-claude-code-session-id":         {},
 }
 
 // urlHeaders carry URLs whose query and fragment are redacted like a route
@@ -368,7 +369,14 @@ func RedactText(s string) string {
 // it looks like a key and is otherwise passed through RedactText. Members
 // keep their order and numbers their text. Input that is not JSON is null.
 func RedactJSON[R []byte | string](raw R) []byte {
-	text := string(raw)
+	// A view of raw, not a copy: the result is built in its own buffer.
+	var text string
+	switch raw := any(raw).(type) {
+	case []byte:
+		text = BytesView(raw)
+	case string:
+		text = raw
+	}
 	if !gjson.Valid(text) {
 		return []byte("null")
 	}
@@ -423,9 +431,10 @@ func redactJSONValue(out []byte, value gjson.Result, credential bool) []byte {
 // credentialField reports a JSON member name that names a credential: a
 // credential header name, or a name containing a credential part, as for
 // headers. A token count is not a credential, so "token" counts only where
-// it is neither part of "tokens" nor followed by "count" (input_tokens,
-// promptTokenCount and prompt_tokens_details are counts; access_token,
-// id_token and token_breakdown are not exempt).
+// it is neither part of "tokens" nor followed by "count" or "breakdown"
+// (input_tokens, promptTokenCount, prompt_tokens_details and the usage
+// reporter's token_breakdown are counts; access_token and id_token are not
+// exempt).
 func credentialField(name string) bool {
 	lower := strings.ToLower(name)
 	if _, ok := credentialHeaders[lower]; ok {
@@ -452,7 +461,8 @@ func credentialToken(lower string) bool {
 			return false
 		}
 		rest = rest[i+len("token"):]
-		if strings.HasPrefix(rest, "s") || strings.HasPrefix(strings.TrimLeft(rest, "_-"), "count") {
+		next := strings.TrimLeft(rest, "_-")
+		if strings.HasPrefix(rest, "s") || strings.HasPrefix(next, "count") || strings.HasPrefix(next, "breakdown") {
 			continue
 		}
 		return true
