@@ -32,8 +32,6 @@ type Attempt struct {
 	gateCode string
 	ids      identities
 	last     requestCredential // of the latest outbound request
-	// discarded bodies still being read, finalized when the attempt ends.
-	discarded []*discardedBody
 }
 
 // requestCredential names the provider and credential of an outbound request.
@@ -352,13 +350,7 @@ func (a *Attempt) end(end AttemptEnd, now time.Time) {
 		identities:  a.ids.clone(),
 	}
 	seq := a.seq
-	discarded := a.discarded
-	a.discarded = nil
 	a.mu.Unlock()
-	// Before attempt_end, and so before ingress_end counts the drops.
-	for _, d := range discarded {
-		d.finalize(DropTruncated, discardedStoppedAttemptEnd)
-	}
 
 	a.in.mu.Lock()
 	for i, open := range a.in.open {

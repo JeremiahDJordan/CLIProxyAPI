@@ -198,6 +198,9 @@ func TapUpstreamResponse(ctx context.Context, status int, headers http.Header) {
 
 type upstreamEventData struct {
 	ChunkSeq uint32 `json:"chunk_seq"`
+	// NotCapturedReason says why a body the archive did not read was not
+	// captured (TapUpstreamBodyNotCaptured).
+	NotCapturedReason string `json:"not_captured_reason,omitempty"`
 }
 
 // TapUpstreamChunk records one decompressed upstream event, or a whole
@@ -221,6 +224,38 @@ func TapUpstreamChunk(ctx context.Context, chunk []byte) {
 	}
 	emitBody(in, &Event{Type: TypeUpstreamEvent, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: upstreamEventData{ChunkSeq: n}}, chunk)
 	a.inspect(chunk, now, seq, sub)
+}
+
+// Why an upstream body was not captured (upstream_event's
+// not_captured_reason).
+const (
+	// NotCapturedRejectedBeforeResend is the body of the response rejecting
+	// Codex's zstd request body (HTTP 400 or 415), which the executor closes
+	// unread before its uncompressed resend.
+	NotCapturedRejectedBeforeResend = "rejected_before_resend"
+)
+
+// TapUpstreamBodyNotCaptured records, as the current sub-attempt's next
+// upstream_event, a response body the executor discards without the
+// archive reading it, for reason (NotCapturedRejectedBeforeResend): the
+// event has no body (body_dropped: not_captured) and counts against the
+// request like every body not captured. The body is the executor's alone:
+// it is closed as it is without capture, so recording cannot delay what
+// the executor does next.
+func TapUpstreamBodyNotCaptured(ctx context.Context, reason string) {
+	if !Installed() {
+		return
+	}
+	var in *Ingress
+	defer recoverTap("upstream.event", &in)
+	in, a := tapTarget(ctx)
+	if a == nil {
+		return
+	}
+	now := time.Now()
+	seq, sub, n := a.nextChunk(now)
+	data := upstreamEventData{ChunkSeq: n, NotCapturedReason: reason}
+	in.emitNotCaptured(&Event{Type: TypeUpstreamEvent, Time: now, AttemptSeq: seq, SubAttempt: &sub, Data: data, SizeHint: int64(len(reason))})
 }
 
 type upstreamErrorData struct {
@@ -623,7 +658,15 @@ func emitBody[B []byte | string](in *Ingress, ev *Event, body B) {
 func emitBodyFill(in *Ingress, ev *Event, size int64, encoding string, fill func(dst []byte) bool) {
 	rec := in.rec
 	if !rec.CaptureBodies() {
-		in.emitBodyOff(ev, size)
+		if rec.acceptsEvents() {
+			reason := rec.BodyDropReason()
+			rec.CountDrop(reason, DropCount{Bodies: 1, Bytes: max(size, 0)})
+			in.NoteDrop()
+			ev.Capture = CaptureDroppedBody
+			ev.BodyDropped = reason
+		}
+		// When events are refused too, Emit drops and counts the event.
+		in.Emit(ev)
 		return
 	}
 	if size < 0 {

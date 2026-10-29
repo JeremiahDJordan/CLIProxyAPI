@@ -204,9 +204,10 @@ func TestArchiveDevinOutboundBodyIsNotCaptured(t *testing.T) {
 
 // Round-3 finding 3: with upstream request compression on, the archive
 // records each send's own bytes and headers: the zstd body first, then the
-// rejected response (status, headers and body, before it is discarded), then
-// the uncompressed resend as its own sub-attempt of the same attempt, marked
-// resend compression_rejected and carrying the first request's credential.
+// rejected response (status and headers; its body, which the executor
+// discards unread, as not captured), then the uncompressed resend as its
+// own sub-attempt of the same attempt, marked resend compression_rejected
+// and carrying the first request's credential.
 func TestArchiveCodexCompressionRecordsEachSend(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
@@ -271,38 +272,35 @@ func TestArchiveCodexCompressionRecordsEachSend(t *testing.T) {
 				meta[1]["status"] != float64(http.StatusOK) || meta[1]["sub_attempt"] != float64(1) {
 				t.Fatalf("upstream_response_meta = %v", meta)
 			}
-			// Read on the archive's own goroutine: possibly queued after the resend's events.
-			rejected := waitDiscardedEvent(t, spool)
-			if rejected["sub_attempt"] != float64(0) || rejected["chunk_seq"] != float64(1) || string(executorArchiveBody(t, rejected)) != `{"error":"compression rejected"}` {
-				t.Fatalf("discarded upstream_event = %v", rejected)
+			rejected := rejectedBodyEvent(t, spool)
+			if rejected["sub_attempt"] != float64(0) || rejected["chunk_seq"] != float64(1) ||
+				rejected["seq"].(float64) < meta[0]["seq"].(float64) || rejected["seq"].(float64) > requests[1]["seq"].(float64) {
+				t.Fatalf("rejected upstream_event = %v", rejected)
 			}
 		})
 	}
 }
 
-// waitDiscardedEvent waits for the one upstream_event recording a discarded
-// body, which the archive queues from its own goroutine.
-func waitDiscardedEvent(t *testing.T, spool string) map[string]any {
+// rejectedBodyEvent returns the one upstream_event recording a rejected
+// body, which the archive records without reading it: not captured, with
+// its reason, and without a body.
+func rejectedBodyEvent(t *testing.T, spool string) map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var found []map[string]any
-		for _, ev := range executorArchiveEvents(t, spool, archive.TypeUpstreamEvent) {
-			if ev["discarded"] == true {
-				found = append(found, ev)
-			}
+	var found []map[string]any
+	for _, ev := range executorArchiveEvents(t, spool, archive.TypeUpstreamEvent) {
+		if ev["not_captured_reason"] != nil {
+			found = append(found, ev)
 		}
-		if len(found) > 1 {
-			t.Fatalf("%d discarded bodies recorded: %v", len(found), found)
-		}
-		if len(found) == 1 {
-			return found[0]
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the discarded body was never recorded")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	if len(found) != 1 {
+		t.Fatalf("%d rejected bodies recorded: %v", len(found), found)
+	}
+	ev := found[0]
+	if ev["not_captured_reason"] != archive.NotCapturedRejectedBeforeResend || ev["capture"] != archive.CaptureDroppedBody ||
+		ev["body_dropped"] != archive.DropNotCaptured || ev["body"] != nil {
+		t.Fatalf("rejected upstream_event = %v", ev)
+	}
+	return ev
 }
 
 // Round-3 finding 3: with capture off for the request, the rejected body is

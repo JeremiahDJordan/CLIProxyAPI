@@ -41,8 +41,6 @@ type TestOverrides struct {
 	StartTimeout     time.Duration
 	StopObserverWait time.Duration
 	StopWriterWait   time.Duration
-	// DiscardedBodyWait replaces discardedBodyWait; zero keeps it.
-	DiscardedBodyWait time.Duration
 }
 
 var (
@@ -111,13 +109,6 @@ func stopWriterWaitFor() time.Duration {
 		return o.StopWriterWait
 	}
 	return stopWriterWait
-}
-
-func discardedBodyWaitFor() time.Duration {
-	if o := overrides.Load(); o != nil && o.DiscardedBodyWait > 0 {
-		return o.DiscardedBodyWait
-	}
-	return discardedBodyWait
 }
 
 // FlushForTest waits until the running recorder has written everything

@@ -2,8 +2,8 @@
 
 package executor
 
-// Fleet fork: round-4 review findings on the archive's capture of Codex's
-// rejected zstd responses (helps.ArchiveRejectedResponse).
+// Fleet fork: review findings on the archive's capture of Codex's rejected
+// zstd responses (helps.ArchiveRejectedResponse).
 
 import (
 	"bytes"
@@ -13,7 +13,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"runtime"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,22 +32,29 @@ func executeCodexCompressed(ctx context.Context, rt http.RoundTripper) error {
 	return err
 }
 
-// Round-4 finding 1: recording must not gate the plaintext resend. The
-// upstream rejects the zstd request with a 415 whose body sends 15 bytes and
-// then stalls; with recording off and on alike the resend goes out at once
-// and the request succeeds (before the fix, recording read the body until
-// the request's deadline, and the request failed). The stalled body is
-// recorded as truncated, on the first sub-attempt, and counted.
+// Round-4 finding 1 and round-5 decision A: recording must not gate the
+// plaintext resend. The upstream rejects the zstd request with a 415 whose
+// body sends 15 bytes and then stalls. With recording off and on the resend
+// goes out as soon as the executor closes the rejected body, and the
+// request succeeds, also through a transport allowing one connection per
+// host, where a rejected body still open holds the only connection (round
+// 5: the archive's own read of it delayed the resend by its time bound).
+// The body is recorded as not captured, on the first sub-attempt, before
+// the resend.
 func TestArchiveStalledRejectedBodyDoesNotDelayTheResend(t *testing.T) {
 	const head = `{"error":"zstd `
-	// run returns how long after the rejection the resend reached the
-	// upstream; the rejected body stalls until the test ends.
-	run := func(t *testing.T, ctx context.Context) time.Duration {
+	type outcome struct {
+		err   error
+		sends int64
+		delay time.Duration // from the rejection to the resend
+	}
+	run := func(t *testing.T, ctx context.Context, maxConns int) outcome {
 		t.Helper()
 		release := make(chan struct{})
-		var rejectedAt, resentAt atomic.Int64
+		var sends, rejectedAt, resentAt atomic.Int64
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, r.Body)
+			sends.Add(1)
 			if r.Header.Get("Content-Encoding") == "zstd" {
 				w.WriteHeader(http.StatusUnsupportedMediaType)
 				_, _ = io.WriteString(w, head)
@@ -65,6 +71,7 @@ func TestArchiveStalledRejectedBodyDoesNotDelayTheResend(t *testing.T) {
 			_, _ = io.WriteString(w, "data: "+codexCompletedEventBody+"\n\n")
 		}))
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxConnsPerHost = maxConns
 		t.Cleanup(func() {
 			close(release)
 			transport.CloseIdleConnections()
@@ -81,92 +88,49 @@ func TestArchiveStalledRejectedBodyDoesNotDelayTheResend(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		t.Cleanup(cancel)
-		if err = executeCodexCompressed(ctx, rt); err != nil {
-			t.Fatalf("request failed: %v", err)
+		out := outcome{err: executeCodexCompressed(ctx, rt), sends: sends.Load()}
+		if resentAt.Load() != 0 && rejectedAt.Load() != 0 {
+			out.delay = time.Duration(resentAt.Load() - rejectedAt.Load())
 		}
-		if resentAt.Load() == 0 || rejectedAt.Load() == 0 {
-			t.Fatal("no resend")
-		}
-		return time.Duration(resentAt.Load() - rejectedAt.Load())
+		return out
 	}
-	var off time.Duration
-	t.Run("recording off", func(t *testing.T) {
-		if archive.Installed() {
-			t.Fatal("a recorder is running")
-		}
-		off = run(t, context.Background())
-	})
-	t.Run("recording on", func(t *testing.T) {
-		spool, in := startArchiveForExecutorWith(t, func(o *archive.TestOverrides) { o.DiscardedBodyWait = 200 * time.Millisecond })
-		on := run(t, archive.WithIngress(context.Background(), in))
-		if on > time.Second || on > off+500*time.Millisecond {
-			t.Fatalf("resend %v after the rejection with recording on, %v with it off", on, off)
-		}
-		rejected := waitDiscardedEvent(t, spool)
-		if rejected["sub_attempt"] != float64(0) || rejected["capture"] != archive.CaptureDroppedBody ||
-			rejected["body_dropped"] != archive.DropTruncated || rejected["stopped"] != "timeout" || rejected["read_bytes"] != float64(len(head)) {
-			t.Fatalf("discarded upstream_event = %v", rejected)
-		}
-		if in.Drops() == 0 {
-			t.Fatal("the truncated body was not counted against the request")
-		}
-	})
-}
-
-// panicAfterHead returns head, and panics on the next read: a decoder (or
-// any reader under the executor) failing inside a read only the archive
-// makes. The executor itself only peeks at the first bytes.
-type panicAfterHead struct {
-	head []byte
-	done bool
-}
-
-func (b *panicAfterHead) Read(p []byte) (int, error) {
-	if b.done {
-		panic("rejected body read failed")
-	}
-	b.done = true
-	return copy(p, b.head), nil
-}
-
-func (*panicAfterHead) Close() error { return nil }
-
-// Round-4 finding 1: a panic in the archive-only read of the rejected body
-// is contained (before the fix it escaped into the executor): the request
-// succeeds as it does with recording off, and the panic counts against it.
-func TestArchiveRejectedBodyReadPanicIsContained(t *testing.T) {
-	rt := func() http.RoundTripper {
-		sent := 0
-		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			_, _ = io.Copy(io.Discard, req.Body)
-			if sent++; sent == 1 {
-				return &http.Response{StatusCode: http.StatusUnsupportedMediaType, Header: http.Header{},
-					Body: &panicAfterHead{head: []byte(`{"error":"compression rejected"}`)}}, nil
+	for _, c := range []struct {
+		name     string
+		maxConns int
+	}{{"default transport", 0}, {"one connection per host", 1}} {
+		t.Run(c.name, func(t *testing.T) {
+			if archive.Installed() {
+				t.Fatal("a recorder is running")
 			}
-			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}},
-				Body: io.NopCloser(strings.NewReader("data: " + codexCompletedEventBody + "\n\n"))}, nil
+			off := run(t, context.Background(), c.maxConns)
+			if off.err != nil || off.sends != 2 || off.delay == 0 {
+				t.Fatalf("recording off: %+v", off)
+			}
+			spool, in := startArchiveForExecutor(t)
+			on := run(t, archive.WithIngress(context.Background(), in), c.maxConns)
+			if on.err != nil || on.sends != off.sends || on.delay == 0 || on.delay > off.delay+250*time.Millisecond {
+				t.Fatalf("recording on: %+v; off: %+v", on, off)
+			}
+			rejected := rejectedBodyEvent(t, spool)
+			if rejected["sub_attempt"] != float64(0) || rejected["chunk_seq"] != float64(1) {
+				t.Fatalf("rejected upstream_event = %v", rejected)
+			}
+			requests := executorArchiveEvents(t, spool, archive.TypeUpstreamRequest)
+			if len(requests) != 2 || requests[1]["resend"] != archive.ResendCompressionRejected || rejected["seq"].(float64) > requests[1]["seq"].(float64) {
+				t.Fatalf("upstream_request = %v", requests)
+			}
+			if in.Drops() != 1 {
+				t.Fatalf("request drops = %d, want the not-captured body", in.Drops())
+			}
 		})
 	}
-	if err := executeCodexCompressed(context.Background(), rt()); err != nil {
-		t.Fatalf("recording off: %v", err)
-	}
-	spool, in := startArchiveForExecutor(t)
-	if err := executeCodexCompressed(archive.WithIngress(context.Background(), in), rt()); err != nil {
-		t.Fatalf("recording on: %v", err)
-	}
-	rejected := waitDiscardedEvent(t, spool)
-	if rejected["sub_attempt"] != float64(0) || rejected["body_dropped"] != archive.DropTapPanic || rejected["body"] != nil {
-		t.Fatalf("discarded upstream_event = %v", rejected)
-	}
-	if in.Drops() == 0 {
-		t.Fatal("the contained panic was not counted against the request")
-	}
 }
 
-// Round-4 finding 2: the rejected body is read only within reservations.
-// With a queue too small for its first bytes, and after Stop, nothing is
-// read or allocated for it and the executor keeps (and closes) the body.
-func TestArchiveRejectedBodyIsReadOnlyWithinReservations(t *testing.T) {
+// Round-5 decision A: the archive reads nothing of a rejected body and
+// allocates nothing of its size, whether it records the request, its queue
+// is too small for the body, or Stop has begun; the body stays the
+// executor's, which closes it as without capture.
+func TestArchiveRejectedBodyIsNeverRead(t *testing.T) {
 	check := func(t *testing.T, ctx context.Context) {
 		t.Helper()
 		body := &countingBody{Reader: bytes.NewReader(bytes.Repeat([]byte("r"), 512<<10))}
@@ -177,17 +141,27 @@ func TestArchiveRejectedBodyIsReadOnlyWithinReservations(t *testing.T) {
 		helps.ArchiveRejectedResponse(ctx, resp)
 		runtime.ReadMemStats(&after)
 		if body.read != 0 || resp.Body != body {
-			t.Fatalf("read %d bytes of the rejected body (body handed off: %v)", body.read, resp.Body != body)
+			t.Fatalf("read %d bytes of the rejected body (body replaced: %v)", body.read, resp.Body != body)
 		}
 		if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= 64<<10 {
-			t.Fatalf("allocated %d bytes for a 512 KiB body it could not record", allocated)
+			t.Fatalf("allocated %d bytes for a 512 KiB rejected body", allocated)
 		}
 	}
+	t.Run("recorded", func(t *testing.T) {
+		spool, in := startArchiveForExecutor(t)
+		check(t, archive.WithIngress(context.Background(), in))
+		if rejected := rejectedBodyEvent(t, spool); rejected["sub_attempt"] != float64(0) {
+			t.Fatalf("rejected upstream_event = %v", rejected)
+		}
+		if in.Drops() != 1 {
+			t.Fatalf("request drops = %d", in.Drops())
+		}
+	})
 	t.Run("queue too small", func(t *testing.T) {
 		_, in := startArchiveForExecutorWith(t, func(o *archive.TestOverrides) { o.QueueBytes = 1024 })
 		check(t, archive.WithIngress(context.Background(), in))
 		if in.Drops() == 0 {
-			t.Fatal("the refused body was not counted")
+			t.Fatal("the body was not counted")
 		}
 	})
 	t.Run("after stop", func(t *testing.T) {
@@ -199,30 +173,4 @@ func TestArchiveRejectedBodyIsReadOnlyWithinReservations(t *testing.T) {
 		}
 		check(t, archive.WithIngress(context.Background(), in))
 	})
-}
-
-// Round-4 finding 2 (Opus): a rejected body over the 1 MiB limit is
-// recorded as truncated and counted in the drop ledger too, so a gap shows
-// it (before the fix it counted only against its request).
-func TestArchiveOversizedRejectedBodyReachesTheDropLedger(t *testing.T) {
-	spool, in := startArchiveForExecutor(t)
-	ctx := archive.WithIngress(context.Background(), in)
-	body := io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), 3<<20)))
-	helps.ArchiveRejectedResponse(ctx, &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}, Body: body})
-	rejected := waitDiscardedEvent(t, spool)
-	if rejected["body_dropped"] != archive.DropTruncated || rejected["stopped"] != "limit" {
-		t.Fatalf("discarded upstream_event = %v", rejected)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		for _, gap := range executorArchiveEvents(t, spool, archive.TypeGap) {
-			if drops, ok := gap["drops"].(map[string]any); ok && drops[archive.DropTruncated] != nil {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("no gap reports the truncated body")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }

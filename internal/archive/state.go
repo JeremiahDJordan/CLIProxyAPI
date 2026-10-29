@@ -22,15 +22,11 @@ const (
 	DropStopped      = "stopped"
 	DropEncodeError  = "encode_error"
 	DropTapPanic     = "tap_panic"
-	// DropNotCaptured marks an outbound body an executor's tap cannot
-	// record as sent (body_dropped only: it counts against its request,
-	// never as a gap).
+	// DropNotCaptured marks a body an executor's tap cannot record: an
+	// outbound body it cannot record as sent, or a response body it
+	// discards without the archive reading it (body_dropped only: it counts
+	// against its request, never as a gap).
 	DropNotCaptured = "not_captured"
-	// DropTruncated marks a discarded upstream body (TapDiscardedBody) not
-	// read to its end: longer than its limit, or still arriving when its
-	// time bound or its attempt ended. It counts against its request and
-	// as a gap.
-	DropTruncated = "truncated"
 	// Start refusals are counted as gaps of unknown size.
 	DropStartRefusedSteering = "start_refused_steering"
 	DropStartRefusedSpool    = "start_refused_spool"
